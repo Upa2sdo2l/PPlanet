@@ -63,6 +63,7 @@ void Scheduler::Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame)
     S.LingerSinceFrame = 0;
     S.ActiveSinceFrame = 0;
     S.bShown = false;
+    S.bAppearedBySplit = false;
     KeyToSlot[D.Key] = SlotIndex;
 }
 
@@ -257,9 +258,21 @@ void Scheduler::UpdateCoverage(uint64_t Frame, const FrameBudget& Budget)
         }
 
         if (!bAnyReplacement || bAllSettled || Frame >= L.LingerSinceFrame + MaxLinger)
+        {
+            // Finer chunks taking over a coarser one's surface: a split.
+            for (const PlanetLOD::ChunkKey& K : CurrentWant)
+            {
+                if (K.LOD <= L.Key.LOD || !PlanetLOD::IsInsideOrSame(K, L.Key)) continue;
+                const auto It = KeyToSlot.find(K);
+                if (It != KeyToSlot.end() && Slots[It->second].State == SlotState::Active && !Slots[It->second].bShown)
+                    Slots[It->second].bAppearedBySplit = true;
+            }
             Retire(i);
+        }
         else
+        {
             StillLingering.push_back(i);
+        }
     }
 
     // 2. Visibility. A lingering chunk stays visible; a desired Active chunk
@@ -278,6 +291,21 @@ void Scheduler::UpdateCoverage(uint64_t Frame, const FrameBudget& Budget)
         }
         S.bShown = !bCovered;
     }
+}
+
+bool Scheduler::BeginSideJob(int32_t SlotIndex)
+{
+    if (SlotIndex < 0 || SlotIndex >= (int32_t)Slots.size()) return false;
+    Slot& S = Slots[SlotIndex];
+    if (S.State != SlotState::Active || S.bWorkerInFlight) return false;
+    S.bWorkerInFlight = true;
+    return true;
+}
+
+int32_t Scheduler::FindSlotIndex(const PlanetLOD::ChunkKey& Key) const
+{
+    const auto It = KeyToSlot.find(Key);
+    return (It == KeyToSlot.end()) ? -1 : It->second;
 }
 
 void Scheduler::WorkerFinished(int32_t SlotIndex)
@@ -349,6 +377,7 @@ std::vector<int32_t> Scheduler::DrainRetires(int32_t MaxCount)
         S.LingerSinceFrame = 0;
         S.ActiveSinceFrame = 0;
         S.bShown = false;
+        S.bAppearedBySplit = false;
         Out.push_back(SlotIndex);
     }
     RetireQueue.swap(Kept);
@@ -377,8 +406,11 @@ bool Scheduler::ValidateInvariants(char* OutWhy, int32_t WhyLen) const
             continue;
         }
 
-        if (S.bWorkerInFlight && S.State != SlotState::Building && S.State != SlotState::Retiring)
-            return Fail("Worker in flight on a slot that is neither Building nor Retiring");
+        // In flight: Building (main job), Active (side job, BeginSideJob) or
+        // Retiring (waiting for either to return).
+        if (S.bWorkerInFlight && S.State != SlotState::Building &&
+            S.State != SlotState::Active && S.State != SlotState::Retiring)
+            return Fail("Worker in flight on a slot that is not Building, Active or Retiring");
 
         if (S.bLingering && S.State != SlotState::Active)
             return Fail("Lingering slot is not Active");

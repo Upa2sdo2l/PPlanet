@@ -94,6 +94,10 @@ struct Slot
     // while a lingering chunk still covers its surface, then the two swap in
     // the same frame.
     bool     bShown           = false;
+
+    // Set when this chunk was swapped in for a coarser lingering chunk (a
+    // split). The GPU renderer morphs such chunks in from the parent's shape.
+    bool     bAppearedBySplit = false;
 };
 
 struct WorkerRequest
@@ -185,6 +189,15 @@ public:
     // replacements are all Active for Budget.SettleFrames (or that have nothing
     // replacing them), and sets bShown on every slot.
     void UpdateCoverage(uint64_t Frame, const FrameBudget& Budget);
+
+    // Reserves an Active slot for a side job that reads its scratch (e.g.
+    // building the collision mesh of a chunk the camera came close to). The
+    // slot is then not freed until WorkerFinished. False if the slot is not
+    // Active or a worker already owns it.
+    bool BeginSideJob(int32_t SlotIndex);
+
+    // Slot currently owning Key (any live state), or -1.
+    int32_t FindSlotIndex(const PlanetLOD::ChunkKey& Key) const;
 
     // Game thread, as soon as the worker launched for this slot has finished,
     // whether its result is applied or dropped as stale. Releases the slot's

@@ -115,7 +115,8 @@ void BuildChunkInputs(const PlanetCore::NoiseGraph& Graph, const PlanetCore::FCh
                       const PlanetCore::HaloGrid& Halo, const Params& Prm, ChunkInputs& Out);
 
 // CPU twin of the GPU pass: DeltaHeight for the chunk's 65 x 65 vertices
-// (row-major, as Surfaces). Used for collision meshes only.
+// (row-major, as Surfaces). Reference for the harness and planet.Bench; the
+// game reads the heights back from the GPU instead (~16 ms per chunk here).
 void ErodeChunk(const PlanetCore::HaloGrid& Halo, const ChunkInputs& In, const Params& Prm,
                 double RadiusMetres, double* OutDelta65);
 

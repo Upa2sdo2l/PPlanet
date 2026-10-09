@@ -224,7 +224,9 @@ private:
     // if the renderer is not selected or anything is missing.
     void InitGpuTerrain();
     UStaticMesh* BuildGridMesh();
-    void GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile);
+    void GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile, uint32 Generation);
+    // Takes the erosion heights the GPU has sent back (for collision meshes).
+    void GpuPollHeights();
     // Sends the tiles queued this frame to the compute shaders (one batch).
     void GpuFlushTiles();
     // Erosion and climate constants of the compute shaders, from the
@@ -269,6 +271,13 @@ private:
         float      CustomData[6] = {0.f, -1e6f, 0.f, 0.f, 0.f, 0.f};
         bool       bShown = false;
         bool       bHasCollisionMesh = false;
+
+        // Erosion heights of the chunk's 65x65 vertices, read back from the
+        // GPU 2-3 frames after its tile was dispatched. The collision mesh is
+        // built only once they are here. Empty with bHeightsReady = no erosion.
+        TArray<float> Heights;
+        bool          bHeightsReady = false;
+        uint64        HeightsRequestFrame = 0;
     };
     TArray<FGpuSlot> GpuSlots;
 
@@ -311,7 +320,9 @@ private:
         double RMCMs = 0.0, RMCMax = 0.0;
         int32  GpuTiles = 0;                           // tiles sent to the compute shaders
         int32  CollisionBuilt = 0;                     // collision meshes built (GPU renderer)
-        double CollisionErosionMs = 0.0, CollisionErosionMax = 0.0;   // CPU erosion for them
+        int32  HeightsArrived = 0;                     // tiles whose heights came back from the GPU
+        double HeightsLatencyFrames = 0.0;             // sum over HeightsArrived
+        int32  HeightsLatencyMax = 0;
 
         // Game-thread stage time summed over the window's frames (ms).
         int32  Frames = 0;
@@ -363,7 +374,9 @@ private:
         // bDone (the release/acquire pair makes them visible).
         double                      NoiseMs = 0.0;
         double                      BuildMs = 0.0;
-        double                      ErosionMs = 0.0;     // CPU erosion of a collision mesh
+        // GPU renderer, CollisionMesh job: erosion heights read back from the
+        // GPU (65x65, metres), added to Surfaces. Empty = no erosion.
+        TArray<float>               CollisionDelta;
     };
     TArray<TUniquePtr<FSlotWork>> SlotWork;
 

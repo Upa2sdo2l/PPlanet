@@ -19,6 +19,8 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
+#include "RHIGPUReadback.h"
+#include "Misc/ScopeLock.h"
 #include "TextureResource.h"
 #include "Engine/TextureRenderTarget2D.h"
 
@@ -74,12 +76,43 @@ IMPLEMENT_GLOBAL_SHADER(FPlanetWriteCS, "/PlanetErosion/PlanetErosion.usf", "Wri
 namespace PlanetErosionGpu
 {
 
+namespace
+{
+    struct FPendingReadback
+    {
+        const void*                       Owner = nullptr;
+        TUniquePtr<FRHIGPUBufferReadback> Readback;
+        TArray<int64>                     Tags;
+        uint32                            NumBytes = 0;
+    };
+
+    // Render thread only. Deliberately never destroyed at exit: deleting RHI
+    // objects after the RHI has shut down would crash; EndPlay releases them.
+    TArray<TUniquePtr<FPendingReadback>>& PendingReadbacks()
+    {
+        static TArray<TUniquePtr<FPendingReadback>>* P = new TArray<TUniquePtr<FPendingReadback>>();
+        return *P;
+    }
+
+    // Filled on the render thread, drained on the game thread.
+    FCriticalSection& ArrivedLock()
+    {
+        static FCriticalSection* L = new FCriticalSection();
+        return *L;
+    }
+    TArray<TPair<const void*, FHeightReadback>>& Arrived()
+    {
+        static TArray<TPair<const void*, FHeightReadback>>* A = new TArray<TPair<const void*, FHeightReadback>>();
+        return *A;
+    }
+}
+
 bool IsSupported()
 {
     return GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5;
 }
 
-void Dispatch(UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAtlas,
+void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAtlas,
               UTextureRenderTarget2D* BiomeAtlas, int32 TilesPerRow,
               const FShaderParams& Params, FTileBatch&& Batch)
 {
@@ -89,7 +122,8 @@ void Dispatch(UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAt
     // them below that would assert. The game module falls back earlier.
     if (!IsSupported()) return;
     if (Batch.Vertices.Num() != Batch.NumTiles * HaloPoints * VertexBytes ||
-        Batch.Tiles.Num()    != Batch.NumTiles * TileBytes)
+        Batch.Tiles.Num()    != Batch.NumTiles * TileBytes ||
+        Batch.Tags.Num()     != Batch.NumTiles)
     {
         UE_LOG(LogTemp, Error, TEXT("[PlanetErosion] batch size mismatch, %d tiles dropped"), Batch.NumTiles);
         return;
@@ -101,7 +135,7 @@ void Dispatch(UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAt
     if (!PosRes || !NormalRes || !BiomeRes) return;
 
     ENQUEUE_RENDER_COMMAND(PlanetErosionDispatch)(
-        [PosRes, NormalRes, BiomeRes, TilesPerRow, Params, Batch = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
+        [Owner, PosRes, NormalRes, BiomeRes, TilesPerRow, Params, Batch = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             TShaderMapRef<FPlanetErodeCS> ErodeCS(ShaderMap);
@@ -162,12 +196,83 @@ void Dispatch(UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAt
                                              WriteCS, P, FIntVector(9, 9, (int32)NumTiles));
             }
 
+            // Heights back to the CPU for collision meshes (PollHeights).
+            TUniquePtr<FPendingReadback> Pending = MakeUnique<FPendingReadback>();
+            Pending->Owner    = Owner;
+            Pending->Readback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Planet.Erosion.HeightReadback"));
+            Pending->Tags     = Batch.Tags;
+            Pending->NumBytes = NumPoints * sizeof(float);
+            AddEnqueueCopyPass(GraphBuilder, Pending->Readback.Get(), DeltaBuf, Pending->NumBytes);
+
             // The terrain material samples the atlases later this frame.
             GraphBuilder.SetTextureAccessFinal(PosTex,    ERHIAccess::SRVMask);
             GraphBuilder.SetTextureAccessFinal(NormalTex, ERHIAccess::SRVMask);
             GraphBuilder.SetTextureAccessFinal(BiomeTex,  ERHIAccess::SRVMask);
             GraphBuilder.Execute();
+
+            PendingReadbacks().Add(MoveTemp(Pending));
         });
+}
+
+void PollHeights(const void* Owner, TArray<FHeightReadback>& Out)
+{
+    check(IsInGameThread());
+
+    // Collect what the render thread found ready on earlier frames.
+    {
+        FScopeLock Lock(&ArrivedLock());
+        TArray<TPair<const void*, FHeightReadback>>& A = Arrived();
+        for (int32 i = 0; i < A.Num(); )
+        {
+            if (A[i].Key == Owner)
+            {
+                Out.Add(MoveTemp(A[i].Value));
+                A.RemoveAt(i, EAllowShrinking::No);
+            }
+            else
+            {
+                ++i;
+            }
+        }
+    }
+
+    // Look for newly finished copies (in submission order).
+    ENQUEUE_RENDER_COMMAND(PlanetErosionPollHeights)([](FRHICommandListImmediate&)
+    {
+        TArray<TUniquePtr<FPendingReadback>>& P = PendingReadbacks();
+        while (P.Num() > 0 && P[0]->Readback->IsReady())
+        {
+            FPendingReadback& R = *P[0];
+            const float* Data = static_cast<const float*>(R.Readback->Lock(R.NumBytes));
+            {
+                FScopeLock Lock(&ArrivedLock());
+                for (int32 t = 0; t < R.Tags.Num(); ++t)
+                {
+                    FHeightReadback H;
+                    H.Tag = R.Tags[t];
+                    if (Data) H.Delta.Append(Data + (SIZE_T)t * HaloPoints, HaloPoints);
+                    Arrived().Add(TPair<const void*, FHeightReadback>(R.Owner, MoveTemp(H)));
+                }
+            }
+            R.Readback->Unlock();
+            P.RemoveAt(0);
+        }
+    });
+}
+
+void ReleaseHeights(const void* Owner)
+{
+    check(IsInGameThread());
+    ENQUEUE_RENDER_COMMAND(PlanetErosionReleaseHeights)([Owner](FRHICommandListImmediate&)
+    {
+        PendingReadbacks().RemoveAll([Owner](const TUniquePtr<FPendingReadback>& R) { return R->Owner == Owner; });
+        // Polls queued before this command may have added heights after the
+        // game thread cleared them below.
+        FScopeLock Lock(&ArrivedLock());
+        Arrived().RemoveAll([Owner](const TPair<const void*, FHeightReadback>& A) { return A.Key == Owner; });
+    });
+    FScopeLock Lock(&ArrivedLock());
+    Arrived().RemoveAll([Owner](const TPair<const void*, FHeightReadback>& A) { return A.Key == Owner; });
 }
 
 } // namespace PlanetErosionGpu

@@ -56,8 +56,8 @@ DECLARE_DWORD_COUNTER_STAT(TEXT("Chunks built per second"),           STAT_Plane
 DECLARE_DWORD_COUNTER_STAT(TEXT("Chunks committed per second"),       STAT_Planet_CommittedPerSec, STATGROUP_Planet);
 DECLARE_DWORD_COUNTER_STAT(TEXT("GPU: tiles eroded per second"),      STAT_Planet_GpuTilesPerSec,  STATGROUP_Planet);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Collision meshes built per second"), STAT_Planet_CollisionPerSec, STATGROUP_Planet);
-DECLARE_FLOAT_COUNTER_STAT(TEXT("Collision: CPU erosion, ms avg"),    STAT_Planet_ColErosionAvg, STATGROUP_Planet);
-DECLARE_FLOAT_COUNTER_STAT(TEXT("Collision: CPU erosion, ms max"),    STAT_Planet_ColErosionMax, STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("GPU: tile heights read back per second"), STAT_Planet_HeightsPerSec, STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("GPU: height read-back latency, frames avg"), STAT_Planet_HeightsLatency, STATGROUP_Planet);
 
 // State
 DECLARE_DWORD_COUNTER_STAT(TEXT("Camera: LOD of chunk under camera"),   STAT_Planet_NadirLOD,       STATGROUP_Planet);
@@ -145,7 +145,6 @@ public:
         Work->bMeshBuilt = false;
         Work->NoiseMs    = 0.0;
         Work->BuildMs    = 0.0;
-        Work->ErosionMs  = 0.0;
 
         if (!Gen || !Gen->IsValid() || !Builder)
         {
@@ -162,16 +161,16 @@ public:
 
         if (Work->Job == AProceduralPlanet::FSlotWork::EJob::CollisionMesh)
         {
+            // The surfaces were sampled by this slot's Full job and have not
+            // changed since: the slot is Active and reserved for this job.
+            // Erosion heights come from the GPU (exactly what is drawn).
             const uint64 BuildStart = FPlatformTime::Cycles64();
             const PlanetCore::Surface* Src = Work->Surfaces.GetData();
-            if (bErosion)
+            if (Work->CollisionDelta.Num() == PLANET_BODY_VERTS)
             {
-                // The halo grid and erosion inputs were not kept: sample again
-                // (~2 ms) rather than hold 320 KB per slot.
                 TArray<PlanetCore::Surface>& Eroded = ScratchSurfaces();
-                Gen->SampleChunk(Work->Key, TArrayView<PlanetCore::Surface>(Eroded.GetData(), Eroded.Num()), &ScratchHalo());
-                PlanetErosion::BuildChunkInputs(Gen->GetGraph(), PlanetBridge::ToCoreKey(Work->Key), ScratchHalo(), Gen->GetErosion(), ScratchInputs());
-                ErodeSurfaces(Eroded);
+                FMemory::Memcpy(Eroded.GetData(), Work->Surfaces.GetData(), sizeof(PlanetCore::Surface) * PLANET_BODY_VERTS);
+                for (int32 i = 0; i < PLANET_BODY_VERTS; ++i) Eroded[i].Height += (double)Work->CollisionDelta[i];
                 Src = Eroded.GetData();
             }
             Work->bMeshBuilt = Builder->Build(Work->Key, Src, PlanetRadius, Origin);
@@ -189,8 +188,8 @@ public:
         const uint64 NoiseStart = FPlatformTime::Cycles64();
         Gen->SampleChunk(Work->Key, View, bTile ? &ScratchHalo() : nullptr);
 
-        // Erosion inputs: steering gradient (481 points x 4 samples of two
-        // layers), land mask and fade. ~0.2 ms. Counted as noise.
+        // Erosion inputs: steering gradient (553 points x 4 samples of two
+        // layers), land mask and fade. ~0.3 ms. Counted as noise.
         const PlanetErosion::ChunkInputs* Inputs = nullptr;
         if (bTile && bErosion)
         {
@@ -200,8 +199,9 @@ public:
         Work->NoiseMs = PlanetMsSince(NoiseStart);
 
         // 2. GPU renderer: the tile the compute shaders erode and write into
-        //    the atlases, and the instance transform. Mesh: only when the
-        //    chunk needs collision (GPU) or always (RealtimeMesh).
+        //    the atlases, and the instance transform. RealtimeMesh renderer:
+        //    the mesh. (GPU renderer collision meshes are separate jobs, once
+        //    the eroded heights are back from the GPU.)
         const uint64 BuildStart = FPlatformTime::Cycles64();
         if (bTile)
         {
@@ -210,16 +210,7 @@ public:
         }
         if (Work->bBuildMesh)
         {
-            const PlanetCore::Surface* Src = Work->Surfaces.GetData();
-            if (Inputs)
-            {
-                // Collision must follow the eroded surface the player sees.
-                TArray<PlanetCore::Surface>& Eroded = ScratchSurfaces();
-                FMemory::Memcpy(Eroded.GetData(), Work->Surfaces.GetData(), sizeof(PlanetCore::Surface) * PLANET_BODY_VERTS);
-                ErodeSurfaces(Eroded);
-                Src = Eroded.GetData();
-            }
-            Work->bMeshBuilt = Builder->Build(Work->Key, Src, PlanetRadius, Origin);
+            Work->bMeshBuilt = Builder->Build(Work->Key, Work->Surfaces.GetData(), PlanetRadius, Origin);
         }
         Work->bBuilt  = bTile || Work->bMeshBuilt;
         Work->BuildMs = PlanetMsSince(BuildStart);
@@ -250,18 +241,6 @@ private:
         static thread_local TArray<PlanetCore::Surface> A;
         if (A.Num() < PLANET_BODY_VERTS) A.SetNumUninitialized(PLANET_BODY_VERTS);
         return A;
-    }
-
-    // CPU twin of the erosion compute shader (to ~0.1 m), heights only: the
-    // collision mesh is never drawn. Uses ScratchHalo / ScratchInputs.
-    void ErodeSurfaces(TArray<PlanetCore::Surface>& Surfaces)
-    {
-        const uint64 Start = FPlatformTime::Cycles64();
-        static thread_local TArray<double> Delta;
-        Delta.SetNumUninitialized(PLANET_BODY_VERTS);
-        PlanetErosion::ErodeChunk(ScratchHalo(), ScratchInputs(), Gen->GetErosion(), PlanetRadius, Delta.GetData());
-        for (int32 i = 0; i < PLANET_BODY_VERTS; ++i) Surfaces[i].Height += Delta[i];
-        Work->ErosionMs = PlanetMsSince(Start);
     }
 
     const FPlanetNoiseGenerator* Gen;
@@ -299,6 +278,8 @@ void AProceduralPlanet::BeginPlay()
 
 void AProceduralPlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    if (bGPUTerrain) PlanetErosionGpu::ReleaseHeights(this);
+
     // Workers hold raw pointers into SlotWork, Builders and Generator. Let
     // every running task finish before any of them is destroyed.
     for (const TUniquePtr<FSlotWork>& W : SlotWork)
@@ -469,6 +450,7 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
         if (bGPUTerrain)
         {
             GpuRebaseIfNeeded(CameraRel);
+            GpuPollHeights();
             SyncSlotPresentationGpu();
         }
         else
@@ -638,7 +620,9 @@ void AProceduralPlanet::PumpWorkers()
         W.bNeedsCollision = Req.bNeedsCollision;
         W.Job             = FSlotWork::EJob::Full;
         // GPU renderer: the mesh exists only to carry collision.
-        W.bBuildMesh      = !bGPUTerrain || Req.bNeedsCollision;
+        // GPU renderer: collision meshes are built later, from the heights
+        // the GPU reads back (SyncSlotPresentationGpu).
+        W.bBuildMesh      = !bGPUTerrain;
         W.bGpuTile        = bGPUTerrain;
         if (bGPUTerrain && !W.Tile.IsValid())
         {
@@ -687,12 +671,7 @@ void AProceduralPlanet::ApplyReadyChunks()
             // Applied only if the slot still holds the same chunk and still
             // wants collision; otherwise the stream set is simply dropped.
             const PlanetStreaming::Slot& Slot = Scheduler.GetSlots()[i];
-            if (W.bMeshBuilt)
-            {
-                ++PerfWindow.CollisionBuilt;
-                PerfWindow.CollisionErosionMs += W.ErosionMs;
-                PerfWindow.CollisionErosionMax = FMath::Max(PerfWindow.CollisionErosionMax, W.ErosionMs);
-            }
+            if (W.bMeshBuilt) ++PerfWindow.CollisionBuilt;
             if (W.bMeshBuilt && Slot.State == PlanetStreaming::SlotState::Active &&
                 Slot.Generation == W.Generation && Slot.bNeedsCollision)
             {
@@ -734,25 +713,12 @@ void AProceduralPlanet::ApplyReadyChunks()
 
         if (bGPUTerrain)
         {
-            // Tile into the atlas; the instance stays hidden until
+            // Tile to the compute shaders; the instance stays hidden until
             // SyncSlotPresentationGpu swaps it in. Collision, if the chunk is
-            // close, comes from the RMC component, which is never visible.
-            GpuUploadTile(i, *W.Tile);
+            // close, comes later from the RMC component (never visible), once
+            // the eroded heights are back from the GPU.
+            GpuUploadTile(i, *W.Tile, W.Generation);
             W.Tile.Reset();
-            if (W.bMeshBuilt)
-            {
-                ++PerfWindow.CollisionBuilt;
-                PerfWindow.CollisionErosionMs += W.ErosionMs;
-                PerfWindow.CollisionErosionMax = FMath::Max(PerfWindow.CollisionErosionMax, W.ErosionMs);
-            }
-            if (W.bMeshBuilt && Scheduler.GetSlots()[i].bNeedsCollision)
-            {
-                ApplyCollisionMesh(i);
-            }
-            else if (W.bMeshBuilt)
-            {
-                Builders[i]->TakeStreamSet();
-            }
 
             const double CommitMs = PlanetMsSince(CommitStart);
             ++PerfWindow.Committed;
@@ -960,6 +926,7 @@ void AProceduralPlanet::LaunchCollisionMeshJob(int32 SlotIndex)
 
     FSlotWork& W = *SlotWork[SlotIndex];
     W.Job        = FSlotWork::EJob::CollisionMesh;
+    W.CollisionDelta = GpuSlots.IsValidIndex(SlotIndex) ? GpuSlots[SlotIndex].Heights : TArray<float>();
     W.Generation = Scheduler.GetSlots()[SlotIndex].Generation;
     W.bBuilt     = false;
     W.bMeshBuilt = false;
@@ -1121,7 +1088,7 @@ void AProceduralPlanet::UpdatePlanetStats()
     const double NoiseAvg = W.Built     > 0 ? W.NoiseMs / W.Built     : 0.0;
     const double BuildAvg = W.Built     > 0 ? W.BuildMs / W.Built     : 0.0;
     const double RMCAvg   = W.Committed > 0 ? W.RMCMs   / W.Committed : 0.0;
-    const double ColErosionAvg = W.CollisionBuilt > 0 ? W.CollisionErosionMs / W.CollisionBuilt : 0.0;
+    const double HeightsLatency = W.HeightsArrived > 0 ? W.HeightsLatencyFrames / W.HeightsArrived : 0.0;
 
 #if STATS
     SET_FLOAT_STAT(STAT_Planet_NoiseAvg, (float)NoiseAvg);
@@ -1134,8 +1101,8 @@ void AProceduralPlanet::UpdatePlanetStats()
     SET_DWORD_STAT(STAT_Planet_CommittedPerSec, W.Committed);
     SET_DWORD_STAT(STAT_Planet_GpuTilesPerSec,  W.GpuTiles);
     SET_DWORD_STAT(STAT_Planet_CollisionPerSec, W.CollisionBuilt);
-    SET_FLOAT_STAT(STAT_Planet_ColErosionAvg,   (float)ColErosionAvg);
-    SET_FLOAT_STAT(STAT_Planet_ColErosionMax,   (float)W.CollisionErosionMax);
+    SET_DWORD_STAT(STAT_Planet_HeightsPerSec,   W.HeightsArrived);
+    SET_FLOAT_STAT(STAT_Planet_HeightsLatency,  (float)HeightsLatency);
 
     SET_DWORD_STAT(STAT_Planet_Active,    S.Active);
     SET_DWORD_STAT(STAT_Planet_Requested, S.Requested);
@@ -1174,8 +1141,8 @@ void AProceduralPlanet::UpdatePlanetStats()
         W.ApplyMs * F, W.RemoveMs * F, W.CreateMs * F, W.ConfigMs * F, W.CoverageMs * F, W.ReleaseMs * F);
 
     const FString LineErosion = FString::Printf(
-        TEXT("[Planet] erosion %s  |  GPU tiles eroded %d/s  |  collision meshes %d/s, CPU erosion %.1f ms avg (max %.1f) on workers"),
-        Generator.HasErosion() ? TEXT("ON") : TEXT("OFF"), W.GpuTiles, W.CollisionBuilt, ColErosionAvg, W.CollisionErosionMax);
+        TEXT("[Planet] erosion %s  |  GPU tiles eroded %d/s  |  heights read back %d/s, %.1f frames after dispatch (max %d)  |  collision meshes %d/s"),
+        Generator.HasErosion() ? TEXT("ON") : TEXT("OFF"), W.GpuTiles, W.HeightsArrived, HeightsLatency, W.HeightsLatencyMax, W.CollisionBuilt);
 
     const FString Line3 = FString::Printf(
         TEXT("[Planet] under camera: LOD %d, collision %s, %.1f m above terrain  |  leaves %d, deepest L%d, budget %s  |  ")
@@ -1318,7 +1285,7 @@ FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
         Count, LOD, TileSize * PlanetRadiusMetres));
     Lines.Add(Row(TEXT("  noise (SampleChunk)         "), NoiseMs));
     Lines.Add(Row(TEXT("  erosion inputs (every tile) "), InputsMs));
-    Lines.Add(Row(TEXT("  CPU erosion (collision only)"), ErodeMs));
+    Lines.Add(Row(TEXT("  CPU erosion (reference only)"), ErodeMs));
     Lines.Add(Row(TEXT("  mesh build (stream set)     "), BuildMs));
     Lines.Add(Row(TEXT("  RMC remove + create section "), CreateMs));
     Lines.Add(Row(TEXT("  RMC config + collision call "), ConfigMs));

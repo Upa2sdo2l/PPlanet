@@ -6,6 +6,9 @@
 //   ErodeCS  erosion height for every point of every tile's 67 x 67 halo grid
 //   WriteCS  eroded position, normal and biomes of every chunk vertex,
 //            written straight into the three atlas render targets.
+// and copies the erosion heights back to the CPU (asynchronously, 2-3 frames
+// later): collision meshes use exactly the heights that are drawn, without
+// computing erosion on the CPU.
 //
 // Layouts: one vertex = PlanetGpu::GpuVertex (48 bytes), one tile =
 // PlanetGpu::GpuTileInfo (64 bytes); the shader declares the same structs.
@@ -42,20 +45,37 @@ namespace PlanetErosionGpu
     {
         TArray<uint8> Vertices;   // NumTiles * HaloPoints * VertexBytes
         TArray<uint8> Tiles;      // NumTiles * TileBytes (AtlasTile filled in)
+        TArray<int64> Tags;       // NumTiles caller ids, returned with the heights
         int32         NumTiles = 0;
 
-        void Reset() { Vertices.Reset(); Tiles.Reset(); NumTiles = 0; }
+        void Reset() { Vertices.Reset(); Tiles.Reset(); Tags.Reset(); NumTiles = 0; }
+    };
+
+    // Erosion heights of one tile, read back from the GPU.
+    struct FHeightReadback
+    {
+        int64         Tag = 0;
+        TArray<float> Delta;      // HaloPoints metres, halo-grid order (67 x 67)
     };
 
     // False below SM5 (no compute shaders compiled): use another renderer.
     PLANETEROSION_API bool IsSupported();
 
-    // Enqueues both passes for the batch. Game thread. The textures must be
-    // created with bCanCreateUAV (positions RGBA32F, normals and biomes RGBA8).
-    PLANETEROSION_API void Dispatch(UTextureRenderTarget2D* PosAtlas,
+    // Enqueues both passes for the batch and the read-back of its heights.
+    // Game thread. The textures must be created with bCanCreateUAV (positions
+    // RGBA32F, normals and biomes RGBA8). Owner keys the read-backs.
+    PLANETEROSION_API void Dispatch(const void* Owner,
+                                    UTextureRenderTarget2D* PosAtlas,
                                     UTextureRenderTarget2D* NormalAtlas,
                                     UTextureRenderTarget2D* BiomeAtlas,
                                     int32 TilesPerRow,
                                     const FShaderParams& Params,
                                     FTileBatch&& Batch);
+
+    // Game thread, once per frame: appends the heights that have arrived
+    // since the last call (oldest first) and checks for new ones.
+    PLANETEROSION_API void PollHeights(const void* Owner, TArray<FHeightReadback>& Out);
+
+    // Drops every pending read-back of Owner (EndPlay).
+    PLANETEROSION_API void ReleaseHeights(const void* Owner);
 }

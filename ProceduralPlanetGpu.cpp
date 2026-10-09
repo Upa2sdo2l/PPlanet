@@ -263,7 +263,7 @@ UStaticMesh* AProceduralPlanet::BuildGridMesh()
 // Per chunk
 // ─────────────────────────────────────────────────────────────────────────────
 // Queues the slot's tile for this frame's compute dispatch (GpuFlushTiles).
-void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile)
+void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile, uint32 Generation)
 {
     if (!GpuSlots.IsValidIndex(SlotIndex)) return;
 
@@ -274,9 +274,60 @@ void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile
 
     PendingTiles.Vertices.Append(reinterpret_cast<const uint8*>(Tile.Vertices), (int32)sizeof(Tile.Vertices));
     PendingTiles.Tiles.Append(reinterpret_cast<const uint8*>(&Tile.Info), (int32)sizeof(Tile.Info));
+    PendingTiles.Tags.Add(((int64)SlotIndex << 32) | (int64)Generation);
     ++PendingTiles.NumTiles;
 
-    GpuSlots[SlotIndex].PlanetTransform = TileTransform(Tile);
+    FGpuSlot& G = GpuSlots[SlotIndex];
+    G.PlanetTransform     = TileTransform(Tile);
+    G.Heights.Reset();
+    G.bHeightsReady       = !Generator.HasErosion();   // nothing to wait for without erosion
+    G.HeightsRequestFrame = FrameCounter;
+}
+
+void AProceduralPlanet::GpuPollHeights()
+{
+    static TArray<PlanetErosionGpu::FHeightReadback> Arrived;   // game thread only
+    Arrived.Reset();
+    PlanetErosionGpu::PollHeights(this, Arrived);
+
+    const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+    constexpr int32 N = PlanetGpu::TILE_SIDE;
+    constexpr int32 G = PlanetGpu::HALO_SIDE;
+
+    for (PlanetErosionGpu::FHeightReadback& R : Arrived)
+    {
+        const int32  SlotIndex  = (int32)(R.Tag >> 32);
+        const uint32 Generation = (uint32)(R.Tag & 0xffffffffll);
+        if (!GpuSlots.IsValidIndex(SlotIndex) || SlotIndex >= (int32)Slots.size()) continue;
+        if (Slots[SlotIndex].Generation != Generation) continue;      // slot reused since
+        FGpuSlot& S = GpuSlots[SlotIndex];
+        if (S.bHeightsReady || R.Delta.Num() != PlanetGpu::HALO_POINTS) continue;
+
+        // Halo grid (67x67) -> the chunk's own 65x65 vertices.
+        S.Heights.SetNumUninitialized(N * N);
+        for (int32 y = 0; y < N; ++y)
+            FMemory::Memcpy(&S.Heights[y * N], &R.Delta[(y + 1) * G + 1], sizeof(float) * N);
+        S.bHeightsReady = true;
+
+        const int32 Latency = (int32)(FrameCounter - S.HeightsRequestFrame);
+        ++PerfWindow.HeightsArrived;
+        PerfWindow.HeightsLatencyFrames += Latency;
+        PerfWindow.HeightsLatencyMax = FMath::Max(PerfWindow.HeightsLatencyMax, Latency);
+    }
+
+    // Safety net: heights normally arrive in 2-3 frames. If a read-back is
+    // ever lost, give the chunk collision without erosion rather than none
+    // (off by up to the erosion depth, but nothing falls through the world).
+    constexpr uint64 GiveUpFrames = 300;
+    for (int32 i = 0; i < GpuSlots.Num() && i < (int32)Slots.size(); ++i)
+    {
+        FGpuSlot& S = GpuSlots[i];
+        if (S.bHeightsReady || Slots[i].State != PlanetStreaming::SlotState::Active) continue;
+        if (FrameCounter - S.HeightsRequestFrame < GiveUpFrames) continue;
+        UE_LOG(LogTemp, Warning, TEXT("[Planet] erosion heights of slot %d did not come back from the GPU; collision without erosion"), i);
+        S.Heights.Reset();
+        S.bHeightsReady = true;
+    }
 }
 
 void AProceduralPlanet::GpuFlushTiles()
@@ -284,12 +335,13 @@ void AProceduralPlanet::GpuFlushTiles()
     if (PendingTiles.NumTiles <= 0) return;
     PerfWindow.GpuTiles += PendingTiles.NumTiles;
     const int32 Tiles = PendingTiles.NumTiles;
-    PlanetErosionGpu::Dispatch(PosAtlas, NormalAtlas, BiomeAtlas, AtlasTilesPerRow,
+    PlanetErosionGpu::Dispatch(this, PosAtlas, NormalAtlas, BiomeAtlas, AtlasTilesPerRow,
                                GpuShaderParams, MoveTemp(PendingTiles));
     // The arrays went to the render thread; keep next frame's appends cheap.
     PendingTiles.Reset();
     PendingTiles.Vertices.Reserve(Tiles * PlanetErosionGpu::HaloPoints * PlanetErosionGpu::VertexBytes);
     PendingTiles.Tiles.Reserve(Tiles * PlanetErosionGpu::TileBytes);
+    PendingTiles.Tags.Reserve(Tiles);
 }
 
 void AProceduralPlanet::UpdateGpuShaderParams()
@@ -430,7 +482,7 @@ void AProceduralPlanet::SyncSlotPresentationGpu()
         }
 
         if (Slot.bWorkerInFlight) continue;   // a collision mesh is on its way
-        if (Slot.bNeedsCollision && !G.bHasCollisionMesh)
+        if (Slot.bNeedsCollision && !G.bHasCollisionMesh && G.bHeightsReady)
             CollisionChanges.Add({i, Slot.Priority, true});
         else if (!Slot.bNeedsCollision && G.bHasCollisionMesh)
             CollisionChanges.Add({i, Slot.Priority, false});

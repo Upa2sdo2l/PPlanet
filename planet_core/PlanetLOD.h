@@ -335,6 +335,46 @@ inline bool ChunkHorizonCulled(const ChunkKey& K, const TraversalParams& P)
     return HorizonCulled(P.CameraPos, P.PlanetRadius, C, BoundsRadius);
 }
 
+// ── Direction -> cube face UV (inverse of CubeFaceDirection) ────────────────
+// The face is the dominant axis; U, V are in [-1, 1]. Used to find the leaf
+// under the camera for diagnostics.
+inline void DirectionToFaceUV(const Vec3d& D, int32_t& OutFace, double& OutU, double& OutV)
+{
+    const double ax = std::fabs(D.X), ay = std::fabs(D.Y), az = std::fabs(D.Z);
+    if (ax >= ay && ax >= az)
+    {
+        if (D.X > 0.0) { OutFace = 0; OutU =  D.Y / ax; OutV = D.Z / ax; }
+        else           { OutFace = 1; OutU = -D.Y / ax; OutV = D.Z / ax; }
+    }
+    else if (ay >= az)
+    {
+        if (D.Y > 0.0) { OutFace = 2; OutU = -D.X / ay; OutV = D.Z / ay; }
+        else           { OutFace = 3; OutU =  D.X / ay; OutV = D.Z / ay; }
+    }
+    else
+    {
+        if (D.Z > 0.0) { OutFace = 4; OutU =  D.X / az; OutV = D.Y / az; }
+        else           { OutFace = 5; OutU = -D.X / az; OutV = D.Y / az; }
+    }
+}
+
+// Index of the leaf in Leaves that covers (Face, U, V), or -1.
+inline int32_t FindLeafContaining(const std::vector<ChunkKey>& Leaves,
+                                  int32_t Face, double U, double V)
+{
+    for (int32_t i = 0; i < (int32_t)Leaves.size(); ++i)
+    {
+        const ChunkKey& K = Leaves[i];
+        if (K.Face != Face) continue;
+        const int32_t N = TilesAt(K.LOD);
+        const double Size = 2.0 / (double)N;
+        const int32_t TX = std::clamp((int32_t)std::floor((U + 1.0) / Size), 0, N - 1);
+        const int32_t TY = std::clamp((int32_t)std::floor((V + 1.0) / Size), 0, N - 1);
+        if (TX == K.X && TY == K.Y) return i;
+    }
+    return -1;
+}
+
 // ── Edge classification ─────────────────────────────────────────────────────
 // What is on the other side of a leaf border? These names are NOT symmetric:
 // the same border reads FinerNeighbours from the coarse side and

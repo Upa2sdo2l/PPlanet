@@ -8,12 +8,69 @@
 #include "Camera/PlayerCameraManager.h"
 #include "Async/Async.h"
 #include "DrawDebugHelpers.h"
+#include "EngineUtils.h"
+#include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"
+#include "Stats/Stats.h"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// "stat Planet" — type it in the console (PIE or game, any non-Shipping build).
+//
+// Game-thread stages are cycle counters: their per-frame cost shows directly.
+// Worker stages (noise, mesh build) run on pool threads, so they are timed by
+// hand in the worker and shown as per-chunk averages over the last second,
+// next to the per-chunk game-thread cost of the RMC calls for comparison.
+// Not shown: render-thread GPU upload of a new section and the async collision
+// cook; those are not on the game thread.
+// ─────────────────────────────────────────────────────────────────────────────
+DECLARE_STATS_GROUP(TEXT("Planet"), STATGROUP_Planet, STATCAT_Advanced);
+
+// Game thread, per frame
+DECLARE_CYCLE_STAT(TEXT("GT: Tick total"),                       STAT_Planet_Tick,          STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: terrain height under camera"),      STAT_Planet_CameraHeight,  STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: LOD traversal"),                    STAT_Planet_LOD,           STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: streaming reconcile"),              STAT_Planet_Reconcile,     STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: launch workers"),                   STAT_Planet_Pump,          STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: commit chunks (all)"),              STAT_Planet_Apply,         STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: RMC RemoveSectionGroup"),           STAT_Planet_RMCRemove,     STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: RMC CreateSectionGroup"),           STAT_Planet_RMCCreate,     STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: RMC UpdateSectionConfig+collision"),STAT_Planet_RMCConfig,     STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: component transform/visibility"),   STAT_Planet_Component,     STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: release retired slots"),            STAT_Planet_Release,       STATGROUP_Planet);
+
+// Per chunk, averaged over the last second
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: worker noise, ms avg"),       STAT_Planet_NoiseAvg,  STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: worker noise, ms max"),       STAT_Planet_NoiseMax,  STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: worker mesh build, ms avg"),  STAT_Planet_BuildAvg,  STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: worker mesh build, ms max"),  STAT_Planet_BuildMax,  STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: GT commit (RMC+component), ms avg"), STAT_Planet_RMCAvg, STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: GT commit (RMC+component), ms max"), STAT_Planet_RMCMax, STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Chunks built per second"),           STAT_Planet_BuiltPerSec,     STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Chunks committed per second"),       STAT_Planet_CommittedPerSec, STATGROUP_Planet);
+
+// State
+DECLARE_DWORD_COUNTER_STAT(TEXT("Camera: LOD of chunk under camera"),   STAT_Planet_NadirLOD,       STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Camera: collision on chunk under camera (1/0)"), STAT_Planet_NadirCollision, STATGROUP_Planet);
+DECLARE_FLOAT_COUNTER_STAT(TEXT("Camera: height above terrain, m"),     STAT_Planet_CameraAGL,      STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("LOD: leaves"),                         STAT_Planet_Leaves,         STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("LOD: deepest level"),                  STAT_Planet_MaxLevel,       STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("LOD: budget hit (1/0)"),               STAT_Planet_BudgetHit,      STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: active"),                        STAT_Planet_Active,         STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: waiting for a worker"),          STAT_Planet_Requested,      STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: building"),                      STAT_Planet_Building,       STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: retiring"),                      STAT_Planet_Retiring,       STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: free"),                          STAT_Planet_Free,           STATGROUP_Planet);
 
 namespace
 {
     inline FChunkKey FromLODKey(const PlanetLOD::ChunkKey& K)
     {
         return FChunkKey(K.Face, K.LOD, K.X, K.Y);
+    }
+
+    inline double PlanetMsSince(uint64 StartCycles)
+    {
+        return FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - StartCycles);
     }
 }
 
@@ -57,6 +114,8 @@ public:
             // until the game thread sees bDone, so a silent return here would
             // lose the slot for good.
             Work->bBuilt = false;
+            Work->NoiseMs = 0.0;
+            Work->BuildMs = 0.0;
             Work->Generation = Generation;
             Work->bDone.Store(true);
             return;
@@ -66,12 +125,16 @@ public:
         //    chunk for 4225 vertices, measured on the reference box.
         TArrayView<PlanetCore::Surface> View(Work->Surfaces.GetData(),
                                              Work->Surfaces.Num());
+        const uint64 NoiseStart = FPlatformTime::Cycles64();
         Gen->SampleChunk(Work->Key, View);
+        Work->NoiseMs = PlanetMsSince(NoiseStart);
 
         // 2. Build the stream set with the worker's own builder instance.
         FVector3d Origin;
+        const uint64 BuildStart = FPlatformTime::Cycles64();
         Work->bBuilt = Builder->Build(Work->Key, Work->Surfaces.GetData(),
                                       PlanetRadius, Origin);
+        Work->BuildMs = PlanetMsSince(BuildStart);
 
         // 3. Signal completion. The generation was captured at launch; if the
         //    slot has been reassigned since, the game thread discards this
@@ -226,6 +289,8 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
     Super::Tick(DeltaSeconds);
     if (Pool.Num() == 0) return;
 
+    SCOPE_CYCLE_COUNTER(STAT_Planet_Tick);
+
     ++FrameCounter;
 
     // ── 1. Camera position, in UE centimetres relative to the actor ───────
@@ -259,6 +324,8 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
     ApplyReadyChunks();
     ReleaseRetired();
 
+    UpdatePlanetStats();
+
 #if !UE_BUILD_SHIPPING
     if (bDrawDebugStats && GEngine)
     {
@@ -287,10 +354,12 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     // chunk under it never refines to the collision LODs. One single-point
     // noise sample per frame.
     P.SurfaceOffsetCm = 0.0;
+    CameraTerrainHeightM = 0.0;
     if (CameraPos.SizeSquared() > 1.0)
     {
-        const double TerrainHeightM = Generator.GetHeightAt(CameraPos.GetSafeNormal());
-        P.SurfaceOffsetCm = TerrainHeightM * PLANET_METRES_TO_UE_CM;
+        SCOPE_CYCLE_COUNTER(STAT_Planet_CameraHeight);
+        CameraTerrainHeightM = Generator.GetHeightAt(CameraPos.GetSafeNormal());
+        P.SurfaceOffsetCm = CameraTerrainHeightM * PLANET_METRES_TO_UE_CM;
     }
     P.MaxLOD           = (uint8_t)FMath::Clamp(MaxLOD, 1, 18);
 
@@ -300,11 +369,14 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     P.MaxLeaves        = PLANET_COMPONENT_POOL_SIZE;
     P.bUseHorizonCull  = true;
 
+    SCOPE_CYCLE_COUNTER(STAT_Planet_LOD);
     PlanetLOD::Traverse(P, LastSelection);
 }
 
 void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& CameraPos)
 {
+    SCOPE_CYCLE_COUNTER(STAT_Planet_Reconcile);
+
     std::vector<PlanetStreaming::DesiredChunk> Desired;
     Desired.reserve(LastSelection.Chunks.size());
 
@@ -371,6 +443,8 @@ static double ChunkDistanceToCamera(const PlanetLOD::ChunkKey& Key,
 // ─────────────────────────────────────────────────────────────────────────────
 void AProceduralPlanet::PumpWorkers()
 {
+    SCOPE_CYCLE_COUNTER(STAT_Planet_Pump);
+
     int32 Launched = 0;
     PlanetStreaming::WorkerRequest Req;
 
@@ -409,6 +483,8 @@ void AProceduralPlanet::PumpWorkers()
 // ─────────────────────────────────────────────────────────────────────────────
 void AProceduralPlanet::ApplyReadyChunks()
 {
+    SCOPE_CYCLE_COUNTER(STAT_Planet_Apply);
+
     int32 Committed = 0;
 
     for (int32 i = 0; i < SlotWork.Num() && Committed < MaxCommitsPerFrame; ++i)
@@ -423,6 +499,17 @@ void AProceduralPlanet::ApplyReadyChunks()
         // the slot's scratch may be reused (and a retired slot released).
         Scheduler.WorkerFinished(i);
 
+        // Worker CPU time counts even when the result is dropped as stale:
+        // it was spent either way.
+        if (W.bBuilt)
+        {
+            ++PerfWindow.Built;
+            PerfWindow.NoiseMs += W.NoiseMs;
+            PerfWindow.BuildMs += W.BuildMs;
+            PerfWindow.NoiseMax = FMath::Max(PerfWindow.NoiseMax, W.NoiseMs);
+            PerfWindow.BuildMax = FMath::Max(PerfWindow.BuildMax, W.BuildMs);
+        }
+
         PlanetStreaming::Completion C;
         C.Key        = PlanetLOD::ChunkKey{W.Key.Face, W.Key.LOD, W.Key.X, W.Key.Y};
         C.SlotIndex  = i;
@@ -434,7 +521,12 @@ void AProceduralPlanet::ApplyReadyChunks()
             continue;
         }
 
-        ConfigureComponentForChunk(i, W.Key);
+        const uint64 CommitStart = FPlatformTime::Cycles64();
+
+        {
+            SCOPE_CYCLE_COUNTER(STAT_Planet_Component);
+            ConfigureComponentForChunk(i, W.Key);
+        }
 
         if (Pool.IsValidIndex(i) && Pool[i])
         {
@@ -445,8 +537,14 @@ void AProceduralPlanet::ApplyReadyChunks()
                 const FRealtimeMeshSectionGroupKey GK =
                     FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk"));
 
-                MeshSimple->RemoveSectionGroup(GK);
-                MeshSimple->CreateSectionGroup(GK, MoveTemp(Streams));
+                {
+                    SCOPE_CYCLE_COUNTER(STAT_Planet_RMCRemove);
+                    MeshSimple->RemoveSectionGroup(GK);
+                }
+                {
+                    SCOPE_CYCLE_COUNTER(STAT_Planet_RMCCreate);
+                    MeshSimple->CreateSectionGroup(GK, MoveTemp(Streams));
+                }
 
                 const FRealtimeMeshSectionKey SK =
                     FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
@@ -455,15 +553,26 @@ void AProceduralPlanet::ApplyReadyChunks()
                 // expensive per-chunk step and a pedestrian never needs it
                 // kilometres away.
                 const bool bWantCollision = W.bNeedsCollision;
-                FRealtimeMeshSectionConfig Config;
-                MeshSimple->UpdateSectionConfig(SK, Config, bWantCollision);
+                {
+                    SCOPE_CYCLE_COUNTER(STAT_Planet_RMCConfig);
+                    FRealtimeMeshSectionConfig Config;
+                    MeshSimple->UpdateSectionConfig(SK, Config, bWantCollision);
+                }
 
-                Pool[i]->SetVisibility(true);
-                Pool[i]->SetCollisionEnabled(bWantCollision
-                    ? ECollisionEnabled::QueryAndPhysics
-                    : ECollisionEnabled::NoCollision);
+                {
+                    SCOPE_CYCLE_COUNTER(STAT_Planet_Component);
+                    Pool[i]->SetVisibility(true);
+                    Pool[i]->SetCollisionEnabled(bWantCollision
+                        ? ECollisionEnabled::QueryAndPhysics
+                        : ECollisionEnabled::NoCollision);
+                }
             }
         }
+
+        const double CommitMs = PlanetMsSince(CommitStart);
+        ++PerfWindow.Committed;
+        PerfWindow.RMCMs += CommitMs;
+        PerfWindow.RMCMax = FMath::Max(PerfWindow.RMCMax, CommitMs);
 
         Scheduler.MarkActive(C);
         W.bDone.Store(false);
@@ -480,6 +589,8 @@ void AProceduralPlanet::ApplyReadyChunks()
 // ─────────────────────────────────────────────────────────────────────────────
 void AProceduralPlanet::ReleaseRetired()
 {
+    SCOPE_CYCLE_COUNTER(STAT_Planet_Release);
+
     const std::vector<int32> Freed = Scheduler.DrainRetires(MaxRetiresPerFrame);
     for (int32 SlotIndex : Freed)
     {
@@ -536,3 +647,230 @@ FString AProceduralPlanet::GetStreamingStatsString() const
         *LODStats);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stat Planet
+// ─────────────────────────────────────────────────────────────────────────────
+void AProceduralPlanet::UpdatePlanetStats()
+{
+    // Close the one-second window that feeds the per-chunk averages.
+    const double Now = FPlatformTime::Seconds();
+    if (PerfWindow.WindowStart <= 0.0) PerfWindow.WindowStart = Now;
+    if (Now - PerfWindow.WindowStart >= 1.0)
+    {
+        PerfPublished = PerfWindow;
+        PerfWindow = FPerfWindow();
+        PerfWindow.WindowStart = Now;
+    }
+
+#if STATS
+    const FPerfWindow& W = PerfPublished;
+    SET_FLOAT_STAT(STAT_Planet_NoiseAvg, W.Built     > 0 ? (float)(W.NoiseMs / W.Built)     : 0.f);
+    SET_FLOAT_STAT(STAT_Planet_NoiseMax, (float)W.NoiseMax);
+    SET_FLOAT_STAT(STAT_Planet_BuildAvg, W.Built     > 0 ? (float)(W.BuildMs / W.Built)     : 0.f);
+    SET_FLOAT_STAT(STAT_Planet_BuildMax, (float)W.BuildMax);
+    SET_FLOAT_STAT(STAT_Planet_RMCAvg,   W.Committed > 0 ? (float)(W.RMCMs   / W.Committed) : 0.f);
+    SET_FLOAT_STAT(STAT_Planet_RMCMax,   (float)W.RMCMax);
+    SET_DWORD_STAT(STAT_Planet_BuiltPerSec,     W.Built);
+    SET_DWORD_STAT(STAT_Planet_CommittedPerSec, W.Committed);
+
+    const PlanetStreaming::Stats S = Scheduler.GetStats();
+    SET_DWORD_STAT(STAT_Planet_Active,    S.Active);
+    SET_DWORD_STAT(STAT_Planet_Requested, S.Requested);
+    SET_DWORD_STAT(STAT_Planet_Building,  S.Building);
+    SET_DWORD_STAT(STAT_Planet_Retiring,  S.Retiring);
+    SET_DWORD_STAT(STAT_Planet_Free,      S.Free);
+
+    int32 DeepestLevel = 0;
+    for (const PlanetLOD::ChunkKey& K : LastSelection.Chunks)
+        DeepestLevel = FMath::Max(DeepestLevel, (int32)K.LOD);
+    SET_DWORD_STAT(STAT_Planet_Leaves,    (int32)LastSelection.Chunks.size());
+    SET_DWORD_STAT(STAT_Planet_MaxLevel,  DeepestLevel);
+    SET_DWORD_STAT(STAT_Planet_BudgetHit, LastSelection.bBudgetHit ? 1 : 0);
+
+    // The chunk under the camera: its LOD, and whether its component has
+    // collision switched on. Enabled means the cook was requested; with
+    // async cooking the body can still be a few frames behind.
+    const double CamDistCm = LastCameraPosUE.Size();
+    int32 NadirLOD = 0;          // 0 also when no leaf was found
+    int32 NadirCollision = 0;
+    if (CamDistCm > 1.0)
+    {
+        const FVector3d Dir = LastCameraPosUE / CamDistCm;
+        int32 Face = 0;
+        double U = 0.0, V = 0.0;
+        PlanetLOD::DirectionToFaceUV(PlanetLOD::Vec3d{Dir.X, Dir.Y, Dir.Z}, Face, U, V);
+
+        const int32 Leaf = PlanetLOD::FindLeafContaining(LastSelection.Chunks, Face, U, V);
+        if (Leaf >= 0)
+        {
+            const PlanetLOD::ChunkKey& K = LastSelection.Chunks[Leaf];
+            NadirLOD = K.LOD;
+
+            const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+            for (int32 s = 0; s < (int32)Slots.size(); ++s)
+            {
+                if (Slots[s].State != PlanetStreaming::SlotState::Active || Slots[s].Key != K) continue;
+                if (Pool.IsValidIndex(s) && Pool[s] &&
+                    Pool[s]->GetCollisionEnabled() != ECollisionEnabled::NoCollision)
+                {
+                    NadirCollision = 1;
+                }
+                break;
+            }
+        }
+    }
+    SET_DWORD_STAT(STAT_Planet_NadirLOD,       NadirLOD);
+    SET_DWORD_STAT(STAT_Planet_NadirCollision, NadirCollision);
+    SET_FLOAT_STAT(STAT_Planet_CameraAGL,
+        (float)(CamDistCm / PLANET_METRES_TO_UE_CM - (PlanetRadiusMetres + CameraTerrainHeightM)));
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// planet.Bench — synchronous per-stage benchmark.
+//
+// Everything runs on the game thread, one chunk at a time, so each number is
+// the plain CPU cost of that stage for one chunk with no contention. The RMC
+// numbers are the game-thread cost of the calls; the GPU upload they schedule
+// on the render thread and the async collision cook are not included.
+// ─────────────────────────────────────────────────────────────────────────────
+FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
+{
+    Count = FMath::Clamp(Count, 1, 1024);
+    LOD   = FMath::Clamp(LOD, 0, 18);
+
+    if (!Generator.IsValid())
+    {
+        const FString Msg = TEXT("[Planet] planet.Bench: the noise generator is not built (start PIE first)");
+        UE_LOG(LogTemp, Warning, TEXT("%s"), *Msg);
+        return Msg;
+    }
+
+    // Chunks around the camera at the requested LOD, in a square block.
+    int32 Face = 0;
+    double U = 0.0, V = 0.0;
+    const double CamDistCm = LastCameraPosUE.Size();
+    if (CamDistCm > 1.0)
+    {
+        const FVector3d Dir = LastCameraPosUE / CamDistCm;
+        PlanetLOD::DirectionToFaceUV(PlanetLOD::Vec3d{Dir.X, Dir.Y, Dir.Z}, Face, U, V);
+    }
+    const int32  Tiles    = PlanetLOD::TilesAt((uint8)LOD);
+    const double TileSize = 2.0 / (double)Tiles;
+    const int32  CX = FMath::Clamp((int32)FMath::FloorToDouble((U + 1.0) / TileSize), 0, Tiles - 1);
+    const int32  CY = FMath::Clamp((int32)FMath::FloorToDouble((V + 1.0) / TileSize), 0, Tiles - 1);
+    const int32  Side = FMath::Max(1, FMath::CeilToInt(FMath::Sqrt((float)Count)));
+
+    TArray<PlanetCore::Surface> Surfaces;
+    Surfaces.SetNumUninitialized(PLANET_BODY_VERTS);
+    FPlanetChunkMeshBuilder Builder;
+
+    // A temporary component outside the pool, so the live planet is untouched.
+    URealtimeMeshComponent* Comp = NewObject<URealtimeMeshComponent>(this);
+    Comp->SetupAttachment(RootComponent);
+    Comp->RegisterComponent();
+    Comp->SetMobility(EComponentMobility::Movable);
+    URealtimeMeshSimple* Mesh = Comp->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    if (Mesh)
+    {
+        if (PlanetMaterial) Mesh->SetupMaterialSlot(0, TEXT("Planet"), PlanetMaterial);
+        FRealtimeMeshCollisionConfiguration Collision;
+        Collision.bUseComplexAsSimpleCollision = true;
+        Collision.bUseAsyncCook = true;
+        Mesh->SetCollisionConfig(Collision);
+    }
+    Comp->SetVisibility(false);
+
+    TArray<double> NoiseMs, BuildMs, CreateMs, ConfigMs, TotalMs;
+    const FRealtimeMeshSectionGroupKey GK = FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk"));
+    const FRealtimeMeshSectionKey      SK = FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
+
+    for (int32 i = 0; i < Count; ++i)
+    {
+        const FChunkKey Key((uint8)Face, (uint8)LOD,
+            FMath::Clamp(CX - Side / 2 + i % Side, 0, Tiles - 1),
+            FMath::Clamp(CY - Side / 2 + i / Side, 0, Tiles - 1));
+
+        uint64 T = FPlatformTime::Cycles64();
+        Generator.SampleChunk(Key, TArrayView<PlanetCore::Surface>(Surfaces.GetData(), Surfaces.Num()));
+        NoiseMs.Add(PlanetMsSince(T));
+
+        T = FPlatformTime::Cycles64();
+        FVector3d Origin;
+        Builder.Build(Key, Surfaces.GetData(), PlanetRadiusMetres, Origin);
+        BuildMs.Add(PlanetMsSince(T));
+
+        if (Mesh)
+        {
+            RealtimeMesh::FRealtimeMeshStreamSet Streams = Builder.TakeStreamSet();
+            T = FPlatformTime::Cycles64();
+            Mesh->RemoveSectionGroup(GK);
+            Mesh->CreateSectionGroup(GK, MoveTemp(Streams));
+            CreateMs.Add(PlanetMsSince(T));
+
+            T = FPlatformTime::Cycles64();
+            FRealtimeMeshSectionConfig Config;
+            Mesh->UpdateSectionConfig(SK, Config, true);
+            ConfigMs.Add(PlanetMsSince(T));
+        }
+
+        TotalMs.Add(NoiseMs.Last() + BuildMs.Last()
+                    + (CreateMs.Num() ? CreateMs.Last() : 0.0)
+                    + (ConfigMs.Num() ? ConfigMs.Last() : 0.0));
+    }
+
+    Comp->DestroyComponent();
+
+    auto Row = [](const TCHAR* Name, const TArray<double>& Ms) -> FString
+    {
+        if (Ms.Num() == 0) return FString::Printf(TEXT("%s: n/a"), Name);
+        double Sum = 0.0, Min = Ms[0], Max = Ms[0];
+        for (double Value : Ms) { Sum += Value; Min = FMath::Min(Min, Value); Max = FMath::Max(Max, Value); }
+        return FString::Printf(TEXT("%s: avg %.3f ms | min %.3f | max %.3f"),
+                               Name, Sum / Ms.Num(), Min, Max);
+    };
+
+    TArray<FString> Lines;
+    Lines.Add(FString::Printf(
+        TEXT("[Planet] planet.Bench: %d chunks, LOD %d (side ~%.0f m), game thread, one chunk at a time"),
+        Count, LOD, TileSize * PlanetRadiusMetres));
+    Lines.Add(Row(TEXT("  noise (SampleChunk)         "), NoiseMs));
+    Lines.Add(Row(TEXT("  mesh build (stream set)     "), BuildMs));
+    Lines.Add(Row(TEXT("  RMC remove + create section "), CreateMs));
+    Lines.Add(Row(TEXT("  RMC config + collision call "), ConfigMs));
+    Lines.Add(Row(TEXT("  total per chunk             "), TotalMs));
+    Lines.Add(TEXT("  not included: render-thread GPU upload, async collision cook"));
+
+    FString Report;
+    for (const FString& L : Lines)
+    {
+        UE_LOG(LogTemp, Log, TEXT("%s"), *L);
+        if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 30.f, FColor::Yellow, L, false);
+        Report += L + TEXT("\n");
+    }
+    return Report;
+}
+
+static void PlanetBenchCommand(const TArray<FString>& Args, UWorld* World)
+{
+    if (!World) return;
+    const int32 Count = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 32;
+    const int32 LOD   = Args.Num() > 1 ? FCString::Atoi(*Args[1]) : 12;
+
+    bool bFound = false;
+    for (TActorIterator<AProceduralPlanet> It(World); It; ++It)
+    {
+        It->RunBenchmark(Count, LOD);
+        bFound = true;
+    }
+    if (!bFound)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Planet] planet.Bench: no AProceduralPlanet in this world"));
+    }
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GPlanetBenchCommand(
+    TEXT("planet.Bench"),
+    TEXT("planet.Bench [Count=32] [LOD=12]: times noise, mesh build and RMC calls per chunk on the game thread."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&PlanetBenchCommand));

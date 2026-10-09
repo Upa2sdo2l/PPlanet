@@ -124,6 +124,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Planet")
     FString GetStreamingStatsString() const;
 
+    // Synchronous per-stage benchmark on the game thread: builds Count chunks
+    // at the given LOD around the camera and times noise, mesh build and the
+    // RMC calls separately. Console: planet.Bench [Count] [LOD].
+    // Returns the report; it is also printed on screen and to the log.
+    UFUNCTION(BlueprintCallable, Category="Planet|Debug")
+    FString RunBenchmark(int32 Count = 32, int32 LOD = 12);
+
 private:
     // ── Internals ───────────────────────────────────────────────────────
 
@@ -136,6 +143,25 @@ private:
     void ReleaseRetired();
 
     void ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key);
+
+    // Publishes "stat Planet" values for this frame.
+    void UpdatePlanetStats();
+
+    // Rolling one-second window behind the per-chunk averages in stat Planet.
+    struct FPerfWindow
+    {
+        double WindowStart = 0.0;
+        int32  Built = 0;
+        double NoiseMs = 0.0, NoiseMax = 0.0;
+        double BuildMs = 0.0, BuildMax = 0.0;
+        int32  Committed = 0;
+        double RMCMs = 0.0, RMCMax = 0.0;
+    };
+    FPerfWindow PerfWindow;      // being accumulated
+    FPerfWindow PerfPublished;   // last complete second, shown in stat Planet
+
+    // Terrain height under the camera this frame (metres), from the LOD pass.
+    double CameraTerrainHeightM = 0.0;
 
     FPlanetNoiseGenerator    Generator;
     PlanetStreaming::Scheduler Scheduler;
@@ -157,6 +183,11 @@ private:
         // The task writing into this slot, if any. EndPlay waits on it
         // before freeing the scratch the task points at.
         TFuture<void>               Future;
+
+        // Worker-side timings of the last run, read by the game thread after
+        // bDone (the release/acquire pair makes them visible).
+        double                      NoiseMs = 0.0;
+        double                      BuildMs = 0.0;
     };
     TArray<TUniquePtr<FSlotWork>> SlotWork;
 

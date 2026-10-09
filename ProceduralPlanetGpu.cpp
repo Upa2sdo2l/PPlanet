@@ -5,8 +5,11 @@
 //   * one instance of GridMesh (a 65x65 grid, local box [-0.5, 0.5]^3) in the
 //     single instanced component TerrainISM; its transform maps that box onto
 //     the chunk's bounding box, so engine culling sees tight bounds;
-//   * one 65x65 tile in three atlas textures: target vertex positions in the
-//     instance's local space (RGBA32F), normals and biome weights (RGBA8).
+//   * one 65x65 tile in three atlas render targets: target vertex positions
+//     in the instance's local space (RGBA32F), normals and biome weights
+//     (RGBA8). The tiles are written by two compute passes (PlanetErosion
+//     plugin, GpuErosion/): erosion of the chunk's halo grid, then position,
+//     normal (from the eroded neighbours) and biomes per vertex.
 // The material (MaterialHLSL/README.md) moves each grid vertex to its target,
 // stitches edges against coarser neighbours and morphs splits in over time.
 //
@@ -20,7 +23,7 @@
 #include "RealtimeMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
-#include "Engine/Texture2D.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "MeshDescription.h"
@@ -41,38 +44,21 @@ namespace
     //   0 atlas tile   1 morph start time (s)   2..5 edge LOD deltas U- U+ V- V+
     constexpr int32 CUSTOM_DATA_FLOATS = 6;
 
-    UTexture2D* MakeAtlasTexture(int32 Size, EPixelFormat Format, TextureFilter Filter, const TCHAR* Name)
+    // Atlas written by compute shaders (UAV) and sampled by the material.
+    UTextureRenderTarget2D* MakeAtlasTarget(UObject* Outer, int32 Size, EPixelFormat Format,
+                                            TextureFilter Filter, const TCHAR* Name)
     {
-        UTexture2D* Tex = UTexture2D::CreateTransient(Size, Size, Format, FName(Name));
-        if (!Tex) return nullptr;
-        Tex->SRGB        = false;              // data, not colour
-        Tex->Filter      = Filter;
-        Tex->AddressX    = TA_Clamp;
-        Tex->AddressY    = TA_Clamp;
-        Tex->NeverStream = true;
-        Tex->LODGroup    = TEXTUREGROUP_Pixels2D;
-        Tex->UpdateResource();
-        return Tex;
-    }
-
-    // Copies one 65x65 tile into the texture at (DestX, DestY). The copy and
-    // the region live until the render thread has consumed them.
-    void UploadTileRegion(UTexture2D* Tex, int32 DestX, int32 DestY, const void* Src, int32 BytesPerTexel)
-    {
-        if (!Tex) return;
-        const int32 Side  = PlanetGpu::TILE_SIDE;
-        const int32 Bytes = Side * Side * BytesPerTexel;
-
-        uint8* Copy = static_cast<uint8*>(FMemory::Malloc(Bytes));
-        FMemory::Memcpy(Copy, Src, Bytes);
-        FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(DestX, DestY, 0, 0, Side, Side);
-
-        Tex->UpdateTextureRegions(0, 1, Region, (uint32)(Side * BytesPerTexel), (uint32)BytesPerTexel, Copy,
-            [](uint8* Data, const FUpdateTextureRegion2D* R)
-            {
-                FMemory::Free(Data);
-                delete R;
-            });
+        UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(Outer, FName(Name), RF_Transient);
+        if (!RT) return nullptr;
+        RT->bCanCreateUAV     = true;
+        RT->bAutoGenerateMips = false;
+        RT->Filter            = Filter;
+        RT->AddressX          = TA_Clamp;
+        RT->AddressY          = TA_Clamp;
+        RT->ClearColor        = FLinearColor::Transparent;
+        RT->InitCustomFormat(Size, Size, Format, /*bInForceLinearGamma*/ true);   // data, not colour
+        RT->UpdateResourceImmediate(true);
+        return RT;
     }
 
     FTransform TileTransform(const PlanetGpu::TileData& T)
@@ -104,6 +90,12 @@ void AProceduralPlanet::InitGpuTerrain()
         return;
     }
 
+    if (!PlanetErosionGpu::IsSupported())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Planet] GPU terrain needs SM5 compute shaders; using the RealtimeMesh renderer."));
+        return;
+    }
+
     GridMesh = BuildGridMesh();
     if (!GridMesh)
     {
@@ -117,9 +109,9 @@ void AProceduralPlanet::InitGpuTerrain()
 
     // Positions are read with Load (exact texels); normals and biomes are
     // sampled bilinearly in the pixel shader.
-    PosAtlas    = MakeAtlasTexture(AtlasTexels, PF_A32B32G32R32F, TF_Nearest,  TEXT("PlanetPosAtlas"));
-    NormalAtlas = MakeAtlasTexture(AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetNormalAtlas"));
-    BiomeAtlas  = MakeAtlasTexture(AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetBiomeAtlas"));
+    PosAtlas    = MakeAtlasTarget(this, AtlasTexels, PF_A32B32G32R32F, TF_Nearest,  TEXT("PlanetPosAtlas"));
+    NormalAtlas = MakeAtlasTarget(this, AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetNormalAtlas"));
+    BiomeAtlas  = MakeAtlasTarget(this, AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetBiomeAtlas"));
     if (!PosAtlas || !NormalAtlas || !BiomeAtlas)
     {
         UE_LOG(LogTemp, Error, TEXT("[Planet] GPU terrain: atlas textures could not be created, using the RealtimeMesh renderer."));
@@ -171,8 +163,8 @@ void AProceduralPlanet::InitGpuTerrain()
         GpuSlots[i] = FGpuSlot();
         GpuSlots[i].CustomData[0] = (float)i;
         TerrainISM->SetCustomData(i, MakeArrayView(GpuSlots[i].CustomData, CUSTOM_DATA_FLOATS), false);
-        SlotWork[i]->Tile = MakeUnique<PlanetGpu::TileData>();
     }
+    PendingTiles.Reset();
     TerrainISM->MarkRenderStateDirty();
 
     // Chunk meshes now only carry collision.
@@ -270,18 +262,50 @@ UStaticMesh* AProceduralPlanet::BuildGridMesh()
 // ─────────────────────────────────────────────────────────────────────────────
 // Per chunk
 // ─────────────────────────────────────────────────────────────────────────────
-void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, const PlanetGpu::TileData& Tile)
+// Queues the slot's tile for this frame's compute dispatch (GpuFlushTiles).
+void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile)
 {
     if (!GpuSlots.IsValidIndex(SlotIndex)) return;
 
-    const int32 DestX = (SlotIndex % AtlasTilesPerRow) * PlanetGpu::TILE_SIDE;
-    const int32 DestY = (SlotIndex / AtlasTilesPerRow) * PlanetGpu::TILE_SIDE;
+    Tile.Info.AtlasTile = SlotIndex;
+    static_assert(sizeof(PlanetGpu::GpuVertex)   == PlanetErosionGpu::VertexBytes, "vertex layout");
+    static_assert(sizeof(PlanetGpu::GpuTileInfo) == PlanetErosionGpu::TileBytes,   "tile layout");
+    static_assert(PlanetGpu::HALO_POINTS         == PlanetErosionGpu::HaloPoints,  "halo grid");
 
-    UploadTileRegion(PosAtlas,    DestX, DestY, Tile.Position, (int32)sizeof(float) * 4);
-    UploadTileRegion(NormalAtlas, DestX, DestY, Tile.Normal,   4);
-    UploadTileRegion(BiomeAtlas,  DestX, DestY, Tile.Biome,    4);
+    PendingTiles.Vertices.Append(reinterpret_cast<const uint8*>(Tile.Vertices), (int32)sizeof(Tile.Vertices));
+    PendingTiles.Tiles.Append(reinterpret_cast<const uint8*>(&Tile.Info), (int32)sizeof(Tile.Info));
+    ++PendingTiles.NumTiles;
 
     GpuSlots[SlotIndex].PlanetTransform = TileTransform(Tile);
+}
+
+void AProceduralPlanet::GpuFlushTiles()
+{
+    if (PendingTiles.NumTiles <= 0) return;
+    PerfWindow.GpuTiles += PendingTiles.NumTiles;
+    const int32 Tiles = PendingTiles.NumTiles;
+    PlanetErosionGpu::Dispatch(PosAtlas, NormalAtlas, BiomeAtlas, AtlasTilesPerRow,
+                               GpuShaderParams, MoveTemp(PendingTiles));
+    // The arrays went to the render thread; keep next frame's appends cheap.
+    PendingTiles.Reset();
+    PendingTiles.Vertices.Reserve(Tiles * PlanetErosionGpu::HaloPoints * PlanetErosionGpu::VertexBytes);
+    PendingTiles.Tiles.Reserve(Tiles * PlanetErosionGpu::TileBytes);
+}
+
+void AProceduralPlanet::UpdateGpuShaderParams()
+{
+    const PlanetErosion::Params& E = Generator.GetErosion();
+    PlanetErosionGpu::FShaderParams& P = GpuShaderParams;
+    P.P0       = FVector4f((float)E.ScaleMetres, (float)E.Strength, (float)E.GullyWeight, (float)E.Detail);
+    P.Rounding = FVector4f((float)E.Rounding[0], (float)E.Rounding[1], (float)E.Rounding[2], (float)E.Rounding[3]);
+    P.Onset    = FVector4f((float)E.Onset[0], (float)E.Onset[1], (float)E.Onset[2], (float)E.Onset[3]);
+    P.P3       = FVector4f((float)E.AssumedSlope[0], (float)E.AssumedSlope[1], (float)E.CellScale, (float)E.Normalization);
+    P.P4       = FVector4f((float)E.Lacunarity, (float)E.Gain, (float)E.HeightOffset, 0.f);
+    P.Octaves  = PlanetErosion::IsEnabled(E) ? E.Octaves : 0;
+    P.Seed     = E.Seed;
+
+    const PlanetCore::NoiseParams& N = Generator.GetCoreParams();
+    P.Climate  = FVector4f(N.SnowLatitudeStart, N.SnowAltitudeStart, N.HumidityVariance, 0.f);
 }
 
 FTransform AProceduralPlanet::GpuWorldTransform(int32 SlotIndex) const

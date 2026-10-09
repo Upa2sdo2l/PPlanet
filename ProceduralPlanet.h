@@ -6,7 +6,9 @@
 //                   a single instanced component; the material moves vertices
 //                   to positions stored in an atlas texture, stitches LOD seams
 //                   and morphs splits. RMC components only carry collision, for
-//                   chunks within CollisionDistanceMetres.
+//                   chunks within CollisionDistanceMetres. The atlas tiles are
+//                   written by compute shaders (PlanetErosion plugin): erosion,
+//                   normals and biomes per tile.
 //   RealtimeMesh  : the original path, one visible RMC component per chunk.
 //
 // POLICY: the pool has PLANET_COMPONENT_POOL_SIZE slots and never grows. The
@@ -33,6 +35,7 @@
 #include "planet_core/PlanetLOD.h"
 #include "planet_core/PlanetStreaming.h"
 #include "planet_core/PlanetGpuTile.h"
+#include "GpuErosion/PlanetErosionGpu.h"
 #include "ProceduralPlanet.generated.h"
 
 class URealtimeMeshComponent;
@@ -42,6 +45,7 @@ class UMaterialInstanceDynamic;
 class UInstancedStaticMeshComponent;
 class UStaticMesh;
 class UTexture2D;
+class UTextureRenderTarget2D;
 
 UENUM()
 enum class EPlanetTerrainRenderer : uint8
@@ -98,6 +102,11 @@ public:
     // would open sub-millimetre gaps between chunks near the player.
     UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain", meta=(ClampMin="100.0"))
     double GPUTerrainRebaseDistanceMetres = 4000.0;
+
+    // Gullies and ridges of the erosion filter (GPU renderer only; the
+    // RealtimeMesh renderer shows the terrain without erosion).
+    UPROPERTY(EditAnywhere, Category="Planet|Erosion")
+    FPlanetErosionSettings Erosion;
 
     // Worst-case mountain height above the sphere, used only for bounding
     // spheres and horizon culling. Over-estimating costs a little culling;
@@ -215,7 +224,12 @@ private:
     // if the renderer is not selected or anything is missing.
     void InitGpuTerrain();
     UStaticMesh* BuildGridMesh();
-    void GpuUploadTile(int32 SlotIndex, const PlanetGpu::TileData& Tile);
+    void GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile);
+    // Sends the tiles queued this frame to the compute shaders (one batch).
+    void GpuFlushTiles();
+    // Erosion and climate constants of the compute shaders, from the
+    // generator's current settings.
+    void UpdateGpuShaderParams();
     void GpuShowSlot(int32 SlotIndex, bool bShow, bool bMorphIn);
     void GpuUpdateEdgeDeltas();
     void GpuRebaseIfNeeded(const FVector3d& CameraPos);
@@ -237,13 +251,13 @@ private:
     TObjectPtr<UStaticMesh> GridMesh;
 
     UPROPERTY(Transient)
-    TObjectPtr<UTexture2D> PosAtlas;
+    TObjectPtr<UTextureRenderTarget2D> PosAtlas;
 
     UPROPERTY(Transient)
-    TObjectPtr<UTexture2D> NormalAtlas;
+    TObjectPtr<UTextureRenderTarget2D> NormalAtlas;
 
     UPROPERTY(Transient)
-    TObjectPtr<UTexture2D> BiomeAtlas;
+    TObjectPtr<UTextureRenderTarget2D> BiomeAtlas;
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> TerrainMID;
@@ -257,6 +271,10 @@ private:
         bool       bHasCollisionMesh = false;
     };
     TArray<FGpuSlot> GpuSlots;
+
+    // Tiles committed this frame, dispatched together by GpuFlushTiles.
+    PlanetErosionGpu::FTileBatch  PendingTiles;
+    PlanetErosionGpu::FShaderParams GpuShaderParams;
 
     // Where the instanced component sits, relative to the actor (cm).
     FVector3d GpuTerrainOrigin = FVector3d::ZeroVector;
@@ -291,6 +309,9 @@ private:
         double BuildMs = 0.0, BuildMax = 0.0;
         int32  Committed = 0;
         double RMCMs = 0.0, RMCMax = 0.0;
+        int32  GpuTiles = 0;                           // tiles sent to the compute shaders
+        int32  CollisionBuilt = 0;                     // collision meshes built (GPU renderer)
+        double CollisionErosionMs = 0.0, CollisionErosionMax = 0.0;   // CPU erosion for them
 
         // Game-thread stage time summed over the window's frames (ms).
         int32  Frames = 0;
@@ -330,7 +351,9 @@ private:
         EJob                        Job = EJob::Full;
         bool                        bBuildMesh = true;     // build the RMC stream set
         bool                        bMeshBuilt = false;
-        TUniquePtr<PlanetGpu::TileData> Tile;               // GPU renderer only
+        // GPU renderer only: allocated per job (215 KB), freed once uploaded.
+        TUniquePtr<PlanetGpu::TileData> Tile;
+        bool                        bGpuTile = false;      // this job builds a GPU tile
 
         // The task writing into this slot, if any. EndPlay waits on it
         // before freeing the scratch the task points at.
@@ -340,6 +363,7 @@ private:
         // bDone (the release/acquire pair makes them visible).
         double                      NoiseMs = 0.0;
         double                      BuildMs = 0.0;
+        double                      ErosionMs = 0.0;     // CPU erosion of a collision mesh
     };
     TArray<TUniquePtr<FSlotWork>> SlotWork;
 

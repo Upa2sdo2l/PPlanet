@@ -66,6 +66,11 @@
 4. Нормаль: `PlanetNormalAtlas` RGB → **× 2** → **− 1** → **Normalize** → пин **Normal**.
 5. Биомы: `PlanetBiomeAtlas` RGBA — это те же веса, что раньше лежали в Vertex Color (R трава, G скалы, B песок, A снег). Скопируйте из старого материала часть, которая смешивает цвета, и подключите вместо ноды Vertex Color.
 
+## 2б. Плагин эрозии
+
+Атласы заполняют compute-шейдеры плагина `PlanetErosion`: настройка в `GpuErosion/README.md`.
+У `PlanetNormalAtlas` и `PlanetBiomeAtlas` лучше выставить **Sampler Type: Linear Color**.
+
 ## 3. Актор планеты
 
 - **GPU Terrain → Terrain Renderer**: `GPUInstanced` (по умолчанию).

@@ -2,7 +2,6 @@
 #include "PlanetGpuTile.h"
 #include <algorithm>
 #include <cmath>
-#include <vector>
 
 namespace PlanetGpu
 {
@@ -10,14 +9,10 @@ namespace PlanetGpu
 namespace
 {
     constexpr double METRES_TO_CM = 100.0;
-
-    inline uint8_t ToUnorm8(double V)
-    {
-        return (uint8_t)std::clamp((int)std::lround(std::clamp(V, 0.0, 1.0) * 255.0), 0, 255);
-    }
 }
 
-void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::Surface* Surfaces,
+void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Halo,
+               const PlanetErosion::ChunkInputs* Inputs, const PlanetErosion::Params& Erosion,
                double PlanetRadiusMetres, TileData& Out)
 {
     using PlanetCore::Vec3d;
@@ -41,33 +36,40 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::Surface* Surf
     const double RadiusCm = PlanetRadiusMetres * METRES_TO_CM;
     const Vec3d  O = C * RadiusCm;
 
-    // ── Positions in the chunk frame, and their bounding box.
-    static thread_local std::vector<double> Q;
-    Q.resize((size_t)TILE_TEXELS * 3);
+    double ErodeLo = 0.0, ErodeHi = 0.0;
+    if (Inputs) PlanetErosion::DeltaRange(Erosion, ErodeLo, ErodeHi);
 
+    auto Frame = [&](const Vec3d& P, double q[3])
+    {
+        const Vec3d R = P - O;
+        q[0] = Vec3d::Dot(R, X); q[1] = Vec3d::Dot(R, Y); q[2] = Vec3d::Dot(R, Z);
+    };
+
+    // ── Bounding box of the chunk's own vertices (not the halo), widened by
+    //    the erosion range wherever erosion may act.
     double Min[3] = { 1e300,  1e300,  1e300};
     double Max[3] = {-1e300, -1e300, -1e300};
-
-    for (int32_t gy = 0; gy < TILE_SIDE; ++gy)
+    auto Grow = [&](const double q[3])
     {
-        for (int32_t gx = 0; gx < TILE_SIDE; ++gx)
-        {
-            const int32_t i = gx + gy * TILE_SIDE;
-            double U, V;
-            PlanetCore::ChunkVertexUV(Key, gx + 1, gy + 1, U, V);
-            const Vec3d Dir = PlanetCore::CubeFaceDirection(Key.Face, U, V);
-            const Vec3d P   = Dir * ((PlanetRadiusMetres + Surfaces[i].Height) * METRES_TO_CM);
-            const Vec3d R   = P - O;
+        for (int a = 0; a < 3; ++a) { Min[a] = std::min(Min[a], q[a]); Max[a] = std::max(Max[a], q[a]); }
+    };
 
-            const double q[3] = {Vec3d::Dot(R, X), Vec3d::Dot(R, Y), Vec3d::Dot(R, Z)};
-            for (int a = 0; a < 3; ++a)
+    constexpr int32_t G = HALO_SIDE;
+    for (int32_t y = 0; y < TILE_SIDE; ++y)
+        for (int32_t x = 0; x < TILE_SIDE; ++x)
+        {
+            const int32_t g = (x + 1) + (y + 1) * G;
+            const Vec3d& Dir = Halo.Dir[g];
+            double q[3];
+            Frame(Dir * ((PlanetRadiusMetres + Halo.Height[g]) * METRES_TO_CM), q);
+            Grow(q);
+            const double M = Inputs ? (double)Inputs->Mask[g] : 0.0;
+            if (M > 0.0)
             {
-                Q[(size_t)i * 3 + a] = q[a];
-                Min[a] = std::min(Min[a], q[a]);
-                Max[a] = std::max(Max[a], q[a]);
+                Frame(Dir * ((PlanetRadiusMetres + Halo.Height[g] + ErodeLo * M) * METRES_TO_CM), q); Grow(q);
+                Frame(Dir * ((PlanetRadiusMetres + Halo.Height[g] + ErodeHi * M) * METRES_TO_CM), q); Grow(q);
             }
         }
-    }
 
     // ── Box -> instance transform. Thin boxes get a minimum thickness so the
     //    scale never degenerates (a flat ocean chunk would otherwise be 0 cm).
@@ -90,21 +92,43 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::Surface* Surf
     Out.Translation[1] = T.Y;
     Out.Translation[2] = T.Z;
 
-    // ── Texels.
-    for (int32_t i = 0; i < TILE_TEXELS; ++i)
+    GpuTileInfo& I = Out.Info;
+    I = GpuTileInfo();
+    for (int a = 0; a < 3; ++a)
     {
-        for (int a = 0; a < 3; ++a)
-            Out.Position[i][a] = (float)((Q[(size_t)i * 3 + a] - Mid[a]) / Ext[a]);
-        Out.Position[i][3] = 0.f;
+        I.AxisX[a] = (float)Out.AxisX[a];
+        I.AxisY[a] = (float)Out.AxisY[a];
+        I.AxisZ[a] = (float)Out.AxisZ[a];
+        I.ExtMetres[a] = (float)(Ext[a] / METRES_TO_CM);
+    }
+    I.AtlasTile = -1;
 
-        const Vec3d& N = Surfaces[i].Normal;
-        Out.Normal[i][0] = ToUnorm8(N.X * 0.5 + 0.5);
-        Out.Normal[i][1] = ToUnorm8(N.Y * 0.5 + 0.5);
-        Out.Normal[i][2] = ToUnorm8(N.Z * 0.5 + 0.5);
-        Out.Normal[i][3] = 255;
+    // ── Every halo-grid point.
+    for (int32_t g = 0; g < HALO_POINTS; ++g)
+    {
+        const Vec3d& Dir = Halo.Dir[g];
+        double q[3];
+        Frame(Dir * ((PlanetRadiusMetres + Halo.Height[g]) * METRES_TO_CM), q);
 
-        for (int b = 0; b < 4; ++b)
-            Out.Biome[i][b] = ToUnorm8((double)Surfaces[i].Biome[b]);
+        GpuVertex& V = Out.Vertices[g];
+        for (int a = 0; a < 3; ++a) V.LocalBase[a] = (float)((q[a] - Mid[a]) / Ext[a]);
+        V.Height0 = (float)Halo.Height[g];
+        V.PRef[0] = (float)(Dir.X * PlanetRadiusMetres);
+        V.PRef[1] = (float)(Dir.Y * PlanetRadiusMetres);
+        V.PRef[2] = (float)(Dir.Z * PlanetRadiusMetres);
+        if (Inputs)
+        {
+            V.Fade = Inputs->Fade[g];
+            V.Mask = Inputs->Mask[g];
+            V.Gradient[0] = (float)Inputs->Gradient[g].X;
+            V.Gradient[1] = (float)Inputs->Gradient[g].Y;
+            V.Gradient[2] = (float)Inputs->Gradient[g].Z;
+        }
+        else
+        {
+            V.Fade = 0.f; V.Mask = 0.f;
+            V.Gradient[0] = V.Gradient[1] = V.Gradient[2] = 0.f;
+        }
     }
 }
 

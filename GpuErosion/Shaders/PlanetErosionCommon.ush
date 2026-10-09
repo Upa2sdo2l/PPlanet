@@ -1,0 +1,271 @@
+// PlanetErosionCommon.ush
+//
+//   Erosion filter and Phacelle noise copyright (c) 2025 Rune Skovbo Johansen.
+//   This Source Code Form is subject to the terms of the Mozilla Public
+//   License, v. 2.0. If a copy of the MPL was not distributed with this
+//   file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// GPU twin of planet_core/PlanetErosion.cpp (erosion) and of
+// NoiseGraph::ComputeClimate / ComputeBiomes (biomes), plus the per-vertex
+// work of the tile pass. The CPU files are the reference; the harness runs
+// this file as C++ (hlsl_mock.h) against them.
+//
+// Shared subset of HLSL and C++: no in/out parameters (functions return
+// structs), no swizzles other than single .x/.y/.z/.w, no casts to vectors,
+// no initialiser lists, no attributes.
+#pragma once
+
+static const float PLANET_TAU = 6.28318530717959;
+
+// Same layout as PlanetGpu::GpuVertex (48 bytes).
+struct FPlanetVertexIn
+{
+    float3 LocalBase;   // instance-local position before erosion
+    float  Height0;     // height before erosion, metres
+    float3 PRef;        // direction * radius, metres
+    float  Fade;        // -1 valleys .. +1 peaks
+    float3 Gradient;    // steering gradient, planet space, m/m
+    float  Mask;        // land mask; 0 = no erosion
+};
+
+// Same layout as PlanetGpu::GpuTileInfo (64 bytes).
+struct FPlanetTileIn
+{
+    float3 AxisX;  int   AtlasTile;
+    float3 AxisY;  float Pad0;
+    float3 AxisZ;  float Pad1;
+    float3 ExtMetres; float Pad2;
+};
+
+struct FPlanetErosionParams
+{
+    float4 P0;         // ScaleMetres, Strength, GullyWeight, Detail
+    float4 Rounding;   // ridges, creases, input multiplier, per-octave multiplier
+    float4 Onset;      // input, octave, ridge-map input, ridge-map octave
+    float4 P3;         // AssumedSlope value, AssumedSlope override, CellScale, Normalization
+    float4 P4;         // Lacunarity, Gain, HeightOffset, (unused)
+    int    Octaves;
+    uint   Seed;
+};
+
+float PlanetEro_PowInv(float T, float Power) { return 1.0 - pow(1.0 - saturate(T), Power); }
+float PlanetEro_EaseOut(float T) { float V = 1.0 - saturate(T); return 1.0 - V * V; }
+float PlanetEro_SmoothStart(float T, float Smoothing)
+{
+    if (T >= Smoothing) return T - 0.5 * Smoothing;
+    return 0.5 * T * T / Smoothing;
+}
+float PlanetEro_Sign(float V) { return (V > 0.0) ? 1.0 : ((V < 0.0) ? -1.0 : 0.0); }
+float3 PlanetEro_SafeNormalize(float3 V)
+{
+    float L = length(V);
+    return (L > 1e-10) ? V / L : V;
+}
+
+// pcg3d (Jarzynski & Olano 2020); random offset in [-1, 1]^3 for a lattice cell.
+float3 PlanetEro_Hash3(int CX, int CY, int CZ, uint Seed)
+{
+    uint X = ((uint)CX) ^ Seed;
+    uint Y = (uint)CY;
+    uint Z = (uint)CZ;
+    X = X * 1664525u + 1013904223u;
+    Y = Y * 1664525u + 1013904223u;
+    Z = Z * 1664525u + 1013904223u;
+    X += Y * Z; Y += Z * X; Z += X * Y;
+    X ^= X >> 16u; Y ^= Y >> 16u; Z ^= Z >> 16u;
+    X += Y * Z; Y += Z * X; Z += X * Y;
+    float Inv = 2.0 / 4294967295.0;
+    return float3((float)X * Inv - 1.0, (float)Y * Inv - 1.0, (float)Z * Inv - 1.0);
+}
+
+struct FPlanetPhacelle
+{
+    float  C;
+    float  S;
+    float3 Side;
+};
+
+// Stripes along NormDir (a unit tangent vector), from the 4x4x4 lattice cells
+// around P (cell units). The wave varies along Up x NormDir: across the slope.
+FPlanetPhacelle PlanetEro_Phacelle(float3 P, float3 Up, float3 NormDir, float Freq, float Offset,
+                                   float Normalization, uint Seed)
+{
+    float3 SideDir = cross(Up, NormDir) * (Freq * PLANET_TAU);
+    float  Off     = Offset * PLANET_TAU;
+
+    float3 F    = floor(P);
+    float3 Frac = P - F;
+    int FX = (int)F.x;
+    int FY = (int)F.y;
+    int FZ = (int)F.z;
+
+    float PX = 0.0;
+    float PY = 0.0;
+    float WeightSum = 0.0;
+    for (int i = -1; i <= 2; ++i)
+    {
+        for (int j = -1; j <= 2; ++j)
+        {
+            for (int k = -1; k <= 2; ++k)
+            {
+                float3 Rand = PlanetEro_Hash3(FX + i, FY + j, FZ + k, Seed) * 0.5;
+                float3 V = float3(Frac.x - (float)i - Rand.x, Frac.y - (float)j - Rand.y, Frac.z - (float)k - Rand.z);
+                // Zero weight beyond d^2 = 2.2499 (most cells): skip exp, sin, cos.
+                float D2 = dot(V, V);
+                if (D2 >= 2.2499) continue;
+                float W = max(0.0, exp(-D2 * 2.0) - 0.01111);
+                WeightSum += W;
+                float Wave = dot(V, SideDir) + Off;
+                PX += cos(Wave) * W;
+                PY += sin(Wave) * W;
+            }
+        }
+    }
+
+    FPlanetPhacelle Out;
+    Out.C = 0.0;
+    Out.S = 0.0;
+    Out.Side = SideDir;
+    if (WeightSum > 0.0)
+    {
+        float IX = PX / WeightSum;
+        float IY = PY / WeightSum;
+        float Magnitude = max(1.0 - Normalization, sqrt(IX * IX + IY * IY));
+        Out.C = IX / Magnitude;
+        Out.S = IY / Magnitude;
+    }
+    return Out;
+}
+
+// Height change (metres) of the erosion filter at one point. See
+// PlanetErosion::Erode for the meaning of every input.
+float PlanetEro_DeltaHeight(float3 PRef, float3 Gradient, float FadeTarget, float Mask, FPlanetErosionParams E)
+{
+    float ScaleMetres = E.P0.x;
+    if (Mask <= 0.0 || E.P0.y <= 0.0 || ScaleMetres <= 0.0 || E.Octaves <= 0) return 0.0;
+
+    float GullyWeight   = E.P0.z;
+    float Detail        = E.P0.w;
+    float CellScale     = E.P3.z;
+    float Normalization = E.P3.w;
+
+    float3 Up = normalize(PRef);
+    float Strength = E.P0.y * ScaleMetres;
+    float Fade = clamp(FadeTarget, -1.0, 1.0);
+
+    float Height = 0.0;
+    float Freq = 1.0 / (ScaleMetres * CellScale);
+    float SlopeLength = max(length(Gradient), 1e-10);
+    float Magnitude = 0.0;
+    float RoundingMult = 1.0;
+
+    float RoundingForInput = lerp(E.Rounding.y, E.Rounding.x, saturate(Fade + 0.5)) * E.Rounding.z;
+    float CombiMask = PlanetEro_EaseOut(PlanetEro_SmoothStart(SlopeLength * E.Onset.x, RoundingForInput * E.Onset.x));
+
+    float3 GullySlope = Gradient + ((Gradient / SlopeLength) * E.P3.x - Gradient) * E.P3.y;
+
+    for (int i = 0; i < E.Octaves; ++i)
+    {
+        uint OctaveSeed = E.Seed + (uint)i * 0x9E3779B9u;
+        FPlanetPhacelle Ph = PlanetEro_Phacelle(PRef * Freq, Up, PlanetEro_SafeNormalize(GullySlope),
+                                                CellScale, 0.25, Normalization, OctaveSeed);
+        float3 Side = Ph.Side * (-Freq);
+        float Sloping = abs(Ph.S);
+
+        GullySlope = GullySlope + Side * (PlanetEro_Sign(Ph.S) * Strength * GullyWeight);
+
+        float FadedH = lerp(Fade, Ph.C * GullyWeight, CombiMask);
+        Height    += FadedH * Strength;
+        Magnitude += Strength;
+        Fade = FadedH;
+
+        float RoundingForOctave = lerp(E.Rounding.y, E.Rounding.x, saturate(Ph.C + 0.5)) * RoundingMult;
+        float NewMask = PlanetEro_EaseOut(PlanetEro_SmoothStart(Sloping * E.Onset.y, RoundingForOctave * E.Onset.y));
+        CombiMask = PlanetEro_PowInv(CombiMask, Detail) * NewMask;
+
+        Strength     *= E.P4.y;
+        Freq         *= E.P4.x;
+        RoundingMult *= E.Rounding.w;
+    }
+
+    return (Height + E.P4.z * Magnitude) * saturate(Mask);
+}
+
+// NoiseGraph::ComputeClimate + ComputeBiomes. Returns grass, rock, sand, snow.
+// ClimateParams: SnowLatitudeStart, SnowAltitudeStart, HumidityVariance.
+float4 PlanetEro_Biomes(float3 Dir, float Height, float Slope, float4 ClimateParams)
+{
+    float SinLat = clamp(Dir.z, -1.0, 1.0);
+    float Lat    = asin(SinLat);
+
+    float BaseTemp    = pow(max(0.0, cos(Lat)), 1.5);
+    float Lapse       = max(0.0, Height) / 11000.0;
+    float Temperature = saturate(BaseTemp - Lapse);
+
+    float LatBand  = 0.5 + 0.5 * cos(6.0 * Lat);
+    float Interior = saturate(Height / 2000.0);
+    float Aridity  = saturate((1.0 - LatBand) * (1.0 + 0.5 * Interior) * 0.5 + (1.0 - LatBand) * ClimateParams.z);
+
+    float LatTrig   = saturate((abs(SinLat) - (ClimateParams.x - 0.10)) / 0.20);
+    float AltTrig   = saturate((Height - (ClimateParams.y - 500.0)) / 1000.0);
+    float SnowCover = saturate(max(LatTrig, AltTrig) * (1.0 - Temperature * 0.4));
+
+    float Snow      = saturate(SnowCover * (1.0 - saturate(Slope * 1.4)));
+    float RockSlope = saturate((Slope - 0.35) / 0.35);
+    float RockCold  = saturate((0.30 - Temperature) / 0.18);
+    float Rock      = saturate(max(RockSlope, RockCold * 0.6) * (1.0 - Snow));
+    float SandArid  = saturate((Aridity - 0.55) / 0.25);
+    float SandBeach = saturate((60.0 - Height) / 60.0) * saturate((0.30 - Slope) / 0.25);
+    float Sand      = saturate(max(SandArid, SandBeach * 0.7) * (1.0 - Snow) * (1.0 - Rock));
+    float Grass     = saturate(1.0 - Snow - Rock - Sand);
+
+    float Sum = Grass + Rock + Sand + Snow;
+    if (Sum < 1e-8) return float4(1.0, 0.0, 0.0, 0.0);
+    return float4(Grass / Sum, Rock / Sum, Sand / Sum, Snow / Sum);
+}
+
+// Eroded point in the chunk frame, metres, relative to the instance box centre.
+float3 PlanetEro_FramePoint(FPlanetVertexIn V, float DeltaH, FPlanetTileIn T)
+{
+    float3 Up  = normalize(V.PRef);
+    float3 UpC = float3(dot(Up, T.AxisX), dot(Up, T.AxisY), dot(Up, T.AxisZ));
+    float3 Lm  = float3(V.LocalBase.x * T.ExtMetres.x, V.LocalBase.y * T.ExtMetres.y, V.LocalBase.z * T.ExtMetres.z);
+    return Lm + UpC * DeltaH;
+}
+
+struct FPlanetTexelOut
+{
+    float4 Pos;      // instance-local target, w = 0
+    float4 Normal;   // planet-space normal * 0.5 + 0.5, w = 1
+    float4 Biome;    // grass, rock, sand, snow
+};
+
+// One chunk vertex: C is the vertex, L/R/D/U its grid neighbours along -U/+U
+// and -V/+V (halo points on the border), with their erosion deltas.
+FPlanetTexelOut PlanetEro_Texel(FPlanetVertexIn C, float DC,
+                                FPlanetVertexIn L, float DL, FPlanetVertexIn R, float DR,
+                                FPlanetVertexIn D, float DD, FPlanetVertexIn U, float DU,
+                                FPlanetTileIn T, float4 ClimateParams)
+{
+    float3 E  = PlanetEro_FramePoint(C, DC, T);
+    float3 Su = PlanetEro_FramePoint(R, DR, T) - PlanetEro_FramePoint(L, DL, T);
+    float3 Sv = PlanetEro_FramePoint(U, DU, T) - PlanetEro_FramePoint(D, DD, T);
+
+    float3 Up  = normalize(C.PRef);
+    float3 UpC = float3(dot(Up, T.AxisX), dot(Up, T.AxisY), dot(Up, T.AxisZ));
+
+    float3 NC = cross(Su, Sv);
+    float NL = length(NC);
+    NC = (NL > 1e-20) ? NC / NL : UpC;
+    if (dot(NC, UpC) < 0.0) NC = -NC;
+    float3 N = normalize(T.AxisX * NC.x + T.AxisY * NC.y + T.AxisZ * NC.z);
+
+    float Slope  = saturate(1.0 - dot(N, Up));
+    float Height = C.Height0 + DC;
+
+    FPlanetTexelOut Out;
+    Out.Pos    = float4(E.x / T.ExtMetres.x, E.y / T.ExtMetres.y, E.z / T.ExtMetres.z, 0.0);
+    Out.Normal = float4(N.x * 0.5 + 0.5, N.y * 0.5 + 0.5, N.z * 0.5 + 0.5, 1.0);
+    Out.Biome  = PlanetEro_Biomes(Up, Height, Slope, ClimateParams);
+    return Out;
+}

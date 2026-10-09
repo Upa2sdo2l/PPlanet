@@ -208,6 +208,20 @@ struct Surface
     float    HumidityRaw = 0.f;
 };
 
+// The chunk's sampling grid including the one-vertex halo ring, as
+// SampleChunkBatch computes it. Index g = gx + gy * PLANET_GRID_WITH_HALO;
+// chunk vertex (x, y) is g = (x + 1) + (y + 1) * PLANET_GRID_WITH_HALO.
+// The GPU renderer needs the halo to compute normals after erosion.
+struct HaloGrid
+{
+    static constexpr int32_t Side  = PLANET_GRID_WITH_HALO;   // 67
+    static constexpr int32_t Count = Side * Side;             // 4489
+    Vec3d  Dir[Count];          // unit direction, double (exactly as the mesh)
+    double Height[Count];       // full height, metres
+    float  Continent[Count];
+    float  Mountain[Count];
+};
+
 class NoiseGraph
 {
 public:
@@ -232,7 +246,23 @@ public:
     // a one-vertex ring around it). Normals are central differences between
     // grid neighbours, so a border vertex gets the same normal from both
     // chunks that share it.
-    void SampleChunkBatch(const FChunkKey& Key, Surface* Out) const;
+    //
+    // OutHalo (optional) receives the whole sampled grid, halo included.
+    void SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* OutHalo = nullptr) const;
+
+    // Continent + mountains only (no detail, no humidity): the large-scale
+    // relief that erosion follows. Two of the four noise layers.
+    void EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,
+                                 int32_t Count, double* OutHeight) const;
+
+    // Erosion inputs from a point's layer values: Mask 0..1 is the land mask
+    // (0 under water, the same shore ramp that fades the mountains in), Fade
+    // -1..1 hints valleys vs peaks (from the mountain layer).
+    void ErosionMaskFade(float Continent, float Mountain, float& OutMask, float& OutFade) const;
+
+    // Branch-free tangent basis; deterministic for a given direction, so a
+    // point shared by two chunks gets the same basis from both.
+    static void TangentBasis(const Vec3d& Dir, Vec3d& OutT1, Vec3d& OutT2) { BuildNormalBasis(Dir, OutT1, OutT2); }
 
     Surface SampleSurface(const Vec3d& UnitDir) const;
     double  EvaluateHeight(const Vec3d& UnitDir) const;

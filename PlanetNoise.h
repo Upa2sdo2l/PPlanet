@@ -18,6 +18,7 @@
 // Plain C++ header: <cmath>, <cstdint>, <vector> and FastNoise2. Unreal
 // consumes it happily, which is what makes the split work.
 #include "planet_core/PlanetNoiseCore.h"
+#include "planet_core/PlanetErosion.h"
 
 class FPlanetNoiseGenerator
 {
@@ -39,11 +40,28 @@ public:
     // Fills PLANET_VERTS_PER_SIDE^2 surfaces row-major (i = gy * VPS + gx).
     // Measured cost on the reference box: min 0.95 ms per chunk single-thread,
     // which leaves three workers comfortably ahead of a 60 fps frame.
-    void SampleChunk(const FChunkKey& Key, TArrayView<PlanetCore::Surface> Out) const;
+    // OutHalo (optional) receives the full sampled grid, halo ring included.
+    void SampleChunk(const FChunkKey& Key, TArrayView<PlanetCore::Surface> Out,
+                     PlanetCore::HaloGrid* OutHalo = nullptr) const;
+
+    const PlanetCore::NoiseGraph& GetGraph() const { return Graph; }
+
+    // ── Erosion ──────────────────────────────────────────────────────────
+    // Set by the actor once it knows the renderer: only the GPU renderer
+    // erodes the terrain, so only then must heights include erosion.
+    // Set before any worker starts; read-only afterwards.
+    void SetErosion(bool bEnabled, const PlanetErosion::Params& Params)
+    {
+        Erosion = Params;
+        if (!bEnabled) Erosion.Strength = 0.0;
+    }
+    const PlanetErosion::Params& GetErosion() const { return Erosion; }
+    bool HasErosion() const { return PlanetErosion::IsEnabled(Erosion); }
 
     // ── Single point ─────────────────────────────────────────────────────
-    // Routes through the bulk path so the value is bit-identical to the mesh.
-    // For line traces and placement, not per-vertex use.
+    // Height of the terrain the player sees, erosion included (to ~0.1 m of
+    // the eroded mesh). For line traces and placement, not per-vertex use;
+    // with erosion one call costs ~20 us.
     double GetHeightAt(const FVector3d& UnitDir) const;
     PlanetCore::Surface GetSurfaceAt(const FVector3d& UnitDir) const;
     FVector3d GetSurfacePositionAt(const FVector3d& UnitDir, double PlanetRadius) const;
@@ -54,6 +72,7 @@ public:
 
 private:
     PlanetCore::NoiseGraph Graph;
+    PlanetErosion::Params  Erosion = []{ PlanetErosion::Params P; P.Strength = 0.0; return P; }();
 };
 
 namespace PlanetBridge
@@ -109,6 +128,23 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
    
 
     return C;
+}
+
+// FPlanetErosionSettings -> PlanetErosion::Params. Fields not exposed keep the
+// core's defaults (Rounding, Onset, AssumedSlope, CellScale, Normalization,
+// Lacunarity, Gain).
+inline PlanetErosion::Params ToCoreErosion(const FPlanetErosionSettings& S)
+{
+    PlanetErosion::Params P;
+    P.ScaleMetres          = S.ScaleMetres;
+    P.Strength             = S.bEnabled ? S.Strength : 0.0;
+    P.Octaves              = FMath::Clamp(S.Octaves, 1, 8);
+    P.GullyWeight          = S.GullyWeight;
+    P.Detail               = S.Detail;
+    P.HeightOffset         = S.HeightOffset;
+    P.GradientStepFraction = S.GradientStepFraction;
+    P.Seed                 = (uint32_t)S.Seed;
+    return P;
 }
 
 } // namespace PlanetBridge

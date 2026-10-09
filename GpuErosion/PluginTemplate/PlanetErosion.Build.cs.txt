@@ -1,0 +1,19 @@
+// Plugins/PlanetErosion/Source/PlanetErosion/PlanetErosion.Build.cs
+using System.IO;
+using UnrealBuildTool;
+
+public class PlanetErosion : ModuleRules
+{
+	public PlanetErosion(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+		// Code and shaders live in the game repository so they update with git:
+		// <Project>/Source/FastNoiseTest/GpuErosion (the shader folder is found
+		// at run time from the same path, see PlanetErosionGpu.inl).
+		string RepoDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "..", "..", "..", "Source", "FastNoiseTest", "GpuErosion"));
+		PublicIncludePaths.Add(RepoDir);
+
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "RenderCore", "RHI" });
+	}
+}

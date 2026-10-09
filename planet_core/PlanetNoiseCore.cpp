@@ -171,6 +171,27 @@ void NoiseGraph::EvaluateHeightField(const float* X, const float* Y, const float
         OutHeight[i] = (float)ComposeHeight(C[i], M[i], D[i]);
 }
 
+void NoiseGraph::EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,
+                                         int32_t Count, double* OutHeight) const
+{
+    if (!bValid || Count <= 0) return;
+    static thread_local std::vector<float> C, M;
+    if ((int32_t)C.size() < Count) { C.resize((size_t)Count); M.resize((size_t)Count); }
+
+    ContinentWarp->GenPositionArray3D(  C.data(), Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
+    MountainFractal->GenPositionArray3D(M.data(), Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
+    for (int32_t i = 0; i < Count; ++i)
+        OutHeight[i] = ComposeHeight(C[i], M[i], 0.f);
+}
+
+void NoiseGraph::ErosionMaskFade(float Continent, float Mountain, float& OutMask, float& OutFade) const
+{
+    const float Above = Continent - SeaLevel;
+    OutMask = (Above > 0.f) ? std::clamp(Above * Params.ShoreSharpness * 8.f, 0.f, 1.f) : 0.f;
+    const float Mn = std::clamp((Mountain + 1.2f) / 3.1f, 0.f, 1.f);
+    OutFade = std::clamp((Mn - 0.5f) / 0.3f, -1.f, 1.f);
+}
+
 void NoiseGraph::BuildNormalBasis(const Vec3d& Dir, Vec3d& OutT1, Vec3d& OutT2)
 {
     // Branch-free: pick a reference axis by the dominant component, then
@@ -186,7 +207,7 @@ void NoiseGraph::BuildNormalBasis(const Vec3d& Dir, Vec3d& OutT1, Vec3d& OutT2)
     OutT2 = Vec3d::Cross(Dir, OutT1).Normalised();
 }
 
-void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out) const
+void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* OutHalo) const
 {
     if (!bValid) return;
 
@@ -233,6 +254,17 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out) const
                    Cg.data(), Mg.data(), Hg.data(), Dg.data());
     for (int32_t i = 0; i < TotalG; ++i)
         HeightG[i] = ComposeHeight(Cg[i], Mg[i], Dg[i]);
+
+    if (OutHalo)
+    {
+        for (int32_t i = 0; i < TotalG; ++i)
+        {
+            OutHalo->Dir[i]       = Vec3d(DXg[i], DYg[i], DZg[i]);
+            OutHalo->Height[i]    = HeightG[i];
+            OutHalo->Continent[i] = Cg[i];
+            OutHalo->Mountain[i]  = Mg[i];
+        }
+    }
 
     const double R = Params.PlanetRadiusMetres;
     auto SurfacePoint = [&](int32_t i)

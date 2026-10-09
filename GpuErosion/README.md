@@ -1,0 +1,95 @@
+# Эрозия на GPU: настройка
+
+Эрозия, нормали и биомы чанков теперь считаются compute-шейдерами. Глобальные шейдеры
+должны регистрироваться до старта движка, поэтому нужен маленький плагин `PlanetErosion`.
+Весь его код и шейдеры лежат здесь, в репозитории (`GpuErosion/`), и обновляются через git.
+Плагин в папке проекта — это только три файла-«заглушки», их нужно создать один раз.
+
+## 1. Плагин (один раз)
+
+Создайте в папке проекта (рядом с `Source`, не внутри него) такую структуру:
+
+```
+<Проект>/Plugins/PlanetErosion/
+    PlanetErosion.uplugin
+    Source/PlanetErosion/
+        PlanetErosion.Build.cs
+        Private/PlanetErosionModule.cpp
+```
+
+Содержимое — файлы из `GpuErosion/PluginTemplate/`, без расширения `.txt`:
+
+| Файл в `PluginTemplate/` | Куда положить |
+| --- | --- |
+| `PlanetErosion.uplugin.txt` | `Plugins/PlanetErosion/PlanetErosion.uplugin` |
+| `PlanetErosion.Build.cs.txt` | `Plugins/PlanetErosion/Source/PlanetErosion/PlanetErosion.Build.cs` |
+| `PlanetErosionModule.cpp.txt` | `Plugins/PlanetErosion/Source/PlanetErosion/Private/PlanetErosionModule.cpp` |
+
+В репозитории у них расширение `.txt` нарочно: иначе UBT собрал бы их ещё раз как часть
+модуля игры.
+
+Плагин ищет код и шейдеры по пути `<Проект>/Source/FastNoiseTest/GpuErosion`. Если
+репозиторий лежит в другой папке, поправьте путь в `PlanetErosion.Build.cs` и в
+`StartupModule` в `PlanetErosionGpu.inl`.
+
+## 2. Build.cs игры
+
+В `FastNoiseTest.Build.cs` добавьте модуль плагина в `PublicDependencyModuleNames`:
+
+```csharp
+"PlanetErosion"
+```
+
+После этого: правый клик по `.uproject` → **Generate Visual Studio project files**, затем
+сборка. При первом запуске редактор скомпилирует два новых шейдера (несколько секунд).
+
+## 3. Материал
+
+Атласы теперь render target'ы. Если редактор ругается на тип сэмплера у
+`PlanetNormalAtlas` или `PlanetBiomeAtlas`, поставьте у обоих **Sampler Type: Linear Color**.
+Больше в материале ничего не меняется.
+
+## 4. Настройки актора
+
+- **Planet → Erosion**: включение и параметры эрозии. Значения по умолчанию подобраны
+  для `MountainAmplitude` 10000 м. Если горы заметно выше, увеличьте `ScaleMetres`.
+- **Planet → Noise Params → Mountains → Mountain Octaves**: рекомендую **7** вместо 12.
+  Мелкие октавы гребневого шума эрозия всё равно заменяет своими оврагами, а без них
+  рельеф чище.
+- Эрозия работает только с рендером `GPUInstanced`. На `RealtimeMesh` рельеф без эрозии.
+
+## 5. Как проверить
+
+- `planet.Stats 1` — строка `erosion ON | GPU tiles eroded N/s | collision meshes N/s, CPU erosion X ms`.
+- `stat gpu` — проходы `PlanetErosion` и `PlanetTerrainTiles` (видны, когда строятся новые чанки).
+- `stat Planet` — те же числа, плюс `Collision: CPU erosion, ms avg/max`.
+- `planet.Bench 32 14` — строки `erosion inputs` и `CPU erosion (collision only)`.
+
+## Как это устроено
+
+1. Воркер (CPU) считает шум на сетке 67×67 (чанк плюс кольцо соседей), уклон для
+   оврагов (по 4 отсчёта в 481 точке), маску суши, и собирает тайл: 4489 вершин по 48 байт.
+2. За кадр все новые тайлы уходят одним пакетом в два compute-прохода:
+   - `ErodeCS` — высота эрозии в каждой из 4489 точек;
+   - `WriteCS` — позиция, нормаль (по эродированным соседям) и биомы каждой вершины, сразу в атласы.
+3. Для коллизии та же эрозия считается на CPU (`PlanetErosion::ErodeChunk`, ~16 мс на чанк
+   в фоновом потоке, только для чанков в радиусе коллизии). Расхождение с картинкой до ~0.1 м.
+4. Высота под игроком (`GetHeightAt`) тоже включает эрозию.
+
+Стыки чанков любых LOD совпадают до миллиметров: высота в точке зависит только от самой
+точки, а не от того, какой чанк её считает.
+
+## Если что-то не так
+
+| Симптом | Вероятная причина |
+| --- | --- |
+| Ошибка сборки `PLANETEROSION_API` не определён | в `FastNoiseTest.Build.cs` не добавлен `"PlanetErosion"` |
+| Редактор закрывается с `[PlanetErosion] shader folder not found` | код лежит не в `Source/FastNoiseTest/GpuErosion` |
+| В логе `GPU terrain needs SM5 compute shaders` | редактор запущен в режиме мобильного превью; планета рисуется через RealtimeMesh |
+| Редактор падает при старте с ошибкой шейдера | пришлите текст ошибки из лога |
+| Планета чёрная или без рельефа | шейдеры не отработали: проверьте `stat gpu` (проходы PlanetErosion) |
+| Персонаж висит в воздухе или проваливается | расхождение коллизии и картинки: пришлите скриншот с `planet.Stats 1` |
+
+Код эрозии (`PlanetErosion.*`, `Shaders/*`) — производная от кода runevision под лицензией
+MPL 2.0: изменения в этих файлах должны оставаться открытыми; на остальной проект лицензия
+не распространяется.

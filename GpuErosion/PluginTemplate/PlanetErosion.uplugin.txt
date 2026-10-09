@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Planet Erosion (GPU)",
+	"Description": "Compute shaders of the procedural planet: erosion, normals and biomes of chunk tiles. Code and shaders live in Source/FastNoiseTest/GpuErosion.",
+	"Category": "Rendering",
+	"CreatedBy": "",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "PlanetErosion",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

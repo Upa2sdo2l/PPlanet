@@ -226,6 +226,56 @@ struct FPlanetNoiseParams
     uint64 ComputeCacheHash() const;
 };
 
+// ── Erosion (GPU terrain renderer only) ─────────────────────────────────────
+// Sphere port of the "Fast & Gorgeous" erosion filter (runevision, MPL 2.0):
+// gullies that run down the slopes and branch, computed per chunk tile by a
+// compute shader (PlanetErosion plugin). Mapped to PlanetErosion::Params by
+// PlanetBridge::ToCoreErosion. Defaults were tuned in the harness for
+// MountainAmplitude 10000 m; with much higher mountains raise ScaleMetres.
+// Erosion acts on land only.
+USTRUCT(BlueprintType)
+struct FPlanetErosionSettings
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, Category="Erosion")
+    bool bEnabled = true;
+
+    // Width (and roughly depth) of the largest gullies, metres. Each further
+    // octave is half as wide.
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="200.0", ClampMax="50000.0"))
+    float ScaleMetres = 4000.f;
+
+    // Gully depth relative to ScaleMetres. 0.12 x 4000 m = ~480 m for the
+    // largest octave.
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float Strength = 0.12f;
+
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="1", ClampMax="8"))
+    int32 Octaves = 5;
+
+    // 0 = only sharpen ridges, 1 = full gullies.
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float GullyWeight = 0.5f;
+
+    // Lower = fine gullies only on steep slopes.
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.1", ClampMax="4.0"))
+    float Detail = 1.0f;
+
+    // -1 = erosion only lowers the terrain, +1 = only raises it. -0.5 lowers
+    // mountains ~150 m on average (keep in mind for the snow line).
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="-1.0", ClampMax="1.0"))
+    float HeightOffset = -0.5f;
+
+    // Step of the slope measurement that steers the gullies, as a fraction of
+    // ScaleMetres. Small values follow every small ridge and look noisy.
+    UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.05", ClampMax="1.0"))
+    float GradientStepFraction = 0.25f;
+
+    UPROPERTY(EditAnywhere, Category="Erosion")
+    int32 Seed = 0;
+};
+
 inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
 {
     uint64 H = 1469598103934665603ull;   // FNV-1a offset basis

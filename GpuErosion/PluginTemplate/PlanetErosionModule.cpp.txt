@@ -1,0 +1,3 @@
+// Plugins/PlanetErosion/Source/PlanetErosion/Private/PlanetErosionModule.cpp
+// The implementation lives in the game repository (GpuErosion/PlanetErosionGpu.inl).
+#include "PlanetErosionGpu.inl"

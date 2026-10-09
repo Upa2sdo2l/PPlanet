@@ -1,0 +1,82 @@
+// PlanetErosion.usf
+//
+//   Erosion filter and Phacelle noise copyright (c) 2025 Rune Skovbo Johansen.
+//   This Source Code Form is subject to the terms of the Mozilla Public
+//   License, v. 2.0. If a copy of the MPL was not distributed with this
+//   file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Two passes over a batch of chunk tiles (one dispatch each, z = tile):
+//   ErodeCS  every point of each tile's 67 x 67 halo grid -> erosion delta
+//   WriteCS  every chunk vertex (65 x 65): eroded position, normal from the
+//            eroded neighbours, biomes -> the three atlas textures
+#include "/Engine/Public/Platform.ush"
+#include "/PlanetErosion/PlanetErosionCommon.ush"
+
+#define HALO_SIDE   67
+#define HALO_POINTS 4489
+#define TILE_SIDE   65
+
+StructuredBuffer<FPlanetVertexIn> Vertices;   // HALO_POINTS per tile
+
+// ErodeCS
+RWStructuredBuffer<float> DeltaOut;           // HALO_POINTS per tile
+float4 ErosionP0;
+float4 ErosionRounding;
+float4 ErosionOnset;
+float4 ErosionP3;
+float4 ErosionP4;
+int    ErosionOctaves;
+uint   ErosionSeed;
+
+// WriteCS
+StructuredBuffer<FPlanetTileIn> Tiles;
+StructuredBuffer<float> DeltaIn;
+RWTexture2D<float4> OutPos;
+RWTexture2D<float4> OutNormal;
+RWTexture2D<float4> OutBiome;
+float4 ClimateParams;
+uint   TilesPerRow;
+
+[numthreads(8, 8, 1)]
+void ErodeCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= HALO_SIDE || Id.y >= HALO_SIDE) return;
+    uint Index = Id.z * HALO_POINTS + Id.y * HALO_SIDE + Id.x;
+
+    FPlanetErosionParams E;
+    E.P0       = ErosionP0;
+    E.Rounding = ErosionRounding;
+    E.Onset    = ErosionOnset;
+    E.P3       = ErosionP3;
+    E.P4       = ErosionP4;
+    E.Octaves  = ErosionOctaves;
+    E.Seed     = ErosionSeed;
+
+    FPlanetVertexIn V = Vertices[Index];
+    DeltaOut[Index] = PlanetEro_DeltaHeight(V.PRef, V.Gradient, V.Fade, V.Mask, E);
+}
+
+[numthreads(8, 8, 1)]
+void WriteCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= TILE_SIDE || Id.y >= TILE_SIDE) return;
+
+    FPlanetTileIn T = Tiles[Id.z];
+    uint Base = Id.z * HALO_POINTS;
+    uint G = Base + (Id.y + 1) * HALO_SIDE + (Id.x + 1);
+
+    FPlanetTexelOut O = PlanetEro_Texel(
+        Vertices[G],             DeltaIn[G],
+        Vertices[G - 1],         DeltaIn[G - 1],
+        Vertices[G + 1],         DeltaIn[G + 1],
+        Vertices[G - HALO_SIDE], DeltaIn[G - HALO_SIDE],
+        Vertices[G + HALO_SIDE], DeltaIn[G + HALO_SIDE],
+        T, ClimateParams);
+
+    uint TileIndex = (uint)T.AtlasTile;
+    uint2 Texel = uint2((TileIndex % TilesPerRow) * TILE_SIDE + Id.x,
+                        (TileIndex / TilesPerRow) * TILE_SIDE + Id.y);
+    OutPos[Texel]    = O.Pos;
+    OutNormal[Texel] = O.Normal;
+    OutBiome[Texel]  = O.Biome;
+}

@@ -20,8 +20,8 @@
 //   dimensionless (m/m), as in the original.
 // * The gradient that steers the gullies is supplied by the caller and must
 //   not depend on mesh resolution, or gullies would turn when the LOD changes.
-// * MaxOctaves lets coarse LODs skip gullies narrower than their vertex
-//   spacing (they would only alias); the morph hides the new octaves.
+// * All octaves at every LOD (see Erode): chunk edges of different LOD
+//   must agree exactly.
 // * The hash is an integer one (pcg3d), so the GPU twin can match it.
 #pragma once
 
@@ -61,25 +61,69 @@ struct Params
 
 struct Result
 {
-    double          DeltaHeight = 0.0;   // metres, already includes HeightOffset
-    PlanetCore::Vec3d DeltaSlope;        // change of the tangent gradient (m/m)
-    double          RidgeMap = 0.0;      // -1 creases .. +1 ridges (drainage, foliage)
+    double DeltaHeight = 0.0;   // metres, already includes HeightOffset and the mask
+    double RidgeMap    = 0.0;   // -1 creases .. +1 ridges (drainage, foliage)
 };
 
-// P          Up * PlanetRadiusMetres: the point on the REFERENCE sphere. Do not
-//            add the terrain height, or the pattern shears along slopes.
-// Up         unit radial direction at P
-// Gradient   tangent gradient of the input height (m/m), central difference
-//            with step Prm.GradientStepMetres() of the base layers
-//            (continent + mountains, no detail): LOD-independent and low-pass
+// Up         unit radial direction of the point. The noise lattice is sampled
+//            at Up * RadiusMetres, on the REFERENCE sphere: adding the terrain
+//            height would shear the pattern along slopes.
+// Gradient   tangent gradient of the base height (m/m), low-pass: a central
+//            difference with step Prm.GradientStepMetres() of the base layers
+//            (continent + mountains, no detail). See BuildChunkInputs.
 // FadeTarget -1 in valleys .. +1 on peaks of the input terrain
-// Mask       0..1 multiplier of the whole effect (e.g. land mask)
-// MaxOctaves cap from OctavesForSpacing, or Params.Octaves
-Result Erode(const PlanetCore::Vec3d& P, const PlanetCore::Vec3d& Up,
+// Mask       0..1 multiplier of the whole effect (land mask)
+//
+// Every octave is always evaluated, at every LOD: the height at a point must
+// not depend on the chunk that samples it, or chunks of different LOD would
+// crack apart along their shared edge. Normals are taken from the eroded
+// mesh itself, so octaves finer than the vertex spacing do not sparkle.
+Result Erode(const PlanetCore::Vec3d& Up, double RadiusMetres,
              const PlanetCore::Vec3d& Gradient, double FadeTarget, double Mask,
-             const Params& Prm, int MaxOctaves);
+             const Params& Prm);
 
-// Octaves whose gullies are at least two vertex spacings wide.
-int OctavesForSpacing(const Params& Prm, double VertexSpacingMetres);
+// Sum of all octave strengths, metres.
+double Magnitude(const Params& Prm);
+
+// Bounds of DeltaHeight at Mask = 1: [(HeightOffset - 1), (HeightOffset + 1)] * Magnitude.
+void DeltaRange(const Params& Prm, double& OutLo, double& OutHi);
+
+bool IsEnabled(const Params& Prm);
+
+// ── Per chunk ───────────────────────────────────────────────────────────────
+// Erosion inputs for every point of the chunk's halo grid (67 x 67).
+//
+// The gradient is exact (four base-height samples) on a 19 x 19 subgrid
+// (every 4th vertex, from -4 to 68) and on EVERY border vertex, and bilinear
+// in between.
+//  * Border vertices are shared with neighbour chunks, possibly of another
+//    LOD; there the gradient is a function of the point alone, so both
+//    chunks erode the shared point identically: no cracks.
+//  * The subgrid nodes of same-LOD neighbours coincide, so the halo ring and
+//    the first inner ring are interpolated identically in both chunks, and
+//    the normals of their shared border agree.
+// Cost: 553 points x 4 samples of two noise layers per chunk (~0.25 ms).
+struct ChunkInputs
+{
+    static constexpr int32_t Count = PlanetCore::HaloGrid::Count;
+    PlanetCore::Vec3d Gradient[Count];
+    float Mask[Count];
+    float Fade[Count];
+};
+
+void BuildChunkInputs(const PlanetCore::NoiseGraph& Graph, const PlanetCore::FChunkKey& Key,
+                      const PlanetCore::HaloGrid& Halo, const Params& Prm, ChunkInputs& Out);
+
+// CPU twin of the GPU pass: DeltaHeight for the chunk's 65 x 65 vertices
+// (row-major, as Surfaces). Used for collision meshes only.
+void ErodeChunk(const PlanetCore::HaloGrid& Halo, const ChunkInputs& In, const Params& Prm,
+                double RadiusMetres, double* OutDelta65);
+
+// ── Single point (gameplay, camera height) ──────────────────────────────────
+// Exact gradient at the point; matches the chunks to centimetres near the
+// camera (interior chunk vertices use the interpolated gradient).
+PlanetCore::Vec3d GradientAt(const PlanetCore::NoiseGraph& Graph, const PlanetCore::Vec3d& Dir,
+                             const Params& Prm);
+double DeltaAt(const PlanetCore::NoiseGraph& Graph, const PlanetCore::Vec3d& Dir, const Params& Prm);
 
 } // namespace PlanetErosion

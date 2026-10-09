@@ -32,10 +32,15 @@ static constexpr int32 PLANET_BODY_VERTS     = PLANET_VERTS_PER_SIDE * PLANET_VE
 static constexpr int32 PLANET_BODY_TRIS      = PLANET_QUADS_PER_SIDE * PLANET_QUADS_PER_SIDE * 2;
 
 // ── Fixed component pool ────────────────────────────────────────────────────
-// Decided policy: the pool never grows at runtime. Under pressure the LOD
-// budget and the visible set shrink; the component count does not.
-// PlanetLOD::TraversalParams::MaxLeaves must equal this value.
-static constexpr int32 PLANET_COMPONENT_POOL_SIZE = 256;
+// Decided policy: the pool never grows at runtime.
+// The LOD selection may use at most PLANET_LOD_LEAF_BUDGET chunks. The extra
+// slots hold chunks that are no longer desired but stay on screen until the
+// chunks replacing them are built ("lingering", see PlanetStreaming), so the
+// pool must be larger than the leaf budget. 64 spare slots ~ 15 MB of mesh.
+static constexpr int32 PLANET_LOD_LEAF_BUDGET     = 256;
+static constexpr int32 PLANET_COMPONENT_POOL_SIZE = 320;
+static_assert(PLANET_COMPONENT_POOL_SIZE > PLANET_LOD_LEAF_BUDGET,
+              "the pool needs headroom above the leaf budget for lingering chunks");
 
 // UE world units are centimetres; the noise core works in metres. This is the
 // single named conversion factor. Prefixed deliberately: in a Unreal unity

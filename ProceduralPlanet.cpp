@@ -43,6 +43,7 @@ DECLARE_CYCLE_STAT(TEXT("GT: RMC CreateSectionGroup"),           STAT_Planet_RMC
 DECLARE_CYCLE_STAT(TEXT("GT: RMC UpdateSectionConfig+collision"),STAT_Planet_RMCConfig,     STATGROUP_Planet);
 DECLARE_CYCLE_STAT(TEXT("GT: component transform/visibility"),   STAT_Planet_Component,     STATGROUP_Planet);
 DECLARE_CYCLE_STAT(TEXT("GT: release retired slots"),            STAT_Planet_Release,       STATGROUP_Planet);
+DECLARE_CYCLE_STAT(TEXT("GT: coverage swap + show/hide/collision"),STAT_Planet_Coverage,     STATGROUP_Planet);
 
 // Per chunk, averaged over the last second
 DECLARE_FLOAT_COUNTER_STAT(TEXT("Chunk: worker noise, ms avg"),       STAT_Planet_NoiseAvg,  STATGROUP_Planet);
@@ -65,6 +66,9 @@ DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: active"),                        STAT_Pla
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: waiting for a worker"),          STAT_Planet_Requested,      STATGROUP_Planet);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: building"),                      STAT_Planet_Building,       STATGROUP_Planet);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: retiring"),                      STAT_Planet_Retiring,       STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: kept until replaced (lingering)"),STAT_Planet_Lingering,     STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: built, waiting to swap in"),      STAT_Planet_Hidden,        STATGROUP_Planet);
+DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: chunks with collision"),          STAT_Planet_WithCollision, STATGROUP_Planet);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pool: free"),                          STAT_Planet_Free,           STATGROUP_Planet);
 
 namespace
@@ -211,6 +215,8 @@ void AProceduralPlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
     SlotWork.Reset();
     Builders.Reset();
     Pool.Reset();
+    SlotVisibleApplied.Reset();
+    SlotCollisionApplied.Reset();
     Super::EndPlay(EndPlayReason);
 }
 
@@ -255,6 +261,8 @@ void AProceduralPlanet::CreatePool()
         Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
         Pool.Add(Comp);
+        SlotVisibleApplied.Add(0);
+        SlotCollisionApplied.Add(0);
 
         TUniquePtr<FSlotWork> W = MakeUnique<FSlotWork>();
         W->Surfaces.SetNumUninitialized(PLANET_BODY_VERTS, EAllowShrinking::No);
@@ -348,6 +356,14 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
     // ── 4. Hand ready work to workers, commit finished work ──────────────
     PumpWorkers();
     ApplyReadyChunks();
+
+    // ── 5. Swap in chunks whose replacements are ready; show/hide; collision ─
+    {
+        SCOPE_CYCLE_COUNTER(STAT_Planet_Coverage);
+        FPlanetScopedMs CoverageTimer(PerfWindow.CoverageMs);
+        Scheduler.UpdateCoverage(FrameCounter, MakeFrameBudget());
+        SyncSlotPresentation();
+    }
     ReleaseRetired();
 
     UpdatePlanetStats();
@@ -390,10 +406,9 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     }
     P.MaxLOD           = (uint8_t)FMath::Clamp(MaxLOD, 1, 18);
 
-    // THE fixed-pool link: the traversal can never return more leaves than the
-    // pool can display. If a view needs more detail, ErrorThresholdPixels is
-    // what gives, never the component count.
-    P.MaxLeaves        = PLANET_COMPONENT_POOL_SIZE;
+    // The leaf budget is below the pool size: the spare slots keep replaced
+    // chunks on screen until their replacements are built (PlanetStreaming).
+    P.MaxLeaves        = PLANET_LOD_LEAF_BUDGET;
     P.bUseHorizonCull  = true;
 
     P.PreviouslySplit  = &LODPreviouslySplit;
@@ -413,8 +428,12 @@ void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& Camera
     std::vector<PlanetStreaming::DesiredChunk> Desired;
     Desired.reserve(LastSelection.Chunks.size());
 
-    // Collision only for the top 2 most detailed LODs (dynamic based on MaxLOD)
-    const uint8 CollisionMinLOD = (MaxLOD >= 2) ? (uint8)(MaxLOD - 2) : 0;
+    // Distances are measured to chunk centres on the sphere through the
+    // terrain under the camera (as the LOD error does), so a camera on a high
+    // plateau is near the chunks around it, not kilometres above them.
+    const double SurfaceRadiusCm = (PlanetRadiusMetres + CameraTerrainHeightM) * PLANET_METRES_TO_UE_CM;
+    const double PlanetRadiusCm  = PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
+    const double CollisionCm     = CollisionDistanceMetres * PLANET_METRES_TO_UE_CM;
 
     for (const PlanetLOD::ChunkKey& K : LastSelection.Chunks)
     {
@@ -423,28 +442,33 @@ void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& Camera
         const PlanetLOD::Vec3d Dir = PlanetLOD::CubeFaceDirection(
             K.Face, U0 + Size * 0.5, V0 + Size * 0.5);
 
-        const double Cx = Dir.X * PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
-        const double Cy = Dir.Y * PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
-        const double Cz = Dir.Z * PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
-
-        const double Dx = CameraPos.X - Cx;
-        const double Dy = CameraPos.Y - Cy;
-        const double Dz = CameraPos.Z - Cz;
+        const double Dx = CameraPos.X - Dir.X * SurfaceRadiusCm;
+        const double Dy = CameraPos.Y - Dir.Y * SurfaceRadiusCm;
+        const double Dz = CameraPos.Z - Dir.Z * SurfaceRadiusCm;
         const double Dist = std::sqrt(Dx*Dx + Dy*Dy + Dz*Dz);
+
+        // Nearest point of the chunk, approximated by its bounding circle
+        // (half diagonal of a side of Size * radius).
+        const double NearestCm = FMath::Max(0.0, Dist - Size * PlanetRadiusCm * 0.7072);
 
         PlanetStreaming::DesiredChunk D;
         D.Key             = K;
-        D.Priority        = Dist;                       // lower = closer = kept
-        D.bNeedsCollision = (K.LOD >= CollisionMinLOD); // collision for top-2 LOD only
+        D.Priority        = Dist;                    // lower = closer = built first
+        D.bNeedsCollision = NearestCm <= CollisionCm;
         Desired.push_back(D);
     }
 
+    Scheduler.Reconcile(Desired, Frame, MakeFrameBudget());
+}
+
+PlanetStreaming::FrameBudget AProceduralPlanet::MakeFrameBudget() const
+{
     PlanetStreaming::FrameBudget Budget;
     Budget.MaxNewWorkerRequests = MaxNewRequestsPerFrame;
     Budget.MaxCommits           = MaxCommitsPerFrame;
     Budget.MaxRetires           = MaxRetiresPerFrame;
-
-    Scheduler.Reconcile(Desired, Frame, Budget);
+    Budget.SettleFrames         = ReplacementSettleFrames;
+    return Budget;
 }
 
 // Distance from the camera to a chunk centre, in UE centimetres.
@@ -586,10 +610,10 @@ void AProceduralPlanet::ApplyReadyChunks()
                 const FRealtimeMeshSectionKey SK =
                     FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
 
-                // Collision is cooked only for near chunks: it is the most
-                // expensive per-chunk step and a pedestrian never needs it
-                // kilometres away.
-                const bool bWantCollision = W.bNeedsCollision;
+                // Collision is cooked only for chunks within
+                // CollisionDistanceMetres. Read the scheduler's current flag,
+                // not the one captured at launch: the camera may have moved.
+                const bool bWantCollision = Scheduler.GetSlots()[i].bNeedsCollision;
                 {
                     SCOPE_CYCLE_COUNTER(STAT_Planet_RMCConfig);
                     FPlanetScopedMs ConfigTimer(PerfWindow.ConfigMs);
@@ -597,12 +621,17 @@ void AProceduralPlanet::ApplyReadyChunks()
                     MeshSimple->UpdateSectionConfig(SK, Config, bWantCollision);
                 }
 
+                // Built but not shown yet: SyncSlotPresentation shows it once
+                // nothing it replaces still covers the same surface. Collision
+                // goes on now, so it is cooked by the time the swap happens.
                 {
                     SCOPE_CYCLE_COUNTER(STAT_Planet_Component);
-                    Pool[i]->SetVisibility(true);
+                    Pool[i]->SetVisibility(false);
                     Pool[i]->SetCollisionEnabled(bWantCollision
                         ? ECollisionEnabled::QueryAndPhysics
                         : ECollisionEnabled::NoCollision);
+                    SlotVisibleApplied[i]   = 0;
+                    SlotCollisionApplied[i] = bWantCollision ? 1 : 0;
                 }
             }
         }
@@ -643,7 +672,86 @@ void AProceduralPlanet::ReleaseRetired()
             }
             Pool[SlotIndex]->SetVisibility(false);
             Pool[SlotIndex]->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+            SlotVisibleApplied[SlotIndex]   = 0;
+            SlotCollisionApplied[SlotIndex] = 0;
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SyncSlotPresentation: push the scheduler's per-slot decisions to UE.
+//
+// Runs right after Scheduler.UpdateCoverage. A retired chunk is hidden here,
+// in the same frame the chunks replacing it are shown, even when the retire
+// budget delays its release to a later frame. Collision changes on already
+// built chunks (camera moved closer or away) are applied closest first,
+// MaxCollisionChangesPerFrame at a time.
+// ─────────────────────────────────────────────────────────────────────────────
+void AProceduralPlanet::SyncSlotPresentation()
+{
+    const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+    const int32 Count = FMath::Min((int32)Slots.size(), Pool.Num());
+
+    struct FCollisionChange { int32 SlotIndex; double Priority; bool bOn; };
+    TArray<FCollisionChange, TInlineAllocator<32>> CollisionChanges;
+
+    for (int32 i = 0; i < Count; ++i)
+    {
+        URealtimeMeshComponent* Comp = Pool[i];
+        if (!Comp) continue;
+        const PlanetStreaming::Slot& Slot = Slots[i];
+
+        if (Slot.State == PlanetStreaming::SlotState::Retiring)
+        {
+            if (SlotVisibleApplied[i])
+            {
+                Comp->SetVisibility(false);
+                SlotVisibleApplied[i] = 0;
+            }
+            if (SlotCollisionApplied[i])
+            {
+                Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+                SlotCollisionApplied[i] = 0;
+            }
+            continue;
+        }
+        if (Slot.State != PlanetStreaming::SlotState::Active) continue;
+
+        const uint8 bWantVisible = Slot.bShown ? 1 : 0;
+        if (SlotVisibleApplied[i] != bWantVisible)
+        {
+            Comp->SetVisibility(bWantVisible != 0);
+            SlotVisibleApplied[i] = bWantVisible;
+        }
+
+        const uint8 bWantCollision = Slot.bNeedsCollision ? 1 : 0;
+        if (SlotCollisionApplied[i] != bWantCollision)
+        {
+            CollisionChanges.Add({i, Slot.Priority, bWantCollision != 0});
+        }
+    }
+
+    CollisionChanges.Sort([](const FCollisionChange& A, const FCollisionChange& B)
+    {
+        return A.Priority < B.Priority;
+    });
+
+    const FRealtimeMeshSectionGroupKey GK = FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk"));
+    const FRealtimeMeshSectionKey      SK = FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
+    const int32 Budget = FMath::Min(CollisionChanges.Num(), FMath::Max(1, MaxCollisionChangesPerFrame));
+
+    for (int32 c = 0; c < Budget; ++c)
+    {
+        const FCollisionChange& Change = CollisionChanges[c];
+        URealtimeMeshComponent* Comp = Pool[Change.SlotIndex];
+        if (URealtimeMeshSimple* MeshSimple = Comp->GetRealtimeMeshAs<URealtimeMeshSimple>())
+        {
+            FRealtimeMeshSectionConfig Config;
+            MeshSimple->UpdateSectionConfig(SK, Config, Change.bOn);
+        }
+        Comp->SetCollisionEnabled(Change.bOn ? ECollisionEnabled::QueryAndPhysics
+                                             : ECollisionEnabled::NoCollision);
+        SlotCollisionApplied[Change.SlotIndex] = Change.bOn ? 1 : 0;
     }
 }
 
@@ -704,13 +812,18 @@ void AProceduralPlanet::UpdatePlanetStats()
     }
 
     // ── Under-camera diagnostics ─────────────────────────────────────────
-    // The chunk under the camera: its LOD, and whether its component has
-    // collision switched on. Enabled means the cook was requested; with
-    // async cooking the body can still be a few frames behind.
-    NadirLOD = 0;                  // 0 also when no leaf was found
+    // What is actually under the camera now: the LOD of the chunk drawn there
+    // (during a swap that can be the old, lingering chunk), and whether any
+    // built chunk there has collision on. "On" means the cook was requested;
+    // with async cooking the body can be a few frames behind.
+    NadirLOD = 0;                  // 0 when nothing is drawn under the camera
     bNadirCollision = false;
     const double CamDistCm = LastCameraPosUE.Size();
     CameraAboveTerrainM = CamDistCm / PLANET_METRES_TO_UE_CM - (PlanetRadiusMetres + CameraTerrainHeightM);
+    int32 WithCollision = 0;
+    for (int32 s = 0; s < SlotCollisionApplied.Num(); ++s)
+        WithCollision += SlotCollisionApplied[s];
+
     if (CamDistCm > 1.0)
     {
         const FVector3d Dir = LastCameraPosUE / CamDistCm;
@@ -718,20 +831,20 @@ void AProceduralPlanet::UpdatePlanetStats()
         double U = 0.0, V = 0.0;
         PlanetLOD::DirectionToFaceUV(PlanetLOD::Vec3d{Dir.X, Dir.Y, Dir.Z}, Face, U, V);
 
-        const int32 Leaf = PlanetLOD::FindLeafContaining(LastSelection.Chunks, Face, U, V);
-        if (Leaf >= 0)
+        const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+        for (int32 s = 0; s < (int32)Slots.size() && s < SlotVisibleApplied.Num(); ++s)
         {
-            const PlanetLOD::ChunkKey& NadirKey = LastSelection.Chunks[Leaf];
-            NadirLOD = NadirKey.LOD;
+            const PlanetStreaming::Slot& Slot = Slots[s];
+            if (Slot.State != PlanetStreaming::SlotState::Active || Slot.Key.Face != Face) continue;
 
-            const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
-            for (int32 s = 0; s < (int32)Slots.size(); ++s)
-            {
-                if (Slots[s].State != PlanetStreaming::SlotState::Active || Slots[s].Key != NadirKey) continue;
-                bNadirCollision = Pool.IsValidIndex(s) && Pool[s] &&
-                    Pool[s]->GetCollisionEnabled() != ECollisionEnabled::NoCollision;
-                break;
-            }
+            const int32  Tiles    = PlanetLOD::TilesAt(Slot.Key.LOD);
+            const double TileSize = 2.0 / (double)Tiles;
+            const int32  TX = FMath::Clamp((int32)FMath::FloorToDouble((U + 1.0) / TileSize), 0, Tiles - 1);
+            const int32  TY = FMath::Clamp((int32)FMath::FloorToDouble((V + 1.0) / TileSize), 0, Tiles - 1);
+            if (TX != Slot.Key.X || TY != Slot.Key.Y) continue;
+
+            if (SlotVisibleApplied[s])   NadirLOD = Slot.Key.LOD;
+            if (SlotCollisionApplied[s]) bNadirCollision = true;
         }
     }
 
@@ -760,6 +873,9 @@ void AProceduralPlanet::UpdatePlanetStats()
     SET_DWORD_STAT(STAT_Planet_Building,  S.Building);
     SET_DWORD_STAT(STAT_Planet_Retiring,  S.Retiring);
     SET_DWORD_STAT(STAT_Planet_Free,      S.Free);
+    SET_DWORD_STAT(STAT_Planet_Lingering, S.Lingering);
+    SET_DWORD_STAT(STAT_Planet_Hidden,    S.Hidden);
+    SET_DWORD_STAT(STAT_Planet_WithCollision, WithCollision);
 
     SET_DWORD_STAT(STAT_Planet_Leaves,    (int32)LastSelection.Chunks.size());
     SET_DWORD_STAT(STAT_Planet_MaxLevel,  DeepestLevel);
@@ -782,16 +898,17 @@ void AProceduralPlanet::UpdatePlanetStats()
 
     const FString Line2 = FString::Printf(
         TEXT("[Planet] game thread per frame:  total %.3f ms  =  height %.3f + LOD %.3f + reconcile %.3f + ")
-        TEXT("launch %.3f + commit %.3f (RMC remove %.3f, create %.3f, config %.3f) + release %.3f"),
+        TEXT("launch %.3f + commit %.3f (RMC remove %.3f, create %.3f, config %.3f) + swap/show/collision %.3f + release %.3f"),
         W.TickMs * F, W.HeightMs * F, W.LODMs * F, W.ReconcileMs * F, W.PumpMs * F,
-        W.ApplyMs * F, W.RemoveMs * F, W.CreateMs * F, W.ConfigMs * F, W.ReleaseMs * F);
+        W.ApplyMs * F, W.RemoveMs * F, W.CreateMs * F, W.ConfigMs * F, W.CoverageMs * F, W.ReleaseMs * F);
 
     const FString Line3 = FString::Printf(
         TEXT("[Planet] under camera: LOD %d, collision %s, %.1f m above terrain  |  leaves %d, deepest L%d, budget %s  |  ")
-        TEXT("pool: active %d, waiting %d, building %d, retiring %d, free %d"),
+        TEXT("pool %d: active %d (kept until replaced %d, waiting to swap in %d), waiting for worker %d, building %d, ")
+        TEXT("retiring %d, free %d, with collision %d"),
         NadirLOD, bNadirCollision ? TEXT("ON") : TEXT("OFF"), CameraAboveTerrainM,
         (int32)LastSelection.Chunks.size(), DeepestLevel, LastSelection.bBudgetHit ? TEXT("full") : TEXT("not full"),
-        S.Active, S.Requested, S.Building, S.Retiring, S.Free);
+        S.PoolSize, S.Active, S.Lingering, S.Hidden, S.Requested, S.Building, S.Retiring, S.Free, WithCollision);
 
     // Key -1 + 0 s: drawn for this frame only. Newer messages go on top, so
     // add in reverse to read top-down.

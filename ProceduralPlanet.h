@@ -1,10 +1,10 @@
 // ProceduralPlanet.h
 // The thin UE owner of a FIXED pool of RMC components.
 //
-// POLICY: the pool has PLANET_COMPONENT_POOL_SIZE (64) slots and never grows.
-// Under pressure PlanetLOD lowers the budget so the visible set fits; it does
-// not allocate a 65th component. That is the whole point of the fixed pool:
-// predictable VRAM, predictable frame cost, no unbounded growth.
+// POLICY: the pool has PLANET_COMPONENT_POOL_SIZE slots and never grows. The
+// LOD selection uses at most PLANET_LOD_LEAF_BUDGET of them; the rest hold
+// chunks kept on screen until their replacements are built. Predictable VRAM,
+// predictable frame cost, no unbounded growth.
 //
 // Division of labour:
 //   Game thread   : traversal, scheduler reconciliation, RMC commit, transforms
@@ -100,10 +100,22 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="0", ClampMax="512"))
     int32 MaxRetiresPerFrame = 8;
 
-    // Distance beyond which collision is not requested. Collision cook is the
-    // most expensive thing per chunk; a pedestrian never needs it 10 km away.
+    // Chunks whose nearest point is within this distance of the camera get
+    // collision, at any LOD. (It used to be "LOD >= MaxLOD - 2", which left
+    // no collision at all when the ground under the player was coarser.)
     UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="0.0"))
-    double CollisionDistanceMetres = 4000.0;
+    double CollisionDistanceMetres = 1500.0;
+
+    // How many frames a new chunk must be on the pool before the chunk it
+    // replaces is removed. Gives its async collision cook time to finish so
+    // the ground does not vanish under the player during a split or merge.
+    UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="0", ClampMax="120"))
+    int32 ReplacementSettleFrames = 6;
+
+    // Collision on/off changes applied to already-built chunks per frame
+    // (each "on" starts a collision cook).
+    UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="1", ClampMax="64"))
+    int32 MaxCollisionChangesPerFrame = 4;
 
     UPROPERTY(EditAnywhere, Category="Planet|Debug")
     bool bDrawDebugStats = false;
@@ -151,6 +163,18 @@ private:
 
     void ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key);
 
+    PlanetStreaming::FrameBudget MakeFrameBudget() const;
+
+    // Applies the scheduler's per-slot decisions to the components: shows or
+    // hides built chunks (atomic swaps), hides retiring ones at once, and
+    // turns collision on/off as chunks enter or leave CollisionDistanceMetres.
+    void SyncSlotPresentation();
+
+    // What each pool component currently has applied, so only changes are
+    // pushed to UE. Indexed like Pool.
+    TArray<uint8> SlotVisibleApplied;
+    TArray<uint8> SlotCollisionApplied;
+
     // Publishes "stat Planet" values for this frame and draws the
     // planet.Stats overlay when that console variable is on.
     void UpdatePlanetStats();
@@ -175,6 +199,7 @@ private:
         double TickMs = 0.0;
         double HeightMs = 0.0, LODMs = 0.0, ReconcileMs = 0.0, PumpMs = 0.0;
         double ApplyMs = 0.0, RemoveMs = 0.0, CreateMs = 0.0, ConfigMs = 0.0, ReleaseMs = 0.0;
+        double CoverageMs = 0.0;
     };
     FPerfWindow PerfWindow;      // being accumulated
     FPerfWindow PerfPublished;   // last complete second, shown in stat Planet

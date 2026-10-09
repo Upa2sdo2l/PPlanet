@@ -404,6 +404,48 @@ inline int32_t FindLeafContaining(const std::vector<ChunkKey>& Leaves,
     return -1;
 }
 
+// ── Coarser neighbour across an edge ────────────────────────────────────────
+// How many LOD levels coarser the chunk in Shown across side Side of K is
+// (0 = same level, finer, or nothing). Sides: 0 = U-, 1 = U+, 2 = V-, 3 = V+.
+//
+// A coarser neighbour covers the whole shared edge, so probing one point just
+// outside the edge midpoint finds it. CubeFaceDirection extends naturally past
+// [-1, 1], so a probe beyond a cube edge lands on the neighbouring face with
+// no adjacency table. Shown must not hold overlapping chunks.
+inline int32_t CoarserNeighbourLevels(const ChunkKey& K, int32_t Side, const KeySet& Shown)
+{
+    if (K.LOD == 0) return 0;
+
+    double U0, V0, Size;
+    ChunkExtent(K, U0, V0, Size);
+    const double Eps  = Size * 1e-3;
+    const double MidU = U0 + Size * 0.5, MidV = V0 + Size * 0.5;
+
+    double PU = MidU, PV = MidV;
+    switch (Side)
+    {
+        case 0:  PU = U0 - Eps;        break;
+        case 1:  PU = U0 + Size + Eps; break;
+        case 2:  PV = V0 - Eps;        break;
+        default: PV = V0 + Size + Eps; break;
+    }
+
+    int32_t Face = 0;
+    double U = 0.0, V = 0.0;
+    DirectionToFaceUV(CubeFaceDirection(K.Face, PU, PV), Face, U, V);
+
+    for (int32_t L = (int32_t)K.LOD - 1; L >= 0; --L)
+    {
+        const int32_t N = TilesAt((uint8_t)L);
+        const double  S = 2.0 / (double)N;
+        const ChunkKey C{(uint8_t)Face, (uint8_t)L,
+                         std::clamp((int32_t)std::floor((U + 1.0) / S), 0, N - 1),
+                         std::clamp((int32_t)std::floor((V + 1.0) / S), 0, N - 1)};
+        if (Shown.count(C)) return (int32_t)K.LOD - L;
+    }
+    return 0;
+}
+
 // ── Edge classification ─────────────────────────────────────────────────────
 // What is on the other side of a leaf border? These names are NOT symmetric:
 // the same border reads FinerNeighbours from the coarse side and

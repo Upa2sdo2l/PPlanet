@@ -18,7 +18,7 @@ Scheduler::Scheduler(int32_t InPoolSize)
 int32_t Scheduler::FindFreeSlot() const
 {
     for (int32_t i = 0; i < (int32_t)Slots.size(); ++i)
-        if (Slots[i].State == SlotState::Free) return i;
+        if (Slots[i].State == SlotState::Free && !Slots[i].bWorkerInFlight) return i;
     return -1;
 }
 
@@ -53,7 +53,7 @@ void Scheduler::Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame)
 
     // A Free slot has no map entry. Retiring slots must be drained before
     // assignment; enforcing that here catches an unsafe UE integration early.
-    if (S.State != SlotState::Free) return;
+    if (S.State != SlotState::Free || S.bWorkerInFlight) return;
 
     S.Key = D.Key;
     S.State = SlotState::Requested;
@@ -164,6 +164,9 @@ bool Scheduler::PopWorkerRequest(WorkerRequest& Out)
     {
         const Slot& S = Slots[i];
         if (S.State != SlotState::Requested) continue;
+        // Never offered while a worker owns the slot: MarkBuilding would
+        // refuse it, and the caller would get the same request back forever.
+        if (S.bWorkerInFlight) continue;
         Pending.push(WorkerRequest{S.Key, i, S.Generation, S.Priority, S.bNeedsCollision});
     }
 
@@ -181,8 +184,20 @@ bool Scheduler::MarkBuilding(const WorkerRequest& R)
     if (S.State != SlotState::Requested || S.Generation != R.Generation || S.Key != R.Key)
         return false;  // stale queued request; worker must not start
 
+    // Defensive: Assign never hands out a slot with a worker in flight, so
+    // a Requested slot cannot have one. If it ever does, do not start a
+    // second worker on the same scratch.
+    if (S.bWorkerInFlight) return false;
+
     S.State = SlotState::Building;
+    S.bWorkerInFlight = true;
     return true;
+}
+
+void Scheduler::WorkerFinished(int32_t SlotIndex)
+{
+    if (SlotIndex < 0 || SlotIndex >= (int32_t)Slots.size()) return;
+    Slots[SlotIndex].bWorkerInFlight = false;
 }
 
 bool Scheduler::AcceptCompletion(const Completion& C)
@@ -215,17 +230,29 @@ bool Scheduler::MarkActive(const Completion& C)
 std::vector<int32_t> Scheduler::DrainRetires(int32_t MaxCount)
 {
     std::vector<int32_t> Out;
-    const int32_t Count = std::min(std::max(0, MaxCount), (int32_t)RetireQueue.size());
-    Out.reserve((size_t)Count);
+    const int32_t Budget = std::max(0, MaxCount);
+    Out.reserve((size_t)std::min(Budget, (int32_t)RetireQueue.size()));
 
     // The UE actor calls this on its game thread, hides each returned RMC and
     // disables collision, then considers the physical slot free. The order is
     // stable; that keeps automated recordings deterministic.
-    for (int32_t i = 0; i < Count; ++i)
+    //
+    // A slot whose worker is still running keeps its place in the queue: its
+    // scratch is in use, so freeing it now would let Assign give it to a new
+    // worker that writes into the same buffers.
+    std::vector<int32_t> Kept;
+    Kept.reserve(RetireQueue.size());
+
+    for (const int32_t SlotIndex : RetireQueue)
     {
-        const int32_t SlotIndex = RetireQueue[i];
         Slot& S = Slots[SlotIndex];
-        if (S.State != SlotState::Retiring) continue;
+        if (S.State != SlotState::Retiring) continue;   // already drained
+
+        if (S.bWorkerInFlight || (int32_t)Out.size() >= Budget)
+        {
+            Kept.push_back(SlotIndex);
+            continue;
+        }
 
         S.Key = {};
         S.State = SlotState::Free;
@@ -234,7 +261,7 @@ std::vector<int32_t> Scheduler::DrainRetires(int32_t MaxCount)
         S.bNeedsCollision = false;
         Out.push_back(SlotIndex);
     }
-    RetireQueue.erase(RetireQueue.begin(), RetireQueue.begin() + Count);
+    RetireQueue.swap(Kept);
     return Out;
 }
 
@@ -255,8 +282,13 @@ bool Scheduler::ValidateInvariants(char* OutWhy, int32_t WhyLen) const
         {
             if (S.Generation == 0 && (S.Key.Face || S.Key.LOD || S.Key.X || S.Key.Y))
                 return Fail("Free slot carries a key");
+            if (S.bWorkerInFlight)
+                return Fail("Free slot still has a worker in flight");
             continue;
         }
+
+        if (S.bWorkerInFlight && S.State != SlotState::Building && S.State != SlotState::Retiring)
+            return Fail("Worker in flight on a slot that is neither Building nor Retiring");
 
         if (!Seen.insert(S.Key).second) return Fail("Two slots own one key");
 

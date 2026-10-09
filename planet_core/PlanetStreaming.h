@@ -72,6 +72,13 @@ struct Slot
 
     uint64_t LastTouchedFrame = 0;
     bool     bNeedsCollision  = false;
+
+    // True from MarkBuilding until the UE side reports WorkerFinished. While
+    // set, the slot's scratch buffers and mesh builder belong to a running
+    // worker, so the slot is never freed or reassigned, even when retired.
+    // Without this a retired slot could be handed to a second worker while
+    // the first still wrote into the same buffers.
+    bool     bWorkerInFlight  = false;
 };
 
 struct WorkerRequest
@@ -148,7 +155,14 @@ public:
     // Game thread, after RMC CreateSectionGroup succeeded.
     bool MarkActive(const Completion& In);
 
+    // Game thread, as soon as the worker launched for this slot has finished,
+    // whether its result is applied or dropped as stale. Releases the slot's
+    // scratch for reuse.
+    void WorkerFinished(int32_t SlotIndex);
+
     // Physical slot indices that the UE side must release, then reuse.
+    // A retiring slot whose worker is still running stays queued until
+    // WorkerFinished; it does not count towards MaxCount.
     std::vector<int32_t> DrainRetires(int32_t MaxCount);
 
     // Test/debug invariant: no key owns two slots, no Free slot carries a key,

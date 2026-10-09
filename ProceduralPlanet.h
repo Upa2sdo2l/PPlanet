@@ -17,6 +17,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "HAL/PlatformAtomics.h"
+#include "Async/Future.h"
 #include "PlanetTypes.h"
 #include "PlanetNoise.h"
 #include "PlanetMeshBuilder.h"
@@ -152,6 +153,10 @@ private:
         FChunkKey                   Key;
         bool                        bBuilt = false;
         bool                        bNeedsCollision = false;
+
+        // The task writing into this slot, if any. EndPlay waits on it
+        // before freeing the scratch the task points at.
+        TFuture<void>               Future;
     };
     TArray<TUniquePtr<FSlotWork>> SlotWork;
 

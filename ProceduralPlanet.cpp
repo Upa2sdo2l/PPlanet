@@ -50,7 +50,17 @@ public:
 
     void Run()
     {
-        if (!Gen || !Gen->IsValid() || !Builder || !Work) return;
+        if (!Work) return;
+        if (!Gen || !Gen->IsValid() || !Builder)
+        {
+            // Still report completion: the scheduler keeps the slot reserved
+            // until the game thread sees bDone, so a silent return here would
+            // lose the slot for good.
+            Work->bBuilt = false;
+            Work->Generation = Generation;
+            Work->bDone.Store(true);
+            return;
+        }
 
         // 1. Sample the surface. This is the expensive step: min 0.95 ms per
         //    chunk for 4225 vertices, measured on the reference box.
@@ -100,6 +110,16 @@ void AProceduralPlanet::BeginPlay()
 
 void AProceduralPlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    // Workers hold raw pointers into SlotWork, Builders and Generator. Let
+    // every running task finish before any of them is destroyed.
+    for (const TUniquePtr<FSlotWork>& W : SlotWork)
+    {
+        if (W.IsValid() && W->Future.IsValid())
+        {
+            W->Future.Wait();
+        }
+    }
+
     SlotWork.Reset();
     Builders.Reset();
     Pool.Reset();
@@ -370,8 +390,10 @@ void AProceduralPlanet::PumpWorkers()
         // Collision requirement was already determined by LOD in ReconcileStreaming
         W.bNeedsCollision = Req.bNeedsCollision;
 
-        FPlanetChunkWorker::Launch(&Generator, Builders[Req.SlotIndex].Get(),
-                                   &W, Req.Generation, PlanetRadiusMetres);
+        // MarkBuilding guarantees no other worker owns this slot's scratch;
+        // the scheduler keeps the slot reserved until WorkerFinished.
+        W.Future = FPlanetChunkWorker::Launch(&Generator, Builders[Req.SlotIndex].Get(),
+                                              &W, Req.Generation, PlanetRadiusMetres);
 
         if (++Launched >= MaxNewRequestsPerFrame) break;
     }
@@ -396,6 +418,10 @@ void AProceduralPlanet::ApplyReadyChunks()
         // Acquire load: pairs with the worker's release store, so the stream
         // set writes above are visible here.
         if (!W.bDone.Load()) continue;
+
+        // The worker has returned, whatever happens to its result below:
+        // the slot's scratch may be reused (and a retired slot released).
+        Scheduler.WorkerFinished(i);
 
         PlanetStreaming::Completion C;
         C.Key        = PlanetLOD::ChunkKey{W.Key.Face, W.Key.LOD, W.Key.X, W.Key.Y};

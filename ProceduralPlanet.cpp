@@ -271,7 +271,7 @@ void AProceduralPlanet::CreatePool()
 // ─────────────────────────────────────────────────────────────────────────────
 void AProceduralPlanet::RebuildNoise()
 {
-    Generator.Build(NoiseParams);
+    Generator.Build(NoiseParams, PlanetRadiusMetres);
 }
 
 double AProceduralPlanet::GetHeightAtDirection(const FVector& UnitDir) const

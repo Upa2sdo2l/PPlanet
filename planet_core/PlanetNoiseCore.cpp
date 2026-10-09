@@ -5,9 +5,9 @@
 //   1. ComputeNormal sampled the height field twice per vertex through
 //      EvaluateHeight -> 2*N single-sample noise batches per chunk. At N=4489
 //      that was 35912 single-sample calls at ~1/8 SIMD utilisation: 36 ms per
-//      chunk. Now the three height fields (base, +U offset, +V offset) are
-//      produced as three BULK batches and the normal is a finite difference:
-//      12 noise calls total. 36.3 ms -> 1.95 ms, x18.
+//      chunk. It then became three BULK batches (base, +U offset, +V offset),
+//      36.3 ms -> 1.95 ms; now it is ONE batch over the chunk grid plus a
+//      one-vertex halo, with central-difference normals.
 //   2. The tangent basis branched on the coordinates to pick a reference axis.
 //      A branch inside the inner loop is slow and discontinuous. The basis now
 //      comes from the cube-face parametrisation: branch-free, and identical to
@@ -72,8 +72,15 @@ void NoiseGraph::Build(const NoiseParams& P)
 
     const float ContinentFreq = SafeFreq(P.ContinentFrequency, 1.2f);
     const float MountainFreq  = SafeFreq(P.MountainFrequency, 6.0f);
-    const float DetailFreq    = SafeFreq(P.DetailFrequency, 24.0f);
     const float WarpFreq      = SafeFreq(P.DomainWarpFrequency, 1.5f);
+
+    // Detail is set in metres. Noise space is the unit sphere (1 unit = the
+    // planet radius), and a Simplex scale is the feature size in input units,
+    // so the scale is wavelength / radius.
+    const double Radius        = (P.PlanetRadiusMetres > 1.0) ? P.PlanetRadiusMetres : 2500000.0;
+    const double DetailWaveM   = (P.DetailWavelengthMetres > 0.01f) ? (double)P.DetailWavelengthMetres : 2000.0;
+    const float  DetailScale   = (float)std::max(1e-7, DetailWaveM / Radius);
+    Params.PlanetRadiusMetres  = Radius;   // sanitised copy used by sampling
 
     // ── Continent: Simplex -> FractalFBm -> DomainWarpGradient ────────────
     ContinentSource = FastNoise::New<FastNoise::Simplex>();
@@ -118,7 +125,7 @@ void NoiseGraph::Build(const NoiseParams& P)
 
     // ── Detail: Simplex -> FractalFBm ─────────────────────────────────────
     DetailSource = FastNoise::New<FastNoise::Simplex>();
-    DetailSource->SetScale(1.0f / DetailFreq);
+    DetailSource->SetScale(DetailScale);
     DetailSource->SetSeedOffset(SeedDetail);
 
     DetailFractal = FastNoise::New<FastNoise::FractalFBm>();
@@ -183,82 +190,89 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out) const
 {
     if (!bValid) return;
 
-    const int32_t N = PLANET_VERTS_PER_SIDE;
-    const int32_t Total = N * N;
+    // The chunk grid is N x N vertices; the sampled grid adds a one-vertex
+    // ring (halo) around it, G = N + 2. Every vertex then has all four grid
+    // neighbours, so its normal is a central difference and the surface is
+    // sampled exactly once: one noise pass of G² points instead of three
+    // passes of N² (base, +U, +V) -- 4489 instead of 12675 samples.
+    const int32_t N = PLANET_VERTS_PER_SIDE;     // 65
+    const int32_t G = PLANET_GRID_WITH_HALO;     // 67
+    const int32_t TotalG = G * G;
 
-    static thread_local std::vector<float> X0,Y0,Z0, XU,YU,ZU, XV,YV,ZV;
-    static thread_local std::vector<float> H0,HU,HV, Cb,Mb,Hb,Db;
-    static thread_local bool bSized = false;
-
-    if (!bSized)
+    static thread_local std::vector<float>  XG, YG, ZG, Cg, Mg, Hg, Dg;
+    static thread_local std::vector<double> DXg, DYg, DZg, HeightG;
+    if ((int32_t)XG.size() < TotalG)
     {
-        for (std::vector<float>* V : {&X0,&Y0,&Z0,&XU,&YU,&ZU,&XV,&YV,&ZV,&H0,&HU,&HV,&Cb,&Mb,&Hb,&Db})
-            V->resize((size_t)Total);
-        bSized = true;
+        for (std::vector<float>* V : {&XG, &YG, &ZG, &Cg, &Mg, &Hg, &Dg})
+            V->resize((size_t)TotalG);
+        for (std::vector<double>* V : {&DXg, &DYg, &DZg, &HeightG})
+            V->resize((size_t)TotalG);
     }
 
-    const double D = 2.0 / (double)((int64_t)1 << Key.LOD);
-    const double StepUV = D / (double)PLANET_QUADS_PER_SIDE;
+    // Grid index g = 0 and G-1 are the halo; g = 1..N map to the chunk's
+    // vertices 0..N-1. ChunkVertexUV is the same function the mesh builder
+    // uses, so the interior samples land exactly on the mesh vertices.
+    for (int32_t gy = 0; gy < G; ++gy)
+    {
+        for (int32_t gx = 0; gx < G; ++gx)
+        {
+            const int32_t i = gx + gy * G;
+            double U, V;
+            ChunkVertexUV(Key, gx, gy, U, V);
+            const Vec3d d = CubeFaceDirection(Key.Face, U, V);
+
+            // float for FastNoise2, double kept for the normal: adjacent LOD-14
+            // vertices are ~5 m apart, and float directions (0.15 m steps on a
+            // 2500 km sphere) would put ~3% noise into the difference.
+            XG[i] = (float)d.X;  YG[i] = (float)d.Y;  ZG[i] = (float)d.Z;
+            DXg[i] = d.X;        DYg[i] = d.Y;        DZg[i] = d.Z;
+        }
+    }
+
+    EvaluateLayers(XG.data(), YG.data(), ZG.data(), TotalG,
+                   Cg.data(), Mg.data(), Hg.data(), Dg.data());
+    for (int32_t i = 0; i < TotalG; ++i)
+        HeightG[i] = ComposeHeight(Cg[i], Mg[i], Dg[i]);
+
+    const double R = Params.PlanetRadiusMetres;
+    auto SurfacePoint = [&](int32_t i)
+    {
+        return Vec3d(DXg[i], DYg[i], DZg[i]) * (R + HeightG[i]);
+    };
 
     for (int32_t gy = 0; gy < N; ++gy)
     {
         for (int32_t gx = 0; gx < N; ++gx)
         {
-            const int32_t i = gx + gy * N;
-            const double U0 = -1.0 + (double)Key.X * D + (double)gx * StepUV;
-            const double V0 = -1.0 + (double)Key.Y * D + (double)gy * StepUV;
+            const int32_t g = (gx + 1) + (gy + 1) * G;   // same vertex in the halo grid
+            Surface& S = Out[gx + gy * N];
+            const Vec3d Dir(DXg[g], DYg[g], DZg[g]);
 
-            const Vec3d d  = CubeFaceDirection(Key.Face, U0, V0);
-            const Vec3d du = CubeFaceDirection(Key.Face, U0 + StepUV, V0);
-            const Vec3d dv = CubeFaceDirection(Key.Face, U0, V0 + StepUV);
+            S.Continent   = Cg[g];
+            S.Mountain    = Mg[g];
+            S.HumidityRaw = Hg[g];
+            S.Height      = HeightG[g];
 
-            X0[i]=(float)d.X;  Y0[i]=(float)d.Y;  Z0[i]=(float)d.Z;
-            XU[i]=(float)du.X; YU[i]=(float)du.Y; ZU[i]=(float)du.Z;
-            XV[i]=(float)dv.X; YV[i]=(float)dv.Y; ZV[i]=(float)dv.Z;
+            // Central differences along the grid's U and V directions.
+            const Vec3d Su = SurfacePoint(g + 1) - SurfacePoint(g - 1);
+            const Vec3d Sv = SurfacePoint(g + G) - SurfacePoint(g - G);
+
+            Vec3d n = Vec3d::Cross(Su, Sv);
+            if (n.LengthSq() < 1e-20) n = Dir;
+            n = n.Normalised();
+            if (Vec3d::Dot(n, Dir) < 0.0) n = -n;
+
+            S.Normal = n;
+            S.Slope  = (float)std::clamp(1.0 - Vec3d::Dot(n, Dir), 0.0, 1.0);
+
+            Vec3d t = Su - n * Vec3d::Dot(n, Su);
+            S.Tangent = (t.LengthSq() > 1e-20) ? t.Normalised() : Vec3d(1,0,0);
+
+            Climate Cl = ComputeClimate(Dir, S.Height, Params);
+            Cl.Humidity = std::clamp(Cl.Humidity + Hg[g] * Params.HumidityVariance * 0.5f, 0.f, 1.f);
+
+            ComputeBiomes(Cl, S.Slope, S.FlowMask, S.Height, S.Biome);
         }
-    }
-
-    // Three bulk height passes, then finite-difference normals.
-    EvaluateLayers(X0.data(), Y0.data(), Z0.data(), Total,
-                   Cb.data(), Mb.data(), Hb.data(), Db.data());
-    for (int32_t i = 0; i < Total; ++i)
-        H0[i] = (float)ComposeHeight(Cb[i], Mb[i], Db[i]);
-
-    EvaluateHeightField(XU.data(), YU.data(), ZU.data(), Total, HU.data());
-    EvaluateHeightField(XV.data(), YV.data(), ZV.data(), Total, HV.data());
-
-    const double R = 2500000.0;
-
-    for (int32_t i = 0; i < Total; ++i)
-    {
-        Surface& S = Out[i];
-        const Vec3d Dir((double)X0[i], (double)Y0[i], (double)Z0[i]);
-
-        S.Continent   = Cb[i];
-        S.Mountain    = Mb[i];
-        S.HumidityRaw = Hb[i];
-        S.Height      = (double)H0[i];
-
-        const Vec3d S0 = Dir * (R + (double)H0[i]);
-        const Vec3d Su = Vec3d((double)XU[i], (double)YU[i], (double)ZU[i]) * (R + (double)HU[i]);
-        const Vec3d Sv = Vec3d((double)XV[i], (double)YV[i], (double)ZV[i]) * (R + (double)HV[i]);
-
-        Vec3d n = Vec3d::Cross(Su - S0, Sv - S0);
-        if (n.LengthSq() < 1e-20) n = Dir;
-        n = n.Normalised();
-        if (Vec3d::Dot(n, Dir) < 0.0) n = -n;
-
-        S.Normal = n;
-        S.Slope  = (float)std::clamp(1.0 - Vec3d::Dot(n, Dir), 0.0, 1.0);
-
-        Vec3d t = Su - S0;
-        t = t - n * Vec3d::Dot(n, t);
-        S.Tangent = (t.LengthSq() > 1e-20) ? t.Normalised() : Vec3d(1,0,0);
-
-        Climate Cl = ComputeClimate(Dir, S.Height, Params);
-        Cl.Humidity = std::clamp(Cl.Humidity + Hb[i] * Params.HumidityVariance * 0.5f, 0.f, 1.f);
-
-        ComputeBiomes(Cl, S.Slope, S.FlowMask, S.Height, S.Biome);
     }
 }
 
@@ -293,7 +307,7 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
     EvaluateHeightField(XU.data(), YU.data(), ZU.data(), Count, HU.data());
     EvaluateHeightField(XV.data(), YV.data(), ZV.data(), Count, HV.data());
 
-    const double R = 2500000.0;
+    const double R = Params.PlanetRadiusMetres;
 
     for (int32_t i = 0; i < Count; ++i)
     {
@@ -363,14 +377,17 @@ double NoiseGraph::ComposeHeight(float C, float M, float D) const
         const float Mn    = std::clamp((M + 1.2f) / 3.1f, 0.f, 1.f);
         const float Peaks = std::pow(Mn, Params.MountainSharpness);
 
+        // Detail is in metres: DetailAmplitude is the height of a full-scale
+        // detail feature. (An earlier "* 0.05" here silently turned the
+        // default 300 into +-15 m.)
         return (double)Above * 12000.0
              + (double)Shore * (double)Peaks * (double)Params.MountainAmplitude
-             + (double)D * (double)Params.DetailAmplitude * 0.05;
+             + (double)D * (double)Params.DetailAmplitude;
     }
 
     // Ocean floor: bounded so a deep trench cannot reach absurd depths.
     const double Depth = (double)(-Above) * (double)Params.OceanDepthScale * 12000.0;
-    return -(std::min(Depth, 11000.0)) + (double)D * 200.0 * (double)Params.OceanDetailAmp;
+    return -(std::min(Depth, 11000.0)) + (double)D * (double)Params.DetailAmplitude * (double)Params.OceanDetailAmp;
 }
 
 // ── Auto sea level: quantile of the continent field over the whole sphere ───

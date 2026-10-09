@@ -22,7 +22,7 @@
 
 // Bump when the noise graph, biome formula or erosion changes. The bake cache
 // hashes this, so stale bakes are evicted without a manual cache bust.
-static constexpr uint32 PLANET_GENERATOR_VERSION = 1;
+static constexpr uint32 PLANET_GENERATOR_VERSION = 2;   // 2: halo-grid normals, detail in metres
 
 // ── Chunk geometry (must match PlanetNoiseCore.h) ───────────────────────────
 static constexpr int32 PLANET_QUADS_PER_SIDE = 64;
@@ -164,18 +164,26 @@ struct FPlanetNoiseParams
     float OceanDepthScale = 0.35f;
     
     // ── Detail ─────────────────────────────────────────────────────────────
+    // Both in metres. These replace DetailFrequency / DetailAmplitude, whose
+    // amplitude was secretly scaled by 0.05 and whose frequency put the
+    // finest detail at ~2 km. New names on purpose: a value saved under the
+    // old name is ignored instead of silently meaning metres.
 
+    // Wavelength of the largest detail octave on the surface. Each further
+    // octave is 2.2x smaller (2000 m, 8 octaves -> finest ~8 m).
     UPROPERTY(EditAnywhere, Category="Planet|Detail",
-        meta=(ClampMin="1.0", ClampMax="128.0"))
-    float DetailFrequency = 24.0f;
+        meta=(ClampMin="10.0", ClampMax="200000.0"))
+    float DetailWavelengthMetres = 2000.0f;
 
     UPROPERTY(EditAnywhere, Category="Planet|Detail",
         meta=(ClampMin="1", ClampMax="16"))
     int32 DetailOctaves = 8;
 
+    // Height of a full-scale detail feature. 40 m gives roughly half the
+    // local relief at walking scale and ~13% at 2 km.
     UPROPERTY(EditAnywhere, Category="Planet|Detail",
-        meta=(ClampMin="0.0", ClampMax="10000.0"))
-    float DetailAmplitude = 300.0f;
+        meta=(ClampMin="0.0", ClampMax="2000.0"))
+    float DetailAmplitudeMetres = 40.0f;
 
     // ── Seed ────────────────────────────────────────────────────────────
     UPROPERTY(EditAnywhere, Category="Planet|Seed")
@@ -234,9 +242,9 @@ inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
     Mix(&SnowAltitudeStart,    sizeof(SnowAltitudeStart));
     Mix(&HumidityVariance,     sizeof(HumidityVariance));
     Mix(&OceanDepthScale,      sizeof(OceanDepthScale));
-    Mix(&DetailFrequency,      sizeof(DetailFrequency));
-    Mix(&DetailOctaves,        sizeof(DetailOctaves));
-    Mix(&DetailAmplitude,      sizeof(DetailAmplitude));
+    Mix(&DetailWavelengthMetres, sizeof(DetailWavelengthMetres));
+    Mix(&DetailOctaves,          sizeof(DetailOctaves));
+    Mix(&DetailAmplitudeMetres,  sizeof(DetailAmplitudeMetres));
     Mix(&MasterSeed,           sizeof(MasterSeed));
     Mix(&TargetLandFraction,   sizeof(TargetLandFraction));
     return H ^ (uint64)PLANET_GENERATOR_VERSION;

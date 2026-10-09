@@ -83,7 +83,7 @@ struct Vec3d
 inline Vec3d operator*(double S, const Vec3d& V) { return V * S; }
 
 // ── Shared constants (must match the UE-side header) ────────────────────────
-static constexpr uint32_t PLANET_GENERATOR_VERSION = 1;
+static constexpr uint32_t PLANET_GENERATOR_VERSION = 2;   // 2: halo-grid normals, detail in metres
 static constexpr int32_t  BIOME_GRASS = 0;
 static constexpr int32_t  BIOME_ROCK  = 1;
 static constexpr int32_t  BIOME_SAND  = 2;
@@ -160,9 +160,18 @@ struct NoiseParams
     float   HumidityVariance   = 0.40f;
 
     // ── Detail ──────────────────────────────────────────────────────────
-    float   DetailFrequency    = 24.0f;
-    int32_t DetailOctaves      = 12;
-    float   DetailAmplitude    = 300.f;
+    // Wavelength of the largest detail octave, metres on the surface. Each
+    // further octave is 2.2x smaller: 2000 m with 8 octaves reaches ~8 m,
+    // about the LOD-14 vertex spacing.
+    float   DetailWavelengthMetres = 2000.f;
+    int32_t DetailOctaves      = 8;
+    // Metres. Added to the height as D * DetailAmplitude, D roughly [-1, 1].
+    float   DetailAmplitude    = 40.f;
+
+    // ── Planet ──────────────────────────────────────────────────────────
+    // Radius of the reference sphere, metres. Converts metre-sized settings
+    // into the unit-sphere noise space and positions samples for normals.
+    double  PlanetRadiusMetres = 2500000.0;
 
     int32_t MasterSeed = 1337;
 
@@ -219,9 +228,10 @@ public:
     // THE mesh-generation entry point. Fills PLANET_VERTS_PER_SIDE² surfaces
     // row-major: index = gy * VERTS_PER_SIDE + gx.
     //
-    // Three bulk noise passes total (base, +U offset, +V offset); normals are
-    // finite differences between them. Cost does not scale with vertex count
-    // beyond per-vertex arithmetic.
+    // One bulk noise pass over a PLANET_GRID_WITH_HALO² grid (the chunk plus
+    // a one-vertex ring around it). Normals are central differences between
+    // grid neighbours, so a border vertex gets the same normal from both
+    // chunks that share it.
     void SampleChunkBatch(const FChunkKey& Key, Surface* Out) const;
 
     Surface SampleSurface(const Vec3d& UnitDir) const;

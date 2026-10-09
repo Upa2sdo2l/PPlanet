@@ -1,9 +1,9 @@
 // PlanetNoise.cpp
 #include "PlanetNoise.h"
 
-void FPlanetNoiseGenerator::Build(const FPlanetNoiseParams& InParams)
+void FPlanetNoiseGenerator::Build(const FPlanetNoiseParams& InParams, double PlanetRadiusMetres)
 {
-    Graph.Build(PlanetBridge::ToCoreParams(InParams));
+    Graph.Build(PlanetBridge::ToCoreParams(InParams, PlanetRadiusMetres));
 
     // Auto sea level: a quantile over a coarse sampling of all six faces
     // (32x32 per face = 6144 samples, sub-millisecond). This is what stops a

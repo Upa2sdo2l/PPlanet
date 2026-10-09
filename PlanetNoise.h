@@ -26,7 +26,9 @@ public:
 
     // Rebuild the graph and recompute the sea level for the target land
     // fraction. A seed is never "all ocean" unless that fraction asks for it.
-    void Build(const FPlanetNoiseParams& InParams);
+    // The radius turns metre-sized settings (detail wavelength) into noise
+    // space and positions samples for normals.
+    void Build(const FPlanetNoiseParams& InParams, double PlanetRadiusMetres);
 
     bool IsValid() const { return Graph.IsValid(); }
     float GetSeaLevel() const { return Graph.GetEffectiveSeaLevel(); }
@@ -72,9 +74,10 @@ FORCEINLINE PlanetCore::FChunkKey ToCoreKey(const FChunkKey& K)
 // because a zero octave count or zero lacunarity would degenerate the terrain
 // rather than merely ignore a slider.
 // ─────────────────────────────────────────────────────────────────────────────
-inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P)
+inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double PlanetRadiusMetres)
 {
     PlanetCore::NoiseParams C;
+    C.PlanetRadiusMetres  = PlanetRadiusMetres;
 
     // ── Mapped from the editor ──────────────────────────────────────────
     C.ContinentFrequency  = P.ContinentFrequency;
@@ -90,9 +93,9 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P)
     C.SnowAltitudeStart   = P.SnowAltitudeStart;
     C.HumidityVariance    = P.HumidityVariance;
     C.OceanDepthScale     = P.OceanDepthScale;
-    C.DetailFrequency     = P.DetailFrequency;
+    C.DetailWavelengthMetres = P.DetailWavelengthMetres;
     C.DetailOctaves       = P.DetailOctaves;
-    C.DetailAmplitude     = P.DetailAmplitude;
+    C.DetailAmplitude     = P.DetailAmplitudeMetres;
     C.MasterSeed          = P.MasterSeed;
 
     // ── DEFAULT: not exposed as sliders yet ─────────────────────────────

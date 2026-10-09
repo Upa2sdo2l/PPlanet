@@ -14,7 +14,13 @@
 #include "Stats/Stats.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// "stat Planet" — type it in the console (PIE or game, any non-Shipping build).
+// Two ways to see the planet's costs:
+//   planet.Stats 1  — on-screen overlay, always available (simplest);
+//   stat Planet     — the same numbers in UE's stats system. The group is
+//                     registered on the planet's first tick, so it is missing
+//                     from console autocomplete; type it in full.
+//
+// stat Planet (PIE or game, any non-Shipping build):
 //
 // Game-thread stages are cycle counters: their per-frame cost shows directly.
 // Worker stages (noise, mesh build) run on pool threads, so they are timed by
@@ -72,7 +78,26 @@ namespace
     {
         return FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - StartCycles);
     }
+
+    // Adds the scope's wall time (ms) to an accumulator. Works in every build
+    // configuration, unlike the stats system; feeds the planet.Stats overlay.
+    struct FPlanetScopedMs
+    {
+        explicit FPlanetScopedMs(double& InAcc) : Acc(InAcc), Start(FPlatformTime::Cycles64()) {}
+        ~FPlanetScopedMs() { Acc += PlanetMsSince(Start); }
+        double& Acc;
+        uint64  Start;
+    };
 }
+
+// "planet.Stats 1" in the console: on-screen profiling overlay. Independent of
+// the stats system, so it needs no "stat" command and shows in autocomplete.
+static TAutoConsoleVariable<int32> CVarPlanetStats(
+    TEXT("planet.Stats"),
+    0,
+    TEXT("1 = show the planet profiling overlay: per-chunk cost of noise, mesh build and ")
+    TEXT("commit, game-thread time per stage, and the LOD/collision of the chunk under the camera."),
+    ECVF_Default);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker task
@@ -290,6 +315,7 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
     if (Pool.Num() == 0) return;
 
     SCOPE_CYCLE_COUNTER(STAT_Planet_Tick);
+    FPlanetScopedMs TickTimer(PerfWindow.TickMs);
 
     ++FrameCounter;
 
@@ -358,6 +384,7 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     if (CameraPos.SizeSquared() > 1.0)
     {
         SCOPE_CYCLE_COUNTER(STAT_Planet_CameraHeight);
+        FPlanetScopedMs HeightTimer(PerfWindow.HeightMs);
         CameraTerrainHeightM = Generator.GetHeightAt(CameraPos.GetSafeNormal());
         P.SurfaceOffsetCm = CameraTerrainHeightM * PLANET_METRES_TO_UE_CM;
     }
@@ -370,12 +397,14 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     P.bUseHorizonCull  = true;
 
     SCOPE_CYCLE_COUNTER(STAT_Planet_LOD);
+    FPlanetScopedMs LODTimer(PerfWindow.LODMs);
     PlanetLOD::Traverse(P, LastSelection);
 }
 
 void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& CameraPos)
 {
     SCOPE_CYCLE_COUNTER(STAT_Planet_Reconcile);
+    FPlanetScopedMs ReconcileTimer(PerfWindow.ReconcileMs);
 
     std::vector<PlanetStreaming::DesiredChunk> Desired;
     Desired.reserve(LastSelection.Chunks.size());
@@ -444,6 +473,7 @@ static double ChunkDistanceToCamera(const PlanetLOD::ChunkKey& Key,
 void AProceduralPlanet::PumpWorkers()
 {
     SCOPE_CYCLE_COUNTER(STAT_Planet_Pump);
+    FPlanetScopedMs PumpTimer(PerfWindow.PumpMs);
 
     int32 Launched = 0;
     PlanetStreaming::WorkerRequest Req;
@@ -484,6 +514,7 @@ void AProceduralPlanet::PumpWorkers()
 void AProceduralPlanet::ApplyReadyChunks()
 {
     SCOPE_CYCLE_COUNTER(STAT_Planet_Apply);
+    FPlanetScopedMs ApplyTimer(PerfWindow.ApplyMs);
 
     int32 Committed = 0;
 
@@ -539,10 +570,12 @@ void AProceduralPlanet::ApplyReadyChunks()
 
                 {
                     SCOPE_CYCLE_COUNTER(STAT_Planet_RMCRemove);
+                    FPlanetScopedMs RemoveTimer(PerfWindow.RemoveMs);
                     MeshSimple->RemoveSectionGroup(GK);
                 }
                 {
                     SCOPE_CYCLE_COUNTER(STAT_Planet_RMCCreate);
+                    FPlanetScopedMs CreateTimer(PerfWindow.CreateMs);
                     MeshSimple->CreateSectionGroup(GK, MoveTemp(Streams));
                 }
 
@@ -555,6 +588,7 @@ void AProceduralPlanet::ApplyReadyChunks()
                 const bool bWantCollision = W.bNeedsCollision;
                 {
                     SCOPE_CYCLE_COUNTER(STAT_Planet_RMCConfig);
+                    FPlanetScopedMs ConfigTimer(PerfWindow.ConfigMs);
                     FRealtimeMeshSectionConfig Config;
                     MeshSimple->UpdateSectionConfig(SK, Config, bWantCollision);
                 }
@@ -590,6 +624,7 @@ void AProceduralPlanet::ApplyReadyChunks()
 void AProceduralPlanet::ReleaseRetired()
 {
     SCOPE_CYCLE_COUNTER(STAT_Planet_Release);
+    FPlanetScopedMs ReleaseTimer(PerfWindow.ReleaseMs);
 
     const std::vector<int32> Freed = Scheduler.DrainRetires(MaxRetiresPerFrame);
     for (int32 SlotIndex : Freed)
@@ -653,7 +688,8 @@ FString AProceduralPlanet::GetStreamingStatsString() const
 // ─────────────────────────────────────────────────────────────────────────────
 void AProceduralPlanet::UpdatePlanetStats()
 {
-    // Close the one-second window that feeds the per-chunk averages.
+    // Close the one-second window that feeds the averages.
+    ++PerfWindow.Frames;
     const double Now = FPlatformTime::Seconds();
     if (PerfWindow.WindowStart <= 0.0) PerfWindow.WindowStart = Now;
     if (Now - PerfWindow.WindowStart >= 1.0)
@@ -663,37 +699,14 @@ void AProceduralPlanet::UpdatePlanetStats()
         PerfWindow.WindowStart = Now;
     }
 
-#if STATS
-    const FPerfWindow& W = PerfPublished;
-    SET_FLOAT_STAT(STAT_Planet_NoiseAvg, W.Built     > 0 ? (float)(W.NoiseMs / W.Built)     : 0.f);
-    SET_FLOAT_STAT(STAT_Planet_NoiseMax, (float)W.NoiseMax);
-    SET_FLOAT_STAT(STAT_Planet_BuildAvg, W.Built     > 0 ? (float)(W.BuildMs / W.Built)     : 0.f);
-    SET_FLOAT_STAT(STAT_Planet_BuildMax, (float)W.BuildMax);
-    SET_FLOAT_STAT(STAT_Planet_RMCAvg,   W.Committed > 0 ? (float)(W.RMCMs   / W.Committed) : 0.f);
-    SET_FLOAT_STAT(STAT_Planet_RMCMax,   (float)W.RMCMax);
-    SET_DWORD_STAT(STAT_Planet_BuiltPerSec,     W.Built);
-    SET_DWORD_STAT(STAT_Planet_CommittedPerSec, W.Committed);
-
-    const PlanetStreaming::Stats S = Scheduler.GetStats();
-    SET_DWORD_STAT(STAT_Planet_Active,    S.Active);
-    SET_DWORD_STAT(STAT_Planet_Requested, S.Requested);
-    SET_DWORD_STAT(STAT_Planet_Building,  S.Building);
-    SET_DWORD_STAT(STAT_Planet_Retiring,  S.Retiring);
-    SET_DWORD_STAT(STAT_Planet_Free,      S.Free);
-
-    int32 DeepestLevel = 0;
-    for (const PlanetLOD::ChunkKey& K : LastSelection.Chunks)
-        DeepestLevel = FMath::Max(DeepestLevel, (int32)K.LOD);
-    SET_DWORD_STAT(STAT_Planet_Leaves,    (int32)LastSelection.Chunks.size());
-    SET_DWORD_STAT(STAT_Planet_MaxLevel,  DeepestLevel);
-    SET_DWORD_STAT(STAT_Planet_BudgetHit, LastSelection.bBudgetHit ? 1 : 0);
-
+    // ── Under-camera diagnostics ─────────────────────────────────────────
     // The chunk under the camera: its LOD, and whether its component has
     // collision switched on. Enabled means the cook was requested; with
     // async cooking the body can still be a few frames behind.
+    NadirLOD = 0;                  // 0 also when no leaf was found
+    bNadirCollision = false;
     const double CamDistCm = LastCameraPosUE.Size();
-    int32 NadirLOD = 0;          // 0 also when no leaf was found
-    int32 NadirCollision = 0;
+    CameraAboveTerrainM = CamDistCm / PLANET_METRES_TO_UE_CM - (PlanetRadiusMetres + CameraTerrainHeightM);
     if (CamDistCm > 1.0)
     {
         const FVector3d Dir = LastCameraPosUE / CamDistCm;
@@ -704,27 +717,84 @@ void AProceduralPlanet::UpdatePlanetStats()
         const int32 Leaf = PlanetLOD::FindLeafContaining(LastSelection.Chunks, Face, U, V);
         if (Leaf >= 0)
         {
-            const PlanetLOD::ChunkKey& K = LastSelection.Chunks[Leaf];
-            NadirLOD = K.LOD;
+            const PlanetLOD::ChunkKey& NadirKey = LastSelection.Chunks[Leaf];
+            NadirLOD = NadirKey.LOD;
 
             const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
             for (int32 s = 0; s < (int32)Slots.size(); ++s)
             {
-                if (Slots[s].State != PlanetStreaming::SlotState::Active || Slots[s].Key != K) continue;
-                if (Pool.IsValidIndex(s) && Pool[s] &&
-                    Pool[s]->GetCollisionEnabled() != ECollisionEnabled::NoCollision)
-                {
-                    NadirCollision = 1;
-                }
+                if (Slots[s].State != PlanetStreaming::SlotState::Active || Slots[s].Key != NadirKey) continue;
+                bNadirCollision = Pool.IsValidIndex(s) && Pool[s] &&
+                    Pool[s]->GetCollisionEnabled() != ECollisionEnabled::NoCollision;
                 break;
             }
         }
     }
+
+    int32 DeepestLevel = 0;
+    for (const PlanetLOD::ChunkKey& K : LastSelection.Chunks)
+        DeepestLevel = FMath::Max(DeepestLevel, (int32)K.LOD);
+
+    const PlanetStreaming::Stats S = Scheduler.GetStats();
+    const FPerfWindow& W = PerfPublished;
+    const double NoiseAvg = W.Built     > 0 ? W.NoiseMs / W.Built     : 0.0;
+    const double BuildAvg = W.Built     > 0 ? W.BuildMs / W.Built     : 0.0;
+    const double RMCAvg   = W.Committed > 0 ? W.RMCMs   / W.Committed : 0.0;
+
+#if STATS
+    SET_FLOAT_STAT(STAT_Planet_NoiseAvg, (float)NoiseAvg);
+    SET_FLOAT_STAT(STAT_Planet_NoiseMax, (float)W.NoiseMax);
+    SET_FLOAT_STAT(STAT_Planet_BuildAvg, (float)BuildAvg);
+    SET_FLOAT_STAT(STAT_Planet_BuildMax, (float)W.BuildMax);
+    SET_FLOAT_STAT(STAT_Planet_RMCAvg,   (float)RMCAvg);
+    SET_FLOAT_STAT(STAT_Planet_RMCMax,   (float)W.RMCMax);
+    SET_DWORD_STAT(STAT_Planet_BuiltPerSec,     W.Built);
+    SET_DWORD_STAT(STAT_Planet_CommittedPerSec, W.Committed);
+
+    SET_DWORD_STAT(STAT_Planet_Active,    S.Active);
+    SET_DWORD_STAT(STAT_Planet_Requested, S.Requested);
+    SET_DWORD_STAT(STAT_Planet_Building,  S.Building);
+    SET_DWORD_STAT(STAT_Planet_Retiring,  S.Retiring);
+    SET_DWORD_STAT(STAT_Planet_Free,      S.Free);
+
+    SET_DWORD_STAT(STAT_Planet_Leaves,    (int32)LastSelection.Chunks.size());
+    SET_DWORD_STAT(STAT_Planet_MaxLevel,  DeepestLevel);
+    SET_DWORD_STAT(STAT_Planet_BudgetHit, LastSelection.bBudgetHit ? 1 : 0);
+
     SET_DWORD_STAT(STAT_Planet_NadirLOD,       NadirLOD);
-    SET_DWORD_STAT(STAT_Planet_NadirCollision, NadirCollision);
-    SET_FLOAT_STAT(STAT_Planet_CameraAGL,
-        (float)(CamDistCm / PLANET_METRES_TO_UE_CM - (PlanetRadiusMetres + CameraTerrainHeightM)));
+    SET_DWORD_STAT(STAT_Planet_NadirCollision, bNadirCollision ? 1 : 0);
+    SET_FLOAT_STAT(STAT_Planet_CameraAGL,      (float)CameraAboveTerrainM);
 #endif
+
+    // ── planet.Stats overlay ─────────────────────────────────────────────
+    if (CVarPlanetStats.GetValueOnGameThread() == 0 || !GEngine) return;
+
+    const double F = W.Frames > 0 ? 1.0 / (double)W.Frames : 0.0;   // per-frame averages
+
+    const FString Line1 = FString::Printf(
+        TEXT("[Planet] per chunk, last 1 s:  noise %.2f ms (max %.2f)  |  mesh build %.2f ms (max %.2f)  |  ")
+        TEXT("GT commit %.2f ms (max %.2f)  |  built %d/s, committed %d/s"),
+        NoiseAvg, W.NoiseMax, BuildAvg, W.BuildMax, RMCAvg, W.RMCMax, W.Built, W.Committed);
+
+    const FString Line2 = FString::Printf(
+        TEXT("[Planet] game thread per frame:  total %.3f ms  =  height %.3f + LOD %.3f + reconcile %.3f + ")
+        TEXT("launch %.3f + commit %.3f (RMC remove %.3f, create %.3f, config %.3f) + release %.3f"),
+        W.TickMs * F, W.HeightMs * F, W.LODMs * F, W.ReconcileMs * F, W.PumpMs * F,
+        W.ApplyMs * F, W.RemoveMs * F, W.CreateMs * F, W.ConfigMs * F, W.ReleaseMs * F);
+
+    const FString Line3 = FString::Printf(
+        TEXT("[Planet] under camera: LOD %d, collision %s, %.1f m above terrain  |  leaves %d, deepest L%d, budget %s  |  ")
+        TEXT("pool: active %d, waiting %d, building %d, retiring %d, free %d"),
+        NadirLOD, bNadirCollision ? TEXT("ON") : TEXT("OFF"), CameraAboveTerrainM,
+        (int32)LastSelection.Chunks.size(), DeepestLevel, LastSelection.bBudgetHit ? TEXT("full") : TEXT("not full"),
+        S.Active, S.Requested, S.Building, S.Retiring, S.Free);
+
+    // Key -1 + 0 s: drawn for this frame only. Newer messages go on top, so
+    // add in reverse to read top-down.
+    const FColor Colour = bNadirCollision ? FColor::Cyan : FColor::Orange;
+    GEngine->AddOnScreenDebugMessage(-1, 0.0f, Colour, Line3);
+    GEngine->AddOnScreenDebugMessage(-1, 0.0f, FColor::Cyan, Line2);
+    GEngine->AddOnScreenDebugMessage(-1, 0.0f, FColor::Cyan, Line1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

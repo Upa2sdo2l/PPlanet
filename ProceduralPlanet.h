@@ -144,8 +144,14 @@ private:
 
     void ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key);
 
-    // Publishes "stat Planet" values for this frame.
+    // Publishes "stat Planet" values for this frame and draws the
+    // planet.Stats overlay when that console variable is on.
     void UpdatePlanetStats();
+
+    // Under-camera diagnostics, refreshed by UpdatePlanetStats.
+    int32  NadirLOD = 0;
+    bool   bNadirCollision = false;
+    double CameraAboveTerrainM = 0.0;
 
     // Rolling one-second window behind the per-chunk averages in stat Planet.
     struct FPerfWindow
@@ -156,6 +162,12 @@ private:
         double BuildMs = 0.0, BuildMax = 0.0;
         int32  Committed = 0;
         double RMCMs = 0.0, RMCMax = 0.0;
+
+        // Game-thread stage time summed over the window's frames (ms).
+        int32  Frames = 0;
+        double TickMs = 0.0;
+        double HeightMs = 0.0, LODMs = 0.0, ReconcileMs = 0.0, PumpMs = 0.0;
+        double ApplyMs = 0.0, RemoveMs = 0.0, CreateMs = 0.0, ConfigMs = 0.0, ReleaseMs = 0.0;
     };
     FPerfWindow PerfWindow;      // being accumulated
     FPerfWindow PerfPublished;   // last complete second, shown in stat Planet

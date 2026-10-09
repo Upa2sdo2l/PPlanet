@@ -69,7 +69,7 @@
 ## 2б. Плагин эрозии
 
 Атласы заполняют compute-шейдеры плагина `PlanetErosion`: настройка в `GpuErosion/README.md`.
-У `PlanetNormalAtlas` и `PlanetBiomeAtlas` лучше выставить **Sampler Type: Linear Color**.
+В материале ничего менять не нужно.
 
 ## 3. Актор планеты
 

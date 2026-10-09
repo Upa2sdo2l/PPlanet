@@ -175,6 +175,11 @@ struct NoiseParams
 
     int32_t MasterSeed = 1337;
 
+    // Noise is sampled with Y and Z swapped: the continents land where Planet
+    // Noise Lab (whose maps put the pole on the noise Y axis) shows them,
+    // while the climate poles stay on world Z. Same shapes, other placement.
+    bool    NoiseSwapYZ = false;
+
     // Wang-mixed per-layer seed: low correlation between layers, deterministic
     // and cheap. Reordering layers is a generator version bump.
     int32_t LayerSeed(int32_t L) const
@@ -302,6 +307,10 @@ private:
 
     void EvaluateHeightField(const float* X, const float* Y, const float* Z,
                              int32_t Count, float* OutHeight) const;
+
+    // Coordinates handed to FastNoise (see NoiseParams::NoiseSwapYZ).
+    const float* NoiseY(const float* Y, const float* Z) const { return Params.NoiseSwapYZ ? Z : Y; }
+    const float* NoiseZ(const float* Y, const float* Z) const { return Params.NoiseSwapYZ ? Y : Z; }
 
     // Branch-free tangent basis from the cube-face parametrisation.
     static void BuildNormalBasis(const Vec3d& Dir, Vec3d& OutT1, Vec3d& OutT2);

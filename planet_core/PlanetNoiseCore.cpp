@@ -142,25 +142,25 @@ void NoiseGraph::EvaluateLayers(const float* X, const float* Y, const float* Z, 
                                 float* OutContinent, float* OutMountain,
                                 float* OutHumidity, float* OutDetail) const
 {
-    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    HumidityFractal->GenPositionArray3D(OutHumidity,  Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
+    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    HumidityFractal->GenPositionArray3D(OutHumidity,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
 }
 
 void NoiseGraph::EvaluateTempNoise(const float* X, const float* Y, const float* Z, int32_t Count,
                                    float* Out) const
 {
-    HumidityFractal->GenPositionArray3D(Out, Count, X, Y, Z, 17.31f, -9.17f, 5.73f, Params.MasterSeed);
+    HumidityFractal->GenPositionArray3D(Out, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 17.31f, -9.17f, 5.73f, Params.MasterSeed);
 }
 
 void NoiseGraph::EvaluateLayersNoHumidity(const float* X, const float* Y, const float* Z, int32_t Count,
                                           float* OutContinent, float* OutMountain,
                                           float* OutDetail) const
 {
-    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
+    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
 }
 
 void NoiseGraph::EvaluateHeightField(const float* X, const float* Y, const float* Z,
@@ -184,8 +184,8 @@ void NoiseGraph::EvaluateBaseHeightBatch(const float* X, const float* Y, const f
     static thread_local std::vector<float> C, M;
     if ((int32_t)C.size() < Count) { C.resize((size_t)Count); M.resize((size_t)Count); }
 
-    ContinentWarp->GenPositionArray3D(  C.data(), Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(M.data(), Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
+    ContinentWarp->GenPositionArray3D(  C.data(), Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    MountainFractal->GenPositionArray3D(M.data(), Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
     for (int32_t i = 0; i < Count; ++i)
         OutHeight[i] = ComposeHeight(C[i], M[i], 0.f);
 }

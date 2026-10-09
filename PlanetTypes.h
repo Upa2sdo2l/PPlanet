@@ -115,6 +115,18 @@ struct FPlanetNoiseParams
     UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="0.1", ClampMax="8.0"))
     float ContinentFrequency = 1.2f;
 
+    // Fractal of the continent layer: more octaves = more ragged coasts and
+    // islands; gain = how strong each finer octave is; lacunarity = how much
+    // finer each octave is.
+    UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="1", ClampMax="16"))
+    int32 ContinentOctaves = 8;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float ContinentGain = 0.5f;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="1.01", ClampMax="4.0"))
+    float ContinentLacunarity = 2.0f;
+
     // Sharpness of the continent-ocean boundary. Low = gentle shelves.
     UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="0.0", ClampMax="1.0"))
     float ShoreSharpness = 0.4f;
@@ -194,11 +206,26 @@ struct FPlanetNoiseParams
     UPROPERTY(EditAnywhere, Category="Planet|Seed")
     int32 MasterSeed = 1337;
 
+    // On: continents are placed as Planet Noise Lab shows them on its map
+    // (the lab's pole is the noise Y axis; the game's poles are on world Z).
+    // Off: the original placement. Shapes are the same either way.
+    UPROPERTY(EditAnywhere, Category="Planet|Seed")
+    bool bNoiseLabOrientation = false;
+
     // Fraction of the surface that should end up above sea level.
     // The sea level is derived from this by quantile, so no seed is ever
     // "all ocean" or "no water" unless asked for.
-    UPROPERTY(EditAnywhere, Category="Planet|Seed", meta=(ClampMin="0.05", ClampMax="0.95"))
+    UPROPERTY(EditAnywhere, Category="Planet|Seed", meta=(ClampMin="0.05", ClampMax="0.95", EditCondition="bAutoSeaLevel"))
     float TargetLandFraction = 0.30f;
+
+    // On: the sea level is chosen so that TargetLandFraction of the surface
+    // is land. Off: SeaLevel is used as is (continent-noise value), which
+    // keeps the exact coastlines of a hand-picked setting.
+    UPROPERTY(EditAnywhere, Category="Planet|Seed")
+    bool bAutoSeaLevel = true;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Seed", meta=(ClampMin="-1.0", ClampMax="1.0", EditCondition="!bAutoSeaLevel"))
+    float SeaLevel = 0.0f;
 
     // ── Layer seeds ─────────────────────────────────────────────────────
     enum ELayer : int32
@@ -363,6 +390,12 @@ inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
     Mix(&DetailAmplitudeMetres,  sizeof(DetailAmplitudeMetres));
     Mix(&MasterSeed,           sizeof(MasterSeed));
     Mix(&TargetLandFraction,   sizeof(TargetLandFraction));
+    Mix(&ContinentOctaves,     sizeof(ContinentOctaves));
+    Mix(&ContinentGain,        sizeof(ContinentGain));
+    Mix(&ContinentLacunarity,  sizeof(ContinentLacunarity));
+    Mix(&bAutoSeaLevel,        sizeof(bAutoSeaLevel));
+    Mix(&SeaLevel,             sizeof(SeaLevel));
+    Mix(&bNoiseLabOrientation, sizeof(bNoiseLabOrientation));
     return H ^ (uint64)PLANET_GENERATOR_VERSION;
 }
 

@@ -8,7 +8,7 @@ void FPlanetNoiseGenerator::Build(const FPlanetNoiseParams& InParams, double Pla
     // Auto sea level: a quantile over a coarse sampling of all six faces
     // (32x32 per face = 6144 samples, sub-millisecond). This is what stops a
     // random seed from producing a world that is 99% ocean.
-    if (Graph.IsValid())
+    if (Graph.IsValid() && InParams.bAutoSeaLevel)
     {
         Graph.ComputeSeaLevelForLandFraction(InParams.TargetLandFraction, 32);
     }

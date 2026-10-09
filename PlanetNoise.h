@@ -122,12 +122,13 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.DetailOctaves       = P.DetailOctaves;
     C.DetailAmplitude     = P.DetailAmplitudeMetres;
     C.MasterSeed          = P.MasterSeed;
+    C.NoiseSwapYZ         = P.bNoiseLabOrientation;
 
     // ── DEFAULT: not exposed as sliders yet ─────────────────────────────
-    C.SeaLevelNorm        = 0.f;    // overwritten by the quantile pass
-    C.ContinentOctaves    = 8;
-    C.ContinentGain       = 0.5f;
-    C.ContinentLacunarity = 2.0f;
+    C.ContinentOctaves    = P.ContinentOctaves;
+    C.ContinentGain       = P.ContinentGain;
+    C.ContinentLacunarity = P.ContinentLacunarity;
+    C.SeaLevelNorm        = P.bAutoSeaLevel ? 0.f : P.SeaLevel;   // auto: replaced by the quantile pass
     //C.MountainOctaves     = 8;
     //C.MountainGain        = 0.5f;
     C.OceanDetailAmp      = 0.08f;

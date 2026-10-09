@@ -38,13 +38,13 @@ struct Params
     double ScaleMetres     = 4000.0;  // horizontal and vertical scale of the largest gullies
     double Strength        = 0.12;    // gully magnitude relative to the scale
     double GullyWeight     = 0.5;     // 0 = sharpen ridges only, 1 = full gullies
-    double Detail          = 1.0;     // lower = fine gullies only on steep slopes
+    double Detail          = 2.0;     // lower = fine gullies only on steep slopes
     double Rounding[4]     = {0.1, 0.0, 0.1, 2.0};   // ridges, creases, input multiplier, per-octave multiplier
     double Onset[4]        = {1.25, 1.25, 2.8, 1.5}; // input, octave, ridge-map input, ridge-map octave
     double AssumedSlope[2] = {0.7, 1.0};             // value, how much it overrides the real slope
     double CellScale       = 0.7;
     double Normalization   = 0.5;
-    int    Octaves         = 5;
+    int    Octaves         = 8;       // finest gullies 4000 / 2^7 = ~31 m wide: visible on foot
     double Lacunarity      = 2.0;
     double Gain            = 0.5;
     double HeightOffset    = -0.5;    // -1 only lowers, +1 only raises (times the total magnitude)

@@ -251,16 +251,19 @@ struct FPlanetErosionSettings
     UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.0", ClampMax="1.0"))
     float Strength = 0.12f;
 
+    // Each octave halves the gully width: 8 octaves at 4000 m reach ~31 m
+    // gullies, the scale you see on foot. GPU cost is negligible either way.
     UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="1", ClampMax="8"))
-    int32 Octaves = 5;
+    int32 Octaves = 8;
 
     // 0 = only sharpen ridges, 1 = full gullies.
     UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.0", ClampMax="1.0"))
     float GullyWeight = 0.5f;
 
-    // Lower = fine gullies only on steep slopes.
+    // Lower = fine gullies only on steep slopes; higher = fine gullies also
+    // on gentle slopes and between the large ones.
     UPROPERTY(EditAnywhere, Category="Erosion", meta=(ClampMin="0.1", ClampMax="4.0"))
-    float Detail = 1.0f;
+    float Detail = 2.0f;
 
     // -1 = erosion only lowers the terrain, +1 = only raises it. -0.5 lowers
     // mountains ~150 m on average (keep in mind for the snow line).

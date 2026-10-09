@@ -9,7 +9,7 @@ namespace PlanetStreaming
 Scheduler::Scheduler(int32_t InPoolSize)
 {
     // A zero-sized pool is never meaningful and turns every caller into a
-    // special case. Clamp here, once. The application uses 64.
+    // special case. Clamp here, once.
     const int32_t Size = std::max(1, InPoolSize);
     Slots.resize((size_t)Size);
     KeyToSlot.reserve((size_t)Size * 2);
@@ -22,26 +22,23 @@ int32_t Scheduler::FindFreeSlot() const
     return -1;
 }
 
-int32_t Scheduler::FindEvictionCandidate(double IncomingPriority) const
+int32_t Scheduler::FindLingeringToEvict() const
 {
-    // A slot is evictable only when it is less important than the incoming
-    // chunk. Never evict a closer chunk just to churn the visible set.
-    // Retiring slots are deliberately skipped: their RMC is already being
-    // hidden/released and will become Free via DrainRetires.
+    // Only lingering slots are ever evicted. Evicting a DESIRED chunk (the old
+    // policy) just moved the shortage: the evicted chunk was rebuilt a frame
+    // later, doubling the work of every LOD change and opening a hole.
     int32_t Candidate = -1;
-    double WorstPriority = -1.0;
-
     for (int32_t i = 0; i < (int32_t)Slots.size(); ++i)
     {
         const Slot& S = Slots[i];
-        if (S.State == SlotState::Free || S.State == SlotState::Retiring) continue;
-        if (S.Priority <= IncomingPriority) continue;
+        if (S.State != SlotState::Active || !S.bLingering) continue;
+        if (Candidate < 0) { Candidate = i; continue; }
 
-        if (Candidate < 0 || S.Priority > WorstPriority ||
-            (S.Priority == WorstPriority && i > Candidate))
+        const Slot& C = Slots[Candidate];
+        if (S.LingerSinceFrame < C.LingerSinceFrame ||
+            (S.LingerSinceFrame == C.LingerSinceFrame && S.Priority > C.Priority))
         {
             Candidate = i;
-            WorstPriority = S.Priority;
         }
     }
     return Candidate;
@@ -62,6 +59,10 @@ void Scheduler::Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame)
     S.Priority = D.Priority;
     S.LastTouchedFrame = Frame;
     S.bNeedsCollision = D.bNeedsCollision;
+    S.bLingering = false;
+    S.LingerSinceFrame = 0;
+    S.ActiveSinceFrame = 0;
+    S.bShown = false;
     KeyToSlot[D.Key] = SlotIndex;
 }
 
@@ -78,6 +79,8 @@ void Scheduler::Retire(int32_t SlotIndex)
     if (S.Generation == 0) ++S.Generation;
     S.State = SlotState::Retiring;
     S.bNeedsCollision = false;
+    S.bLingering = false;
+    S.bShown = false;
     RetireQueue.push_back(SlotIndex);
 }
 
@@ -103,11 +106,17 @@ void Scheduler::Reconcile(const std::vector<DesiredChunk>& Desired,
 
     std::unordered_map<PlanetLOD::ChunkKey, DesiredChunk, ChunkKeyHash> Want;
     Want.reserve(Sorted.size() * 2);
+    CurrentWant.clear();
     for (const DesiredChunk& D : Sorted)
-        if (Want.find(D.Key) == Want.end()) Want.emplace(D.Key, D);
+    {
+        if (Want.find(D.Key) != Want.end()) continue;
+        Want.emplace(D.Key, D);
+        CurrentWant.push_back(D.Key);
+    }
 
     // 1. Existing desired chunks stay assigned. Updating priority here affects
     // future capacity comparisons but does not restart already-building work.
+    // A lingering chunk that is desired again simply stops lingering.
     for (const auto& Pair : Want)
     {
         const auto It = KeyToSlot.find(Pair.first);
@@ -116,21 +125,38 @@ void Scheduler::Reconcile(const std::vector<DesiredChunk>& Desired,
         S.Priority = Pair.second.Priority;
         S.LastTouchedFrame = Frame;
         S.bNeedsCollision = Pair.second.bNeedsCollision;
+        S.bLingering = false;
     }
 
-    // 2. Retire no-longer-desired slots first. They are not immediately free:
-    // UE must hide the RMC/disable collision on the game thread before reuse.
-    // This deliberately avoids destroy/create churn and stale geometry flashes.
+    // 2. No-longer-desired slots. A chunk on screen lingers: it keeps covering
+    // its surface (and keeps its collision) until UpdateCoverage sees its
+    // replacements ready. Anything not on screen (still building, or built but
+    // hidden) has nothing to cover and is retired now. Retired slots are not
+    // immediately free: UE hides them first and DrainRetires releases them.
     for (int32_t i = 0; i < (int32_t)Slots.size(); ++i)
     {
-        const Slot& S = Slots[i];
+        Slot& S = Slots[i];
         if (S.State == SlotState::Free || S.State == SlotState::Retiring) continue;
-        if (Want.find(S.Key) == Want.end()) Retire(i);
+        if (Want.find(S.Key) != Want.end()) continue;
+
+        if (S.State == SlotState::Active && S.bShown)
+        {
+            if (!S.bLingering)
+            {
+                S.bLingering = true;
+                S.LingerSinceFrame = Frame;
+            }
+        }
+        else
+        {
+            Retire(i);
+        }
     }
 
-    // 3. Assign missing chunks closest-first. This is where the hard cap is
-    // enforced. A slot awaiting retirement is NOT reusable this frame; that is
-    // intentional and prevents a result from being applied to the wrong RMC.
+    // 3. Assign missing chunks closest-first. A slot awaiting retirement is
+    // NOT reusable this frame; that prevents a result from being applied to
+    // the wrong RMC. With no free slot, give up the longest-lingering chunk
+    // (free next frame); a desired chunk is never evicted.
     int32_t Issued = 0;
     for (const DesiredChunk& D : Sorted)
     {
@@ -140,9 +166,7 @@ void Scheduler::Reconcile(const std::vector<DesiredChunk>& Desired,
         int32_t SlotIndex = FindFreeSlot();
         if (SlotIndex < 0)
         {
-            // Capacity pressure: retire only a worse existing chunk. It will
-            // be free NEXT reconcile after the UE layer drains it.
-            const int32_t Evict = FindEvictionCandidate(D.Priority);
+            const int32_t Evict = FindLingeringToEvict();
             if (Evict >= 0) Retire(Evict);
             ++LastRejected;
             continue;
@@ -192,6 +216,68 @@ bool Scheduler::MarkBuilding(const WorkerRequest& R)
     S.State = SlotState::Building;
     S.bWorkerInFlight = true;
     return true;
+}
+
+void Scheduler::UpdateCoverage(uint64_t Frame, const FrameBudget& Budget)
+{
+    const uint64_t Settle   = (uint64_t)std::max(0, Budget.SettleFrames);
+    const uint64_t MaxLinger = (uint64_t)std::max(1, Budget.MaxLingerFrames);
+
+    for (Slot& S : Slots)
+        if (S.State == SlotState::Active && S.ActiveSinceFrame == 0)
+            S.ActiveSinceFrame = Frame;
+
+    // A desired chunk counts as a ready replacement once it has been Active
+    // for the settle time.
+    auto IsSettled = [&](const PlanetLOD::ChunkKey& K)
+    {
+        const auto It = KeyToSlot.find(K);
+        if (It == KeyToSlot.end()) return false;
+        const Slot& R = Slots[It->second];
+        return R.State == SlotState::Active && !R.bLingering &&
+               Frame >= R.ActiveSinceFrame + Settle;
+    };
+
+    // 1. Retire every lingering chunk whose surface is now fully covered by
+    //    settled replacements, has no replacement at all (e.g. now beyond
+    //    the horizon), or has waited too long.
+    std::vector<int32_t> StillLingering;
+    for (int32_t i = 0; i < (int32_t)Slots.size(); ++i)
+    {
+        Slot& L = Slots[i];
+        if (L.State != SlotState::Active || !L.bLingering) continue;
+
+        bool bAnyReplacement = false;
+        bool bAllSettled = true;
+        for (const PlanetLOD::ChunkKey& K : CurrentWant)
+        {
+            if (!PlanetLOD::TilesOverlap(K, L.Key)) continue;
+            bAnyReplacement = true;
+            if (!IsSettled(K)) { bAllSettled = false; break; }
+        }
+
+        if (!bAnyReplacement || bAllSettled || Frame >= L.LingerSinceFrame + MaxLinger)
+            Retire(i);
+        else
+            StillLingering.push_back(i);
+    }
+
+    // 2. Visibility. A lingering chunk stays visible; a desired Active chunk
+    //    is shown unless a lingering chunk still covers part of its surface.
+    //    When step 1 retires the last lingering chunk over an area, the chunks
+    //    replacing it become visible in this same call: the swap is atomic.
+    for (Slot& S : Slots)
+    {
+        if (S.State != SlotState::Active) { S.bShown = false; continue; }
+        if (S.bLingering) { S.bShown = true; continue; }
+
+        bool bCovered = false;
+        for (const int32_t li : StillLingering)
+        {
+            if (PlanetLOD::TilesOverlap(S.Key, Slots[li].Key)) { bCovered = true; break; }
+        }
+        S.bShown = !bCovered;
+    }
 }
 
 void Scheduler::WorkerFinished(int32_t SlotIndex)
@@ -259,6 +345,10 @@ std::vector<int32_t> Scheduler::DrainRetires(int32_t MaxCount)
         S.Priority = 0.0;
         S.LastTouchedFrame = 0;
         S.bNeedsCollision = false;
+        S.bLingering = false;
+        S.LingerSinceFrame = 0;
+        S.ActiveSinceFrame = 0;
+        S.bShown = false;
         Out.push_back(SlotIndex);
     }
     RetireQueue.swap(Kept);
@@ -290,17 +380,26 @@ bool Scheduler::ValidateInvariants(char* OutWhy, int32_t WhyLen) const
         if (S.bWorkerInFlight && S.State != SlotState::Building && S.State != SlotState::Retiring)
             return Fail("Worker in flight on a slot that is neither Building nor Retiring");
 
-        if (!Seen.insert(S.Key).second) return Fail("Two slots own one key");
+        if (S.bLingering && S.State != SlotState::Active)
+            return Fail("Lingering slot is not Active");
+        if (S.bShown && S.State != SlotState::Active)
+            return Fail("Shown slot is not Active");
 
-        if (S.State != SlotState::Retiring)
+        // A Retiring slot still carries its old key, and that key may already
+        // belong to a new slot (a retired slot can wait for its worker while
+        // the chunk is wanted again). Only live slots must own keys uniquely.
+        if (S.State == SlotState::Retiring)
         {
             const auto It = KeyToSlot.find(S.Key);
-            if (It == KeyToSlot.end() || It->second != i) return Fail("Key map disagrees with slot array");
+            if (It != KeyToSlot.end() && It->second == i)
+                return Fail("Key map points at a retiring slot");
+            continue;
         }
-        else if (KeyToSlot.find(S.Key) != KeyToSlot.end())
-        {
-            return Fail("Retiring key is still in key map");
-        }
+
+        if (!Seen.insert(S.Key).second) return Fail("Two slots own one key");
+
+        const auto It = KeyToSlot.find(S.Key);
+        if (It == KeyToSlot.end() || It->second != i) return Fail("Key map disagrees with slot array");
     }
 
     for (const auto& P : KeyToSlot)
@@ -331,7 +430,11 @@ Stats Scheduler::GetStats() const
             case SlotState::Requested: ++S.Requested; break;
             case SlotState::Building:  ++S.Building; break;
             case SlotState::Ready:     ++S.Ready; break;
-            case SlotState::Active:    ++S.Active; break;
+            case SlotState::Active:
+                ++S.Active;
+                if (Slot.bLingering) ++S.Lingering;
+                else if (!Slot.bShown) ++S.Hidden;
+                break;
             case SlotState::Retiring:  ++S.Retiring; break;
         }
     }

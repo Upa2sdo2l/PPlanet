@@ -348,6 +348,22 @@ inline bool ChunkHorizonCulled(const ChunkKey& K, const TraversalParams& P)
     return HorizonCulled(P.CameraPos, P.PlanetRadius, C, BoundsRadius);
 }
 
+// ── Quadtree containment ────────────────────────────────────────────────────
+// True when D lies inside A (or is A): same face, D at A's level or deeper,
+// and D's tile index shifted up to A's level is A's.
+inline bool IsInsideOrSame(const ChunkKey& D, const ChunkKey& A)
+{
+    if (D.Face != A.Face || D.LOD < A.LOD) return false;
+    const int32_t Shift = (int32_t)D.LOD - (int32_t)A.LOD;
+    return (D.X >> Shift) == A.X && (D.Y >> Shift) == A.Y;
+}
+
+// Two quadtree tiles cover any common surface only if one contains the other.
+inline bool TilesOverlap(const ChunkKey& A, const ChunkKey& B)
+{
+    return IsInsideOrSame(A, B) || IsInsideOrSame(B, A);
+}
+
 // ── Direction -> cube face UV (inverse of CubeFaceDirection) ────────────────
 // The face is the dominant axis; U, V are in [-1, 1]. Used to find the leaf
 // under the camera for diagnostics.

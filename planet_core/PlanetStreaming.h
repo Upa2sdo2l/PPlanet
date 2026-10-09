@@ -3,10 +3,13 @@
 // UE-FREE streaming scheduler for a HARD-FIXED RMC component pool.
 //
 // POLICY (decided, not configurable at runtime):
-//   - The pool has a fixed number of slots (default 64).
-//   - It NEVER grows. If demand exceeds capacity the scheduler keeps the
-//     CLOSEST chunks and evicts the farthest; the LOD selection then lowers
-//     detail. We do not buy detail with unbounded components and VRAM.
+//   - The pool has a fixed number of slots and NEVER grows.
+//   - The LOD leaf budget is smaller than the pool. The headroom holds chunks
+//     that are no longer desired but still on screen ("lingering"): a chunk
+//     is replaced only once everything replacing it is built, so a split or
+//     merge never opens a hole or drops collision for a few frames.
+//   - Under capacity pressure only lingering chunks are evicted, never a
+//     desired one.
 //
 // Why a separate core: worker completion and RMC application are Unreal's job,
 // but the hard part is a state machine, and state machines are testable here
@@ -40,7 +43,7 @@ enum class SlotState : uint8_t
     Requested,  // assigned, queued for a worker
     Building,   // a worker is running
     Ready,      // worker finished; waiting for the game-thread commit budget
-    Active,     // visible RMC section belongs to this key
+    Active,     // RMC section built for this key (visible when bShown)
     Retiring,   // hidden / collision off; waiting to be released and reused
 };
 
@@ -79,6 +82,18 @@ struct Slot
     // Without this a retired slot could be handed to a second worker while
     // the first still wrote into the same buffers.
     bool     bWorkerInFlight  = false;
+
+    // Coverage (see Scheduler::UpdateCoverage).
+    // Lingering: Active, no longer desired, kept on screen until the desired
+    // chunks covering the same surface are all Active and settled.
+    bool     bLingering       = false;
+    uint64_t LingerSinceFrame = 0;
+    // Frame this slot became Active; 0 while not yet Active.
+    uint64_t ActiveSinceFrame = 0;
+    // What the UE side should display. An Active desired chunk stays hidden
+    // while a lingering chunk still covers its surface, then the two swap in
+    // the same frame.
+    bool     bShown           = false;
 };
 
 struct WorkerRequest
@@ -102,6 +117,15 @@ struct FrameBudget
     int32_t MaxNewWorkerRequests = 4;
     int32_t MaxCommits           = 4;
     int32_t MaxRetires           = 8;
+
+    // A replacement chunk must have been Active this many frames before the
+    // chunk it replaces goes. Gives its async collision cook time to finish,
+    // so the ground does not disappear under the player during a swap.
+    int32_t SettleFrames         = 6;
+
+    // Safety valve: a lingering chunk is retired after this many frames even
+    // if its replacements are still missing (e.g. starved of slots).
+    int32_t MaxLingerFrames      = 180;
 };
 
 struct DesiredChunk
@@ -120,6 +144,8 @@ struct Stats
     int32_t Ready     = 0;
     int32_t Active    = 0;
     int32_t Retiring  = 0;
+    int32_t Lingering = 0;   // Active, undesired, still covering its surface
+    int32_t Hidden    = 0;   // Active, desired, waiting to swap in
     int32_t Desired   = 0;
     int32_t RejectedByCapacity   = 0;
     int32_t StaleCompletionsDropped = 0;
@@ -155,6 +181,11 @@ public:
     // Game thread, after RMC CreateSectionGroup succeeded.
     bool MarkActive(const Completion& In);
 
+    // Game thread, after this frame's commits. Retires lingering chunks whose
+    // replacements are all Active for Budget.SettleFrames (or that have nothing
+    // replacing them), and sets bShown on every slot.
+    void UpdateCoverage(uint64_t Frame, const FrameBudget& Budget);
+
     // Game thread, as soon as the worker launched for this slot has finished,
     // whether its result is applied or dropped as stale. Releases the slot's
     // scratch for reuse.
@@ -184,7 +215,9 @@ private:
     };
 
     int32_t FindFreeSlot() const;
-    int32_t FindEvictionCandidate(double IncomingPriority) const;
+    // The lingering slot to give up under capacity pressure: the one that has
+    // lingered longest, farthest first on ties. -1 when none.
+    int32_t FindLingeringToEvict() const;
     void Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame);
     void Retire(int32_t SlotIndex);
 
@@ -192,6 +225,9 @@ private:
     std::unordered_map<PlanetLOD::ChunkKey, int32_t, ChunkKeyHash> KeyToSlot;
     std::priority_queue<WorkerRequest, std::vector<WorkerRequest>, PendingCompare> Pending;
     std::vector<int32_t> RetireQueue;
+
+    // Desired keys from the last Reconcile, for coverage decisions.
+    std::vector<PlanetLOD::ChunkKey> CurrentWant;
 
     int32_t LastDesiredCount = 0;
     int32_t LastRejected     = 0;

@@ -155,7 +155,7 @@ struct NoiseParams
     float   DomainWarpFrequency = 1.5f;
 
     // ── Climate ─────────────────────────────────────────────────────────
-    float   SnowLatitudeStart  = 0.70f;
+    float   SnowLatitudeStart  = 0.90f;   // sin(latitude): 0.90 ~ 64 deg
     float   SnowAltitudeStart  = 3500.f;
     float   HumidityVariance   = 0.40f;
 
@@ -282,10 +282,12 @@ private:
 //   humidity_lat(lat) = 0.5 + 0.5·cos(6·lat)
 //   0°->1.0 wet, 30°->0.0 dry, 60°->1.0 wet, 90°->0.0 dry
 // Verified numerically: desert band centres land at exactly ±30.00°.
+//
+// Polar axis is +Z (UE "up"): the poles sit at the centres of cube faces 4/5.
 inline Climate NoiseGraph::ComputeClimate(const Vec3d& Dir, double Height, const NoiseParams& P)
 {
     Climate Out;
-    const double SinLat = std::clamp(Dir.Y, -1.0, 1.0);
+    const double SinLat = std::clamp(Dir.Z, -1.0, 1.0);
     const double Lat    = std::asin(SinLat);
 
     const double BaseTemp = std::pow(std::max(0.0, std::cos(Lat)), 1.5);
@@ -300,7 +302,10 @@ inline Climate NoiseGraph::ComputeClimate(const Vec3d& Dir, double Height, const
         (1.0 - LatBand) * (1.0 + 0.5 * Interior) * 0.5 + (1.0 - Out.Humidity) * (double)P.HumidityVariance,
         0.0, 1.0);
 
-    const float LatTrig = 1.f - (float)std::clamp(
+    // 0 below |sin(lat)| = SnowLatitudeStart - 0.10, 1 above SnowLatitudeStart + 0.10.
+    // An earlier version had "1.f - clamp(...)", which put full snow on the
+    // equator and none on the poles.
+    const float LatTrig = (float)std::clamp(
         (std::fabs(SinLat) - (P.SnowLatitudeStart - 0.10)) / 0.20, 0.0, 1.0);
     const float AltTrig = (float)std::clamp(
         (Height - (P.SnowAltitudeStart - 500.f)) / 1000.f, 0.0, 1.0);

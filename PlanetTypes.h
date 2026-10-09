@@ -143,10 +143,14 @@ struct FPlanetNoiseParams
     float DomainWarpFrequency = 1.5f;
 
     // ── Climate ─────────────────────────────────────────────────────────
+    // sin(latitude) where polar snow is half-way in; the ramp is ±0.10 around
+    // it. 0.90 ~ 64 deg. Polar axis is world +Z.
     UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float SnowLatitudeStart = 0.70f;
+    float SnowLatitudeStart = 0.90f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="9000.0"))
+    // Elevation above sea level, metres, where altitude snow starts. The
+    // terrain reaches ~20+ km, so the range goes well past 9 km.
+    UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="25000.0"))
     float SnowAltitudeStart = 3500.f;
 
     UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))

@@ -270,9 +270,22 @@ struct TraversalParams
     double ErrorThresholdPx = 2.0;
     double ErrorFraction    = 0.05;      // geometric error / chunk side
     uint8_t MaxLOD          = 14;
-    int32_t MaxLeaves       = 64;        // MUST match the component pool
+    int32_t MaxLeaves       = 64;        // leaf budget; the pool needs headroom above it
     bool   bUseHorizonCull  = true;
+
+    // Hysteresis. Nodes that were split in the previous selection (its
+    // internal nodes, see InternalNodesOf) have their error multiplied by
+    // HysteresisFactor, so a node is only merged back once its error falls
+    // that much below what split it. Without it, a camera moving a few
+    // metres reshuffles nodes of near-equal error at the budget edge: one
+    // node merges and another splits, and both get rebuilt.
+    const KeySet* PreviouslySplit = nullptr;
+    double  HysteresisFactor = 1.25;
 };
+
+// Every ancestor of the given leaves: the nodes that were split to produce
+// them. Feed the result of one frame to the next as PreviouslySplit.
+KeySet InternalNodesOf(const std::vector<ChunkKey>& Leaves);
 
 struct Selection
 {

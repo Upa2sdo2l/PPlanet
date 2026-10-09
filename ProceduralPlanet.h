@@ -81,6 +81,13 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="0.0", ClampMax="20000.0"))
     double LODReliefMetres = 0.0;
 
+    // A chunk split last frame stays split until its error drops this many
+    // times below the split point. Stops chunks at the edge of the leaf
+    // budget from merging and re-splitting as the camera moves a few metres.
+    // 1 = off.
+    UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="1.0", ClampMax="3.0"))
+    double LODHysteresis = 1.25;
+
     // ── Frame budgets ───────────────────────────────────────────────────
     // These bound work per frame. Together with the fixed pool they are what
     // keeps a fly-over from stalling.
@@ -215,6 +222,9 @@ private:
 
     // Cached last selection so we can detect a stable view and stop re-issuing.
     PlanetLOD::Selection LastSelection;
+
+    // Internal nodes of LastSelection: what was split last frame (hysteresis).
+    PlanetLOD::KeySet LODPreviouslySplit;
 
     friend class FPlanetChunkWorker;
 };

@@ -25,13 +25,21 @@ void Traverse(const TraversalParams& P, Selection& Out)
 
     std::priority_queue<FrontierNode, std::vector<FrontierNode>, WorseFirst> Frontier;
 
+    // Error with hysteresis: a node split last frame is favoured to stay
+    // split, both against the threshold and in the budget ordering.
+    const double Hysteresis = std::max(1.0, P.HysteresisFactor);
+    auto NodeError = [&P, Hysteresis](const ChunkKey& K)
+    {
+        const double E = ChunkError(K, P);
+        return (P.PreviouslySplit && P.PreviouslySplit->count(K)) ? E * Hysteresis : E;
+    };
+
     for (uint8_t F = 0; F < 6; ++F)
     {
         const ChunkKey Root{F, 0, 0, 0};
         ++Out.Visited;
-        // Never cull LOD 0-1: they're essential fallback coverage from orbit
         if (ChunkHorizonCulled(Root, P)) { ++Out.Culled; continue; }
-        Frontier.push({Root, ChunkError(Root, P)});
+        Frontier.push({Root, NodeError(Root)});
     }
 
     while (!Frontier.empty())
@@ -72,9 +80,8 @@ void Traverse(const TraversalParams& P, Selection& Out)
         for (const ChunkKey& C : Children)
         {
             ++Out.Visited;
-            // Never cull LOD 0-1: they're essential fallback coverage from orbit
             if (ChunkHorizonCulled(C, P)) { ++Out.Culled; continue; }
-            Frontier.push({C, ChunkError(C, P)});
+            Frontier.push({C, NodeError(C)});
         }
     }
 
@@ -206,6 +213,14 @@ namespace
         }
         return Internal;
     }
+}
+
+KeySet InternalNodesOf(const std::vector<ChunkKey>& Leaves)
+{
+    KeySet LeafSet;
+    LeafSet.reserve(Leaves.size() * 2);
+    for (const ChunkKey& K : Leaves) LeafSet.insert(K);
+    return BuildInternal(LeafSet);
 }
 
 EdgeMatch ClassifyBorder(const ChunkKey& K, int32_t Side, const KeySet& Leaves)

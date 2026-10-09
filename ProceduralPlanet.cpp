@@ -396,9 +396,13 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     P.MaxLeaves        = PLANET_COMPONENT_POOL_SIZE;
     P.bUseHorizonCull  = true;
 
+    P.PreviouslySplit  = &LODPreviouslySplit;
+    P.HysteresisFactor = LODHysteresis;
+
     SCOPE_CYCLE_COUNTER(STAT_Planet_LOD);
     FPlanetScopedMs LODTimer(PerfWindow.LODMs);
     PlanetLOD::Traverse(P, LastSelection);
+    LODPreviouslySplit = PlanetLOD::InternalNodesOf(LastSelection.Chunks);
 }
 
 void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& CameraPos)

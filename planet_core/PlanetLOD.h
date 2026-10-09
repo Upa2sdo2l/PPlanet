@@ -256,7 +256,15 @@ struct TraversalParams
     Vec3d  CameraPos        = {0, 0, 0};
     double PlanetRadius     = 2500000.0;
     double HeightMargin     = 60000.0;
-    double ReliefCm = 500000.0; // 5 км, только для LOD error-bound
+    // Terrain elevation under the camera (cm, may be negative). The error
+    // metric measures distance to a sphere through that point instead of to
+    // the bare reference sphere: on a 10 km plateau the camera is metres from
+    // the ground, not 10 km. Used only by ChunkError, never by culling.
+    double SurfaceOffsetCm  = 0.0;
+    // Extra slack subtracted from the distance (cm). With SurfaceOffsetCm in
+    // place this should stay small: a large value makes every chunk within
+    // that radius equal-error and spends the leaf budget on ties.
+    double ReliefCm         = 0.0;
     double ScreenHeightPx   = 1080.0;
     double VertFOVRad       = 1.0472;    // 60 deg
     double ErrorThresholdPx = 2.0;
@@ -286,10 +294,12 @@ void Traverse(const TraversalParams& P, Selection& Out);
         const Vec3d Dir =
             CubeFaceDirection(K.Face, U0 + Size * 0.5, V0 + Size * 0.5);
 
+        // Chunk centre on the sphere through the terrain under the camera.
+        const double SurfaceRadius = P.PlanetRadius + P.SurfaceOffsetCm;
         const Vec3d C{
-            Dir.X * P.PlanetRadius,
-            Dir.Y * P.PlanetRadius,
-            Dir.Z * P.PlanetRadius
+            Dir.X * SurfaceRadius,
+            Dir.Y * SurfaceRadius,
+            Dir.Z * SurfaceRadius
         };
 
         const double Dx = P.CameraPos.X - C.X;

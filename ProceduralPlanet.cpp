@@ -259,7 +259,19 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     P.PlanetRadius     = PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
     P.HeightMargin     = HeightMarginMetres * PLANET_METRES_TO_UE_CM;
     P.ErrorThresholdPx = ErrorThresholdPixels;
-    P.ReliefCm = 5000.0 * PLANET_METRES_TO_UE_CM;
+    P.ReliefCm         = LODReliefMetres * PLANET_METRES_TO_UE_CM;
+
+    // The error metric is measured from the terrain under the camera, not from
+    // the reference sphere: terrain rises 20+ km, and measured from the bare
+    // sphere a camera standing on a high plateau looks kilometres up, so the
+    // chunk under it never refines to the collision LODs. One single-point
+    // noise sample per frame.
+    P.SurfaceOffsetCm = 0.0;
+    if (CameraPos.SizeSquared() > 1.0)
+    {
+        const double TerrainHeightM = Generator.GetHeightAt(CameraPos.GetSafeNormal());
+        P.SurfaceOffsetCm = TerrainHeightM * PLANET_METRES_TO_UE_CM;
+    }
     P.MaxLOD           = (uint8_t)FMath::Clamp(MaxLOD, 1, 18);
 
     // THE fixed-pool link: the traversal can never return more leaves than the

@@ -73,6 +73,13 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="1", ClampMax="18"))
     int32 MaxLOD = 14;
 
+    // Slack (metres) subtracted from the camera-to-chunk distance in the LOD
+    // error. The distance is already measured from the terrain under the
+    // camera, so keep this small: a few km makes every nearby chunk tie on
+    // error and the leaf budget is then spent arbitrarily.
+    UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="0.0", ClampMax="20000.0"))
+    double LODReliefMetres = 0.0;
+
     // ── Frame budgets ───────────────────────────────────────────────────
     // These bound work per frame. Together with the fixed pool they are what
     // keeps a fly-over from stalling.

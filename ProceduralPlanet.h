@@ -1,5 +1,13 @@
 // ProceduralPlanet.h
-// The thin UE owner of a FIXED pool of RMC components.
+// The thin UE owner of a FIXED pool of chunk slots.
+//
+// Two renderers (TerrainRenderer):
+//   GPUInstanced  : every chunk is one instance of a shared 65x65 grid mesh in
+//                   a single instanced component; the material moves vertices
+//                   to positions stored in an atlas texture, stitches LOD seams
+//                   and morphs splits. RMC components only carry collision, for
+//                   chunks within CollisionDistanceMetres.
+//   RealtimeMesh  : the original path, one visible RMC component per chunk.
 //
 // POLICY: the pool has PLANET_COMPONENT_POOL_SIZE slots and never grows. The
 // LOD selection uses at most PLANET_LOD_LEAF_BUDGET of them; the rest hold
@@ -24,11 +32,26 @@
 #include "PlanetCoordinates.h"
 #include "planet_core/PlanetLOD.h"
 #include "planet_core/PlanetStreaming.h"
+#include "planet_core/PlanetGpuTile.h"
 #include "ProceduralPlanet.generated.h"
 
 class URealtimeMeshComponent;
 class URealtimeMeshSimple;
 class UMaterialInterface;
+class UMaterialInstanceDynamic;
+class UInstancedStaticMeshComponent;
+class UStaticMesh;
+class UTexture2D;
+
+UENUM()
+enum class EPlanetTerrainRenderer : uint8
+{
+    // One instanced draw for the whole terrain, displaced in the material.
+    // Needs GPUTerrainMaterial; falls back to RealtimeMesh without it.
+    GPUInstanced,
+    // One visible RMC component per chunk (the original renderer).
+    RealtimeMesh,
+};
 
 UCLASS()
 class FASTNOISETEST_API AProceduralPlanet : public AActor
@@ -52,8 +75,29 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet")
     FPlanetNoiseParams NoiseParams;
 
+    // Material of the RealtimeMesh renderer (biome weights in vertex colour).
     UPROPERTY(EditAnywhere, Category="Planet")
     TObjectPtr<UMaterialInterface> PlanetMaterial;
+
+    // ── GPU terrain ─────────────────────────────────────────────────────
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain")
+    EPlanetTerrainRenderer TerrainRenderer = EPlanetTerrainRenderer::GPUInstanced;
+
+    // Material built as described in MaterialHLSL/README.md. Without it the
+    // planet falls back to the RealtimeMesh renderer and says so in the log.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain")
+    TObjectPtr<UMaterialInterface> GPUTerrainMaterial;
+
+    // Seconds over which a chunk that replaced its parent morphs from the
+    // parent's shape to its own. 0 = no morph (instant swap).
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain", meta=(ClampMin="0.0", ClampMax="5.0"))
+    float MorphSeconds = 0.35f;
+
+    // The instanced component is kept within this distance of the camera.
+    // Instance transforms are stored in float relative to it, so a far origin
+    // would open sub-millimetre gaps between chunks near the player.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain", meta=(ClampMin="100.0"))
+    double GPUTerrainRebaseDistanceMetres = 4000.0;
 
     // Worst-case mountain height above the sphere, used only for bounding
     // spheres and horizon culling. Over-estimating costs a little culling;
@@ -101,8 +145,8 @@ public:
     int32 MaxRetiresPerFrame = 8;
 
     // Chunks whose nearest point is within this distance of the camera get
-    // collision, at any LOD. (It used to be "LOD >= MaxLOD - 2", which left
-    // no collision at all when the ground under the player was coarser.)
+    // collision, at any LOD. It is dropped again only beyond 1.25x this
+    // distance, so a chunk at the boundary does not toggle.
     UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="0.0"))
     double CollisionDistanceMetres = 1500.0;
 
@@ -113,7 +157,7 @@ public:
     int32 ReplacementSettleFrames = 6;
 
     // Collision on/off changes applied to already-built chunks per frame
-    // (each "on" starts a collision cook).
+    // (each "on" builds a collision mesh and starts a cook).
     UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="1", ClampMax="64"))
     int32 MaxCollisionChangesPerFrame = 4;
 
@@ -164,6 +208,60 @@ private:
     void ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key);
 
     PlanetStreaming::FrameBudget MakeFrameBudget() const;
+
+    // ── GPU terrain (ProceduralPlanetGpu.cpp) ───────────────────────────
+    // Creates the grid mesh, atlas textures, material instance and the
+    // instanced component. Leaves bGPUTerrain false (RealtimeMesh renderer)
+    // if the renderer is not selected or anything is missing.
+    void InitGpuTerrain();
+    UStaticMesh* BuildGridMesh();
+    void GpuUploadTile(int32 SlotIndex, const PlanetGpu::TileData& Tile);
+    void GpuShowSlot(int32 SlotIndex, bool bShow, bool bMorphIn);
+    void GpuUpdateEdgeDeltas();
+    void GpuRebaseIfNeeded(const FVector3d& CameraPos);
+    FTransform GpuWorldTransform(int32 SlotIndex) const;
+    void SyncSlotPresentationGpu();
+
+    // Collision mesh for a slot from its kept surfaces: on a worker, or
+    // applied on the game thread when one comes back.
+    void LaunchCollisionMeshJob(int32 SlotIndex);
+    void ApplyCollisionMesh(int32 SlotIndex);
+    void RemoveCollisionMesh(int32 SlotIndex);
+
+    bool bGPUTerrain = false;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UInstancedStaticMeshComponent> TerrainISM;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UStaticMesh> GridMesh;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2D> PosAtlas;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2D> NormalAtlas;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2D> BiomeAtlas;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInstanceDynamic> TerrainMID;
+
+    // Per slot: the instance as last pushed to the instanced component.
+    struct FGpuSlot
+    {
+        FTransform PlanetTransform = FTransform::Identity;   // planet space, cm
+        float      CustomData[6] = {0.f, -1e6f, 0.f, 0.f, 0.f, 0.f};
+        bool       bShown = false;
+        bool       bHasCollisionMesh = false;
+    };
+    TArray<FGpuSlot> GpuSlots;
+
+    // Where the instanced component sits, relative to the actor (cm).
+    FVector3d GpuTerrainOrigin = FVector3d::ZeroVector;
+    int32     AtlasTilesPerRow = 1;
+    int32     AtlasTexels = 1;
 
     // Applies the scheduler's per-slot decisions to the components: shows or
     // hides built chunks (atomic swaps), hides retiring ones at once, and
@@ -217,12 +315,22 @@ private:
     // and clears on commit. Only one worker ever touches a given slot index.
     struct FSlotWork
     {
+        // Full = sample the surface, then build the GPU tile and/or the mesh.
+        // CollisionMesh = build the mesh from the Surfaces kept from the last
+        // Full job (the chunk is already shown; the camera came close).
+        enum class EJob : uint8 { Full, CollisionMesh };
+
         TArray<PlanetCore::Surface> Surfaces;
         TAtomic<bool>               bDone{false};
         uint32                      Generation = 0;
         FChunkKey                   Key;
         bool                        bBuilt = false;
         bool                        bNeedsCollision = false;
+
+        EJob                        Job = EJob::Full;
+        bool                        bBuildMesh = true;     // build the RMC stream set
+        bool                        bMeshBuilt = false;
+        TUniquePtr<PlanetGpu::TileData> Tile;               // GPU renderer only
 
         // The task writing into this slot, if any. EndPlay waits on it
         // before freeing the scratch the task points at.

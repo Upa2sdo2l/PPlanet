@@ -137,32 +137,57 @@ public:
     void Run()
     {
         if (!Work) return;
+        Work->bBuilt     = false;
+        Work->bMeshBuilt = false;
+        Work->NoiseMs    = 0.0;
+        Work->BuildMs    = 0.0;
+
         if (!Gen || !Gen->IsValid() || !Builder)
         {
             // Still report completion: the scheduler keeps the slot reserved
             // until the game thread sees bDone, so a silent return here would
             // lose the slot for good.
-            Work->bBuilt = false;
-            Work->NoiseMs = 0.0;
-            Work->BuildMs = 0.0;
             Work->Generation = Generation;
             Work->bDone.Store(true);
             return;
         }
 
-        // 1. Sample the surface. This is the expensive step: min 0.95 ms per
-        //    chunk for 4225 vertices, measured on the reference box.
+        FVector3d Origin;
+
+        if (Work->Job == AProceduralPlanet::FSlotWork::EJob::CollisionMesh)
+        {
+            // The surfaces were sampled by this slot's Full job and have not
+            // changed since: the slot is Active and reserved for this job.
+            const uint64 BuildStart = FPlatformTime::Cycles64();
+            Work->bMeshBuilt = Builder->Build(Work->Key, Work->Surfaces.GetData(), PlanetRadius, Origin);
+            Work->bBuilt     = Work->bMeshBuilt;
+            Work->BuildMs    = PlanetMsSince(BuildStart);
+            Work->Generation = Generation;
+            Work->bDone.Store(true);
+            return;
+        }
+
+        // 1. Sample the surface. This is the expensive step: ~1 ms per chunk
+        //    for 4225 vertices on one core.
         TArrayView<PlanetCore::Surface> View(Work->Surfaces.GetData(),
                                              Work->Surfaces.Num());
         const uint64 NoiseStart = FPlatformTime::Cycles64();
         Gen->SampleChunk(Work->Key, View);
         Work->NoiseMs = PlanetMsSince(NoiseStart);
 
-        // 2. Build the stream set with the worker's own builder instance.
-        FVector3d Origin;
+        // 2. GPU renderer: the atlas tile and instance transform. Mesh: only
+        //    when the chunk needs collision (GPU) or always (RealtimeMesh).
         const uint64 BuildStart = FPlatformTime::Cycles64();
-        Work->bBuilt = Builder->Build(Work->Key, Work->Surfaces.GetData(),
-                                      PlanetRadius, Origin);
+        if (Work->Tile.IsValid())
+        {
+            PlanetGpu::BuildTile(PlanetCore::FChunkKey(Work->Key.Face, Work->Key.LOD, Work->Key.X, Work->Key.Y),
+                                 Work->Surfaces.GetData(), PlanetRadius, *Work->Tile);
+        }
+        if (Work->bBuildMesh)
+        {
+            Work->bMeshBuilt = Builder->Build(Work->Key, Work->Surfaces.GetData(), PlanetRadius, Origin);
+        }
+        Work->bBuilt  = Work->Tile.IsValid() || Work->bMeshBuilt;
         Work->BuildMs = PlanetMsSince(BuildStart);
 
         // 3. Signal completion. The generation was captured at launch; if the
@@ -198,6 +223,7 @@ void AProceduralPlanet::BeginPlay()
     Super::BeginPlay();
     RebuildNoise();
     CreatePool();
+    InitGpuTerrain();
 }
 
 void AProceduralPlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -217,6 +243,8 @@ void AProceduralPlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Pool.Reset();
     SlotVisibleApplied.Reset();
     SlotCollisionApplied.Reset();
+    GpuSlots.Reset();
+    bGPUTerrain = false;
     Super::EndPlay(EndPlayReason);
 }
 
@@ -240,6 +268,10 @@ void AProceduralPlanet::CreatePool()
         if (!Comp) continue;
 
         Comp->SetupAttachment(RootComponent);
+        // Lumen here uses software tracing; hardware ray-tracing structures for
+        // 300 chunk meshes cost ~110 MB and a rebuild on every chunk swap.
+        Comp->bVisibleInRayTracing = false;
+        Comp->bAffectDistanceFieldLighting = false;
         Comp->RegisterComponent();
         Comp->SetMobility(EComponentMobility::Movable);
 
@@ -362,7 +394,15 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
         SCOPE_CYCLE_COUNTER(STAT_Planet_Coverage);
         FPlanetScopedMs CoverageTimer(PerfWindow.CoverageMs);
         Scheduler.UpdateCoverage(FrameCounter, MakeFrameBudget());
-        SyncSlotPresentation();
+        if (bGPUTerrain)
+        {
+            GpuRebaseIfNeeded(CameraRel);
+            SyncSlotPresentationGpu();
+        }
+        else
+        {
+            SyncSlotPresentation();
+        }
     }
     ReleaseRetired();
 
@@ -451,10 +491,14 @@ void AProceduralPlanet::ReconcileStreaming(uint64 Frame, const FVector3d& Camera
         // (half diagonal of a side of Size * radius).
         const double NearestCm = FMath::Max(0.0, Dist - Size * PlanetRadiusCm * 0.7072);
 
+        // Hysteresis: on within CollisionDistanceMetres, off only beyond 1.25x.
+        const int32 SlotIndex = Scheduler.FindSlotIndex(K);
+        const bool  bHadCollision = SlotIndex >= 0 && Scheduler.GetSlots()[SlotIndex].bNeedsCollision;
+
         PlanetStreaming::DesiredChunk D;
         D.Key             = K;
         D.Priority        = Dist;                    // lower = closer = built first
-        D.bNeedsCollision = NearestCm <= CollisionCm;
+        D.bNeedsCollision = NearestCm <= CollisionCm || (bHadCollision && NearestCm <= CollisionCm * 1.25);
         Desired.push_back(D);
     }
 
@@ -519,8 +563,10 @@ void AProceduralPlanet::PumpWorkers()
         W.bBuilt     = false;
         W.bDone.Store(false);
 
-        // Collision requirement was already determined by LOD in ReconcileStreaming
         W.bNeedsCollision = Req.bNeedsCollision;
+        W.Job             = FSlotWork::EJob::Full;
+        // GPU renderer: the mesh exists only to carry collision.
+        W.bBuildMesh      = !bGPUTerrain || Req.bNeedsCollision;
 
         // MarkBuilding guarantees no other worker owns this slot's scratch;
         // the scheduler keeps the slot reserved until WorkerFinished.
@@ -558,6 +604,25 @@ void AProceduralPlanet::ApplyReadyChunks()
         // the slot's scratch may be reused (and a retired slot released).
         Scheduler.WorkerFinished(i);
 
+        if (W.Job == FSlotWork::EJob::CollisionMesh)
+        {
+            // Applied only if the slot still holds the same chunk and still
+            // wants collision; otherwise the stream set is simply dropped.
+            const PlanetStreaming::Slot& Slot = Scheduler.GetSlots()[i];
+            if (W.bMeshBuilt && Slot.State == PlanetStreaming::SlotState::Active &&
+                Slot.Generation == W.Generation && Slot.bNeedsCollision)
+            {
+                ApplyCollisionMesh(i);
+            }
+            else if (W.bMeshBuilt)
+            {
+                Builders[i]->TakeStreamSet();
+            }
+            W.bDone.Store(false);
+            ++Committed;
+            continue;
+        }
+
         // Worker CPU time counts even when the result is dropped as stale:
         // it was spent either way.
         if (W.bBuilt)
@@ -581,6 +646,32 @@ void AProceduralPlanet::ApplyReadyChunks()
         }
 
         const uint64 CommitStart = FPlatformTime::Cycles64();
+
+        if (bGPUTerrain)
+        {
+            // Tile into the atlas; the instance stays hidden until
+            // SyncSlotPresentationGpu swaps it in. Collision, if the chunk is
+            // close, comes from the RMC component, which is never visible.
+            GpuUploadTile(i, *W.Tile);
+            if (W.bMeshBuilt && Scheduler.GetSlots()[i].bNeedsCollision)
+            {
+                ApplyCollisionMesh(i);
+            }
+            else if (W.bMeshBuilt)
+            {
+                Builders[i]->TakeStreamSet();
+            }
+
+            const double CommitMs = PlanetMsSince(CommitStart);
+            ++PerfWindow.Committed;
+            PerfWindow.RMCMs += CommitMs;
+            PerfWindow.RMCMax = FMath::Max(PerfWindow.RMCMax, CommitMs);
+
+            Scheduler.MarkActive(C);
+            W.bDone.Store(false);
+            ++Committed;
+            continue;
+        }
 
         {
             SCOPE_CYCLE_COUNTER(STAT_Planet_Component);
@@ -675,6 +766,12 @@ void AProceduralPlanet::ReleaseRetired()
             SlotVisibleApplied[SlotIndex]   = 0;
             SlotCollisionApplied[SlotIndex] = 0;
         }
+        if (GpuSlots.IsValidIndex(SlotIndex))
+        {
+            // The instance was hidden by SyncSlotPresentationGpu when the slot
+            // started retiring; the section group is gone now.
+            GpuSlots[SlotIndex].bHasCollisionMesh = false;
+        }
     }
 }
 
@@ -753,6 +850,74 @@ void AProceduralPlanet::SyncSlotPresentation()
                                              : ECollisionEnabled::NoCollision);
         SlotCollisionApplied[Change.SlotIndex] = Change.bOn ? 1 : 0;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Collision meshes (GPU renderer): the RMC component of a slot is never
+// visible there and holds a section only while the chunk needs collision.
+// ─────────────────────────────────────────────────────────────────────────────
+void AProceduralPlanet::LaunchCollisionMeshJob(int32 SlotIndex)
+{
+    if (!SlotWork.IsValidIndex(SlotIndex) || !Builders.IsValidIndex(SlotIndex)) return;
+    if (!Scheduler.BeginSideJob(SlotIndex)) return;
+
+    FSlotWork& W = *SlotWork[SlotIndex];
+    W.Job        = FSlotWork::EJob::CollisionMesh;
+    W.Generation = Scheduler.GetSlots()[SlotIndex].Generation;
+    W.bBuilt     = false;
+    W.bMeshBuilt = false;
+    W.bDone.Store(false);
+
+    W.Future = FPlanetChunkWorker::Launch(&Generator, Builders[SlotIndex].Get(),
+                                          &W, W.Generation, PlanetRadiusMetres);
+}
+
+// Takes the slot builder's stream set: the caller has just had it built.
+void AProceduralPlanet::ApplyCollisionMesh(int32 SlotIndex)
+{
+    if (!Pool.IsValidIndex(SlotIndex) || !Pool[SlotIndex]) return;
+    URealtimeMeshSimple* MeshSimple = Pool[SlotIndex]->GetRealtimeMeshAs<URealtimeMeshSimple>();
+    if (!MeshSimple) return;
+
+    ConfigureComponentForChunk(SlotIndex, SlotWork[SlotIndex]->Key);
+
+    const FRealtimeMeshSectionGroupKey GK = FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk"));
+    const FRealtimeMeshSectionKey      SK = FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
+    RealtimeMesh::FRealtimeMeshStreamSet Streams = Builders[SlotIndex]->TakeStreamSet();
+    {
+        SCOPE_CYCLE_COUNTER(STAT_Planet_RMCRemove);
+        FPlanetScopedMs RemoveTimer(PerfWindow.RemoveMs);
+        MeshSimple->RemoveSectionGroup(GK);
+    }
+    {
+        SCOPE_CYCLE_COUNTER(STAT_Planet_RMCCreate);
+        FPlanetScopedMs CreateTimer(PerfWindow.CreateMs);
+        MeshSimple->CreateSectionGroup(GK, MoveTemp(Streams));
+    }
+    {
+        SCOPE_CYCLE_COUNTER(STAT_Planet_RMCConfig);
+        FPlanetScopedMs ConfigTimer(PerfWindow.ConfigMs);
+        FRealtimeMeshSectionConfig Config;
+        MeshSimple->UpdateSectionConfig(SK, Config, true);
+    }
+
+    Pool[SlotIndex]->SetVisibility(false);
+    Pool[SlotIndex]->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+    SlotVisibleApplied[SlotIndex]   = 0;
+    SlotCollisionApplied[SlotIndex] = 1;
+    if (GpuSlots.IsValidIndex(SlotIndex)) GpuSlots[SlotIndex].bHasCollisionMesh = true;
+}
+
+void AProceduralPlanet::RemoveCollisionMesh(int32 SlotIndex)
+{
+    if (!Pool.IsValidIndex(SlotIndex) || !Pool[SlotIndex]) return;
+    if (URealtimeMeshSimple* MeshSimple = Pool[SlotIndex]->GetRealtimeMeshAs<URealtimeMeshSimple>())
+    {
+        MeshSimple->RemoveSectionGroup(FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk")));
+    }
+    Pool[SlotIndex]->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    SlotCollisionApplied[SlotIndex] = 0;
+    if (GpuSlots.IsValidIndex(SlotIndex)) GpuSlots[SlotIndex].bHasCollisionMesh = false;
 }
 
 void AProceduralPlanet::ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key)
@@ -843,7 +1008,9 @@ void AProceduralPlanet::UpdatePlanetStats()
             const int32  TY = FMath::Clamp((int32)FMath::FloorToDouble((V + 1.0) / TileSize), 0, Tiles - 1);
             if (TX != Slot.Key.X || TY != Slot.Key.Y) continue;
 
-            if (SlotVisibleApplied[s])   NadirLOD = Slot.Key.LOD;
+            const bool bDrawn = bGPUTerrain ? (GpuSlots.IsValidIndex(s) && GpuSlots[s].bShown)
+                                            : (SlotVisibleApplied[s] != 0);
+            if (bDrawn)                  NadirLOD = Slot.Key.LOD;
             if (SlotCollisionApplied[s]) bNadirCollision = true;
         }
     }
@@ -892,9 +1059,11 @@ void AProceduralPlanet::UpdatePlanetStats()
     const double F = W.Frames > 0 ? 1.0 / (double)W.Frames : 0.0;   // per-frame averages
 
     const FString Line1 = FString::Printf(
-        TEXT("[Planet] per chunk, last 1 s:  noise %.2f ms (max %.2f)  |  mesh build %.2f ms (max %.2f)  |  ")
+        TEXT("[Planet] %s renderer. Per chunk, last 1 s:  noise %.2f ms (max %.2f)  |  %s %.2f ms (max %.2f)  |  ")
         TEXT("GT commit %.2f ms (max %.2f)  |  built %d/s, committed %d/s"),
-        NoiseAvg, W.NoiseMax, BuildAvg, W.BuildMax, RMCAvg, W.RMCMax, W.Built, W.Committed);
+        bGPUTerrain ? TEXT("GPU") : TEXT("RealtimeMesh"),
+        NoiseAvg, W.NoiseMax, bGPUTerrain ? TEXT("tile + collision mesh") : TEXT("mesh build"),
+        BuildAvg, W.BuildMax, RMCAvg, W.RMCMax, W.Built, W.Committed);
 
     const FString Line2 = FString::Printf(
         TEXT("[Planet] game thread per frame:  total %.3f ms  =  height %.3f + LOD %.3f + reconcile %.3f + ")

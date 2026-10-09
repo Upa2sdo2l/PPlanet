@@ -206,6 +206,7 @@ struct Surface
     float    Continent = 0.f;
     float    Mountain  = 0.f;
     float    HumidityRaw = 0.f;
+    float    TempNoiseRaw = 0.f;     // decorrelated twin of HumidityRaw, for temperature
 };
 
 // The chunk's sampling grid including the one-vertex halo ring, as
@@ -220,6 +221,8 @@ struct HaloGrid
     double Height[Count];       // full height, metres
     float  Continent[Count];
     float  Mountain[Count];
+    float  Humidity[Count];     // HumidityRaw
+    float  TempNoise[Count];    // TempNoiseRaw
 };
 
 class NoiseGraph
@@ -288,6 +291,11 @@ private:
 
     // Height only. Humidity is not part of ComposeHeight, so skipping it here
     // removes 2 of the 12 noise calls per chunk.
+    // The humidity fractal sampled at an offset position: a second, uncorrelated
+    // low-frequency field for the temperature noise, at no extra node.
+    void EvaluateTempNoise(const float* X, const float* Y, const float* Z, int32_t Count,
+                           float* Out) const;
+
     void EvaluateLayersNoHumidity(const float* X, const float* Y, const float* Z, int32_t Count,
                                   float* OutContinent, float* OutMountain,
                                   float* OutDetail) const;

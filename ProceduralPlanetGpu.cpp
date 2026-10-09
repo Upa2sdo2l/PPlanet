@@ -36,6 +36,7 @@ namespace
     const FName PARAM_POS_ATLAS     (TEXT("PlanetPosAtlas"));
     const FName PARAM_NORMAL_ATLAS  (TEXT("PlanetNormalAtlas"));
     const FName PARAM_BIOME_ATLAS   (TEXT("PlanetBiomeAtlas"));
+    const FName PARAM_BIOME_ATLAS2  (TEXT("PlanetBiomeAtlas2"));
     const FName PARAM_TILES_PER_ROW (TEXT("AtlasTilesPerRow"));
     const FName PARAM_ATLAS_TEXELS  (TEXT("AtlasTexels"));
     const FName PARAM_MORPH_SECONDS (TEXT("MorphSeconds"));
@@ -112,7 +113,8 @@ void AProceduralPlanet::InitGpuTerrain()
     PosAtlas    = MakeAtlasTarget(this, AtlasTexels, PF_A32B32G32R32F, TF_Nearest,  TEXT("PlanetPosAtlas"));
     NormalAtlas = MakeAtlasTarget(this, AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetNormalAtlas"));
     BiomeAtlas  = MakeAtlasTarget(this, AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetBiomeAtlas"));
-    if (!PosAtlas || !NormalAtlas || !BiomeAtlas)
+    BiomeAtlas2 = MakeAtlasTarget(this, AtlasTexels, PF_R8G8B8A8,      TF_Bilinear, TEXT("PlanetBiomeAtlas2"));
+    if (!PosAtlas || !NormalAtlas || !BiomeAtlas || !BiomeAtlas2)
     {
         UE_LOG(LogTemp, Error, TEXT("[Planet] GPU terrain: atlas textures could not be created, using the RealtimeMesh renderer."));
         return;
@@ -122,6 +124,7 @@ void AProceduralPlanet::InitGpuTerrain()
     TerrainMID->SetTextureParameterValue(PARAM_POS_ATLAS,    PosAtlas);
     TerrainMID->SetTextureParameterValue(PARAM_NORMAL_ATLAS, NormalAtlas);
     TerrainMID->SetTextureParameterValue(PARAM_BIOME_ATLAS,  BiomeAtlas);
+    TerrainMID->SetTextureParameterValue(PARAM_BIOME_ATLAS2, BiomeAtlas2);
     TerrainMID->SetScalarParameterValue(PARAM_TILES_PER_ROW, (float)AtlasTilesPerRow);
     TerrainMID->SetScalarParameterValue(PARAM_ATLAS_TEXELS,  (float)AtlasTexels);
     TerrainMID->SetScalarParameterValue(PARAM_MORPH_SECONDS, MorphSeconds);
@@ -335,7 +338,7 @@ void AProceduralPlanet::GpuFlushTiles()
     if (PendingTiles.NumTiles <= 0) return;
     PerfWindow.GpuTiles += PendingTiles.NumTiles;
     const int32 Tiles = PendingTiles.NumTiles;
-    PlanetErosionGpu::Dispatch(this, PosAtlas, NormalAtlas, BiomeAtlas, AtlasTilesPerRow,
+    PlanetErosionGpu::Dispatch(this, PosAtlas, NormalAtlas, BiomeAtlas, BiomeAtlas2, AtlasTilesPerRow,
                                GpuShaderParams, MoveTemp(PendingTiles));
     // The arrays went to the render thread; keep next frame's appends cheap.
     PendingTiles.Reset();
@@ -356,8 +359,10 @@ void AProceduralPlanet::UpdateGpuShaderParams()
     P.Octaves  = PlanetErosion::IsEnabled(E) ? E.Octaves : 0;
     P.Seed     = E.Seed;
 
-    const PlanetCore::NoiseParams& N = Generator.GetCoreParams();
-    P.Climate  = FVector4f(N.SnowLatitudeStart, N.SnowAltitudeStart, N.HumidityVariance, 0.f);
+    const PlanetBiomes::Params& B = Generator.GetBiomes();
+    P.Biome0 = FVector4f((float)B.EquatorTempC, (float)B.PoleTempC, (float)B.LapseCPerKm, (float)B.TempNoiseC);
+    P.Biome1 = FVector4f((float)B.MoistureNoise, (float)B.InlandDryness, (float)B.BeachHeightM, (float)B.SwampMaxHeightM);
+    P.Biome2 = FVector4f((float)B.RockSlopeStart, (float)B.RockSlopeFull, (float)B.SnowTempC, (float)B.PlateauDiscount);
 }
 
 FTransform AProceduralPlanet::GpuWorldTransform(int32 SlotIndex) const

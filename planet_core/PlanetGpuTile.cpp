@@ -13,7 +13,7 @@ namespace
 
 void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Halo,
                const PlanetErosion::ChunkInputs* Inputs, const PlanetErosion::Params& Erosion,
-               double PlanetRadiusMetres, TileData& Out)
+               double PlanetRadiusMetres, float SeaLevel, TileData& Out)
 {
     using PlanetCore::Vec3d;
 
@@ -116,6 +116,10 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Hal
         V.PRef[0] = (float)(Dir.X * PlanetRadiusMetres);
         V.PRef[1] = (float)(Dir.Y * PlanetRadiusMetres);
         V.PRef[2] = (float)(Dir.Z * PlanetRadiusMetres);
+        V.Humidity  = Halo.Humidity[g];
+        V.TempNoise = Halo.TempNoise[g];
+        V.Inland    = Halo.Continent[g] - SeaLevel;
+        V.Pad       = 0.f;
         if (Inputs)
         {
             V.Fade = Inputs->Fade[g];

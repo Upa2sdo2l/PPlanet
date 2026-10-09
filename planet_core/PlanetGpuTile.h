@@ -37,7 +37,7 @@ static constexpr int32_t TILE_TEXELS = TILE_SIDE * TILE_SIDE;               // 4
 static constexpr int32_t HALO_SIDE   = PlanetCore::PLANET_GRID_WITH_HALO;   // 67
 static constexpr int32_t HALO_POINTS = HALO_SIDE * HALO_SIDE;               // 4489
 
-// Layout shared with the shader (FPlanetVertexIn). 48 bytes.
+// Layout shared with the shader (FPlanetVertexIn). 64 bytes.
 struct GpuVertex
 {
     float LocalBase[3];   // instance-local position before erosion
@@ -46,8 +46,12 @@ struct GpuVertex
     float Fade;           // -1 valleys .. +1 peaks
     float Gradient[3];    // steering gradient, planet space, m/m
     float Mask;           // 0..1 land mask; 0 = no erosion
+    float Humidity;       // climate noise (biomes)
+    float TempNoise;
+    float Inland;         // continent value above sea level, 0 at the coast
+    float Pad;
 };
-static_assert(sizeof(GpuVertex) == 48, "GpuVertex must match FPlanetVertexIn");
+static_assert(sizeof(GpuVertex) == 64, "GpuVertex must match FPlanetVertexIn");
 
 // Layout shared with the shader (FPlanetTileIn). 64 bytes.
 struct GpuTileInfo
@@ -77,9 +81,10 @@ struct TileData
 
 // Builds the tile for Key from its halo grid (SampleChunkBatch) and the
 // erosion inputs (BuildChunkInputs). Inputs may be null: no erosion (mask 0).
+// SeaLevel: the generator's effective sea level (continent value), for Inland.
 void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Halo,
                const PlanetErosion::ChunkInputs* Inputs, const PlanetErosion::Params& Erosion,
-               double PlanetRadiusMetres, TileData& Out);
+               double PlanetRadiusMetres, float SeaLevel, TileData& Out);
 
 // Planet-space position (cm) of a local-space point under the tile transform.
 void LocalToPlanet(const TileData& T, const double Local[3], double OutPlanet[3]);

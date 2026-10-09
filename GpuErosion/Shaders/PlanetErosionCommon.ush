@@ -17,7 +17,7 @@
 
 static const float PLANET_TAU = 6.28318530717959;
 
-// Same layout as PlanetGpu::GpuVertex (48 bytes).
+// Same layout as PlanetGpu::GpuVertex (64 bytes).
 struct FPlanetVertexIn
 {
     float3 LocalBase;   // instance-local position before erosion
@@ -26,6 +26,10 @@ struct FPlanetVertexIn
     float  Fade;        // -1 valleys .. +1 peaks
     float3 Gradient;    // steering gradient, planet space, m/m
     float  Mask;        // land mask; 0 = no erosion
+    float  Humidity;    // humidity noise, about -1..1
+    float  TempNoise;   // temperature noise, about -1..1
+    float  Inland;      // continent value above sea level (0 at the coast)
+    float  Pad;
 };
 
 // Same layout as PlanetGpu::GpuTileInfo (64 bytes).
@@ -191,37 +195,115 @@ float PlanetEro_DeltaHeight(float3 PRef, float3 Gradient, float FadeTarget, floa
     return (Height + E.P4.z * Magnitude) * saturate(Mask);
 }
 
-// NoiseGraph::ComputeClimate + ComputeBiomes. Returns grass, rock, sand, snow.
-// ClimateParams: SnowLatitudeStart, SnowAltitudeStart, HumidityVariance.
-float4 PlanetEro_Biomes(float3 Dir, float Height, float Slope, float4 ClimateParams)
+// ── Biomes: GPU twin of planet_core/PlanetBiomes.cpp ────────────────────────
+// Eight surface layers: Sand, DryGrass, Grass, Forest | Jungle, Tundra, Snow, Rock.
+struct FPlanetBiomeParams
 {
-    float SinLat = clamp(Dir.z, -1.0, 1.0);
-    float Lat    = asin(SinLat);
+    float4 P0;   // EquatorTempC, PoleTempC, LapseCPerKm, TempNoiseC
+    float4 P1;   // MoistureNoise, InlandDryness, BeachHeightM, SwampMaxHeightM
+    float4 P2;   // RockSlopeStart, RockSlopeFull, SnowTempC, PlateauDiscount
+};
 
-    float BaseTemp    = pow(max(0.0, cos(Lat)), 1.5);
-    float Lapse       = max(0.0, Height) / 11000.0;
-    float Temperature = saturate(BaseTemp - Lapse);
+// Layer mix of each of the 10 biomes (rows: Ice, Tundra, Taiga, TemperateForest,
+// Grassland, Desert, Savanna, Rainforest, Swamp, Beach).
+static const float PLANET_BIOME_LAYERS[80] = {
+    0.00, 0.00, 0.00, 0.00,  0.00, 0.00, 1.00, 0.00,
+    0.00, 0.05, 0.00, 0.00,  0.00, 0.85, 0.05, 0.05,
+    0.00, 0.00, 0.10, 0.70,  0.00, 0.20, 0.00, 0.00,
+    0.00, 0.00, 0.30, 0.70,  0.00, 0.00, 0.00, 0.00,
+    0.00, 0.30, 0.70, 0.00,  0.00, 0.00, 0.00, 0.00,
+    0.85, 0.05, 0.00, 0.00,  0.00, 0.00, 0.00, 0.10,
+    0.10, 0.75, 0.15, 0.00,  0.00, 0.00, 0.00, 0.00,
+    0.00, 0.00, 0.00, 0.10,  0.90, 0.00, 0.00, 0.00,
+    0.00, 0.00, 0.20, 0.40,  0.40, 0.00, 0.00, 0.00,
+    1.00, 0.00, 0.00, 0.00,  0.00, 0.00, 0.00, 0.00
+};
 
-    float LatBand  = 0.5 + 0.5 * cos(6.0 * Lat);
-    float Interior = saturate(Height / 2000.0);
-    float Aridity  = saturate((1.0 - LatBand) * (1.0 + 0.5 * Interior) * 0.5 + (1.0 - LatBand) * ClimateParams.z);
+float PlanetBio_SmoothStep(float A, float B, float X)
+{
+    float T = saturate((X - A) / (B - A));
+    return T * T * (3.0 - 2.0 * T);
+}
 
-    float LatTrig   = saturate((abs(SinLat) - (ClimateParams.x - 0.10)) / 0.20);
-    float AltTrig   = saturate((Height - (ClimateParams.y - 500.0)) / 1000.0);
-    float SnowCover = saturate(max(LatTrig, AltTrig) * (1.0 - Temperature * 0.4));
+// Soft membership of X in [Lo, Hi], edges W wide; |Lo|, |Hi| > 1000 = open.
+float PlanetBio_Band(float X, float Lo, float Hi, float W)
+{
+    float A = (Lo < -1000.0) ? 1.0 : PlanetBio_SmoothStep(Lo - W, Lo + W, X);
+    float B = (Hi >  1000.0) ? 1.0 : 1.0 - PlanetBio_SmoothStep(Hi - W, Hi + W, X);
+    return A * B;
+}
 
-    float Snow      = saturate(SnowCover * (1.0 - saturate(Slope * 1.4)));
-    float RockSlope = saturate((Slope - 0.35) / 0.35);
-    float RockCold  = saturate((0.30 - Temperature) / 0.18);
-    float Rock      = saturate(max(RockSlope, RockCold * 0.6) * (1.0 - Snow));
-    float SandArid  = saturate((Aridity - 0.55) / 0.25);
-    float SandBeach = saturate((60.0 - Height) / 60.0) * saturate((0.30 - Slope) / 0.25);
-    float Sand      = saturate(max(SandArid, SandBeach * 0.7) * (1.0 - Snow) * (1.0 - Rock));
-    float Grass     = saturate(1.0 - Snow - Rock - Sand);
+struct FPlanetLayers
+{
+    float4 L0;   // Sand, DryGrass, Grass, Forest
+    float4 L1;   // Jungle, Tundra, Snow, Rock
+};
 
-    float Sum = Grass + Rock + Sand + Snow;
-    if (Sum < 1e-8) return float4(1.0, 0.0, 0.0, 0.0);
-    return float4(Grass / Sum, Rock / Sum, Sand / Sum, Snow / Sum);
+FPlanetLayers PlanetBio_Layers(float3 Up, float HeightM, float Slope, float HumidityRaw, float TempNoise,
+                               float Inland, FPlanetBiomeParams B)
+{
+    // Climate
+    float SinLat   = clamp(Up.z, -1.0, 1.0);
+    float CosLat   = sqrt(max(0.0, 1.0 - SinLat * SinLat));
+    float Plateau  = max(0.0, Inland) * 12000.0;
+    float Altitude = max(0.0, HeightM - B.P2.w * Plateau);
+    float T = B.P0.y + (B.P0.x - B.P0.y) * CosLat - B.P0.z * Altitude * 0.001 + B.P0.w * clamp(TempNoise, -1.0, 1.0);
+    float Lat   = asin(SinLat);
+    float Bands = 0.5 + 0.5 * cos(6.0 * Lat);
+    float Noise = saturate(0.5 + 0.6 * HumidityRaw);
+    float M = saturate(Bands * (1.0 - B.P1.x) + Noise * B.P1.x - B.P1.y * saturate(Inland * 12000.0 / 6000.0));
+
+    // Biomes
+    float WT = 2.5;
+    float WM = 0.06;
+    float W[10];
+    W[0] = PlanetBio_Band(T, -1.0e9, -14.0, WT);
+    W[1] = PlanetBio_Band(T, -14.0, -3.0, WT);
+    W[2] = PlanetBio_Band(T, -3.0, 6.0, WT)  * PlanetBio_Band(M, 0.30, 1.0e9, WM);
+    W[3] = PlanetBio_Band(T, 6.0, 20.0, WT)  * PlanetBio_Band(M, 0.45, 1.0e9, WM);
+    W[4] = PlanetBio_Band(T, -3.0, 21.0, WT) * PlanetBio_Band(M, 0.15, 0.45, WM) * 0.9
+         + PlanetBio_Band(T, -3.0, 6.0, WT)  * PlanetBio_Band(M, 0.15, 0.30, WM) * 0.1;
+    W[5] = PlanetBio_Band(T, -3.0, 1.0e9, WT) * PlanetBio_Band(M, -1.0e9, 0.17, WM);
+    W[6] = PlanetBio_Band(T, 20.0, 1.0e9, WT) * PlanetBio_Band(M, 0.17, 0.55, WM);
+    W[7] = PlanetBio_Band(T, 20.0, 1.0e9, WT) * PlanetBio_Band(M, 0.55, 1.0e9, WM);
+
+    float Swamp = PlanetBio_Band(T, 6.0, 1.0e9, WT) * PlanetBio_SmoothStep(0.70, 0.82, M)
+                * (1.0 - PlanetBio_SmoothStep(B.P1.w * 0.5, B.P1.w, HeightM))
+                * (1.0 - PlanetBio_SmoothStep(0.01, 0.04, Slope));
+    float Sum = 0.0;
+    for (int b = 0; b < 8; ++b) { W[b] = W[b] * (1.0 - Swamp); Sum += W[b]; }
+    W[8] = Swamp;
+    Sum += Swamp;
+
+    float Beach = (1.0 - PlanetBio_SmoothStep(B.P1.z * 0.6, B.P1.z, HeightM))
+                * (1.0 - PlanetBio_SmoothStep(0.05, 0.15, Slope) * ((HeightM > 0.0) ? 1.0 : 0.0));
+    if (Sum < 1e-9)
+    {
+        for (int z = 0; z < 9; ++z) W[z] = 0.0;
+        W[4] = 1.0;
+        Sum = 1.0;
+    }
+    for (int c = 0; c < 9; ++c) W[c] = W[c] / Sum * (1.0 - Beach);
+    W[9] = Beach;
+
+    // Layers
+    float L[8];
+    for (int l = 0; l < 8; ++l) L[l] = 0.0;
+    for (int bb = 0; bb < 10; ++bb)
+        for (int ll = 0; ll < 8; ++ll)
+            L[ll] += W[bb] * PLANET_BIOME_LAYERS[bb * 8 + ll];
+
+    float Snow = PlanetBio_SmoothStep(B.P2.z + 2.0, B.P2.z - 2.0, T) * (1.0 - PlanetBio_SmoothStep(0.25, 0.45, Slope));
+    float Rock = PlanetBio_SmoothStep(B.P2.x, B.P2.y, Slope);
+    for (int s1 = 0; s1 < 8; ++s1) L[s1] = L[s1] * (1.0 - Snow);
+    L[6] += Snow;
+    for (int s2 = 0; s2 < 8; ++s2) L[s2] = L[s2] * (1.0 - Rock);
+    L[7] += Rock;
+
+    FPlanetLayers Out;
+    Out.L0 = float4(L[0], L[1], L[2], L[3]);
+    Out.L1 = float4(L[4], L[5], L[6], L[7]);
+    return Out;
 }
 
 // Eroded point in the chunk frame, metres, relative to the instance box centre.
@@ -237,7 +319,8 @@ struct FPlanetTexelOut
 {
     float4 Pos;      // instance-local target, w = 0
     float4 Normal;   // planet-space normal * 0.5 + 0.5, w = 1
-    float4 Biome;    // grass, rock, sand, snow
+    float4 Biome;    // layers Sand, DryGrass, Grass, Forest
+    float4 Biome2;   // layers Jungle, Tundra, Snow, Rock
 };
 
 // One chunk vertex: C is the vertex, L/R/D/U its grid neighbours along -U/+U
@@ -245,7 +328,7 @@ struct FPlanetTexelOut
 FPlanetTexelOut PlanetEro_Texel(FPlanetVertexIn C, float DC,
                                 FPlanetVertexIn L, float DL, FPlanetVertexIn R, float DR,
                                 FPlanetVertexIn D, float DD, FPlanetVertexIn U, float DU,
-                                FPlanetTileIn T, float4 ClimateParams)
+                                FPlanetTileIn T, FPlanetBiomeParams BiomeParams)
 {
     float3 E  = PlanetEro_FramePoint(C, DC, T);
     float3 Su = PlanetEro_FramePoint(R, DR, T) - PlanetEro_FramePoint(L, DL, T);
@@ -266,6 +349,8 @@ FPlanetTexelOut PlanetEro_Texel(FPlanetVertexIn C, float DC,
     FPlanetTexelOut Out;
     Out.Pos    = float4(E.x / T.ExtMetres.x, E.y / T.ExtMetres.y, E.z / T.ExtMetres.z, 0.0);
     Out.Normal = float4(N.x * 0.5 + 0.5, N.y * 0.5 + 0.5, N.z * 0.5 + 0.5, 1.0);
-    Out.Biome  = PlanetEro_Biomes(Up, Height, Slope, ClimateParams);
+    FPlanetLayers Layers = PlanetBio_Layers(Up, Height, Slope, C.Humidity, C.TempNoise, C.Inland, BiomeParams);
+    Out.Biome  = Layers.L0;
+    Out.Biome2 = Layers.L1;
     return Out;
 }

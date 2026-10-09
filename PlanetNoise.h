@@ -19,6 +19,7 @@
 // consumes it happily, which is what makes the split work.
 #include "planet_core/PlanetNoiseCore.h"
 #include "planet_core/PlanetErosion.h"
+#include "planet_core/PlanetBiomes.h"
 
 class FPlanetNoiseGenerator
 {
@@ -58,6 +59,10 @@ public:
     const PlanetErosion::Params& GetErosion() const { return Erosion; }
     bool HasErosion() const { return PlanetErosion::IsEnabled(Erosion); }
 
+    // ── Biomes (climate model shared with the GPU) ──────────────────────
+    void SetBiomes(const PlanetBiomes::Params& Params) { Biomes = Params; }
+    const PlanetBiomes::Params& GetBiomes() const { return Biomes; }
+
     // ── Single point ─────────────────────────────────────────────────────
     // Height of the terrain the player sees, erosion included (to ~0.1 m of
     // the eroded mesh). For line traces and placement, not per-vertex use;
@@ -73,6 +78,7 @@ public:
 private:
     PlanetCore::NoiseGraph Graph;
     PlanetErosion::Params  Erosion = []{ PlanetErosion::Params P; P.Strength = 0.0; return P; }();
+    PlanetBiomes::Params   Biomes;
 };
 
 namespace PlanetBridge
@@ -144,6 +150,24 @@ inline PlanetErosion::Params ToCoreErosion(const FPlanetErosionSettings& S)
     P.HeightOffset         = S.HeightOffset;
     P.GradientStepFraction = S.GradientStepFraction;
     P.Seed                 = (uint32_t)S.Seed;
+    return P;
+}
+
+inline PlanetBiomes::Params ToCoreBiomes(const FPlanetBiomeSettings& S)
+{
+    PlanetBiomes::Params P;
+    P.EquatorTempC    = S.EquatorTempC;
+    P.PoleTempC       = S.PoleTempC;
+    P.LapseCPerKm     = S.LapseCPerKm;
+    P.PlateauDiscount = S.PlateauDiscount;
+    P.TempNoiseC      = S.TempNoiseC;
+    P.MoistureNoise   = S.MoistureNoise;
+    P.InlandDryness   = S.InlandDryness;
+    P.BeachHeightM    = S.BeachHeightMetres;
+    P.SwampMaxHeightM = S.SwampMaxHeightMetres;
+    P.RockSlopeStart  = S.RockSlopeStart;
+    P.RockSlopeFull   = FMath::Max(S.RockSlopeFull, S.RockSlopeStart + 0.01f);
+    P.SnowTempC       = S.SnowTempC;
     return P;
 }
 

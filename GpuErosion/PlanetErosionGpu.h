@@ -4,13 +4,13 @@
 // The game module fills a batch of chunk tiles on the game thread and hands
 // it over; the plugin runs two compute passes on the render thread:
 //   ErodeCS  erosion height for every point of every tile's 67 x 67 halo grid
-//   WriteCS  eroded position, normal and biomes of every chunk vertex,
-//            written straight into the three atlas render targets.
+//   WriteCS  eroded position, normal and eight surface-layer weights of every
+//            chunk vertex, written straight into the four atlas render targets.
 // and copies the erosion heights back to the CPU (asynchronously, 2-3 frames
 // later): collision meshes use exactly the heights that are drawn, without
 // computing erosion on the CPU.
 //
-// Layouts: one vertex = PlanetGpu::GpuVertex (48 bytes), one tile =
+// Layouts: one vertex = PlanetGpu::GpuVertex (64 bytes), one tile =
 // PlanetGpu::GpuTileInfo (64 bytes); the shader declares the same structs.
 // Bytes are passed as-is so the plugin does not depend on planet_core.
 //
@@ -26,7 +26,7 @@ class UTextureRenderTarget2D;
 namespace PlanetErosionGpu
 {
     static constexpr int32 HaloPoints     = 67 * 67;
-    static constexpr int32 VertexBytes    = 48;
+    static constexpr int32 VertexBytes    = 64;
     static constexpr int32 TileBytes      = 64;
 
     struct FShaderParams
@@ -38,7 +38,12 @@ namespace PlanetErosionGpu
         FVector4f P4       = FVector4f(0.f, 0.f, 0.f, 0.f);   // Lacunarity, Gain, HeightOffset, -
         int32     Octaves  = 0;                               // 0 = no erosion
         uint32    Seed     = 0;
-        FVector4f Climate  = FVector4f(0.f, 0.f, 0.f, 0.f);   // SnowLatitudeStart, SnowAltitudeStart, HumidityVariance, -
+        // Biomes (PlanetBiomes::Params): EquatorTempC, PoleTempC, LapseCPerKm, TempNoiseC |
+        // MoistureNoise, InlandDryness, BeachHeightM, SwampMaxHeightM |
+        // RockSlopeStart, RockSlopeFull, SnowTempC, PlateauDiscount
+        FVector4f Biome0   = FVector4f(0.f, 0.f, 0.f, 0.f);
+        FVector4f Biome1   = FVector4f(0.f, 0.f, 0.f, 0.f);
+        FVector4f Biome2   = FVector4f(0.f, 0.f, 0.f, 0.f);
     };
 
     struct FTileBatch
@@ -63,11 +68,12 @@ namespace PlanetErosionGpu
 
     // Enqueues both passes for the batch and the read-back of its heights.
     // Game thread. The textures must be created with bCanCreateUAV (positions
-    // RGBA32F, normals and biomes RGBA8). Owner keys the read-backs.
+    // RGBA32F, normals and both biome atlases RGBA8). Owner keys the read-backs.
     PLANETEROSION_API void Dispatch(const void* Owner,
                                     UTextureRenderTarget2D* PosAtlas,
                                     UTextureRenderTarget2D* NormalAtlas,
                                     UTextureRenderTarget2D* BiomeAtlas,
+                                    UTextureRenderTarget2D* BiomeAtlas2,
                                     int32 TilesPerRow,
                                     const FShaderParams& Params,
                                     FTileBatch&& Batch);

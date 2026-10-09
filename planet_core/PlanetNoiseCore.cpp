@@ -148,6 +148,12 @@ void NoiseGraph::EvaluateLayers(const float* X, const float* Y, const float* Z, 
     DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, Y, Z, 0.f,0.f,0.f, Params.MasterSeed);
 }
 
+void NoiseGraph::EvaluateTempNoise(const float* X, const float* Y, const float* Z, int32_t Count,
+                                   float* Out) const
+{
+    HumidityFractal->GenPositionArray3D(Out, Count, X, Y, Z, 17.31f, -9.17f, 5.73f, Params.MasterSeed);
+}
+
 void NoiseGraph::EvaluateLayersNoHumidity(const float* X, const float* Y, const float* Z, int32_t Count,
                                           float* OutContinent, float* OutMountain,
                                           float* OutDetail) const
@@ -220,11 +226,11 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
     const int32_t G = PLANET_GRID_WITH_HALO;     // 67
     const int32_t TotalG = G * G;
 
-    static thread_local std::vector<float>  XG, YG, ZG, Cg, Mg, Hg, Dg;
+    static thread_local std::vector<float>  XG, YG, ZG, Cg, Mg, Hg, Dg, Tg;
     static thread_local std::vector<double> DXg, DYg, DZg, HeightG;
     if ((int32_t)XG.size() < TotalG)
     {
-        for (std::vector<float>* V : {&XG, &YG, &ZG, &Cg, &Mg, &Hg, &Dg})
+        for (std::vector<float>* V : {&XG, &YG, &ZG, &Cg, &Mg, &Hg, &Dg, &Tg})
             V->resize((size_t)TotalG);
         for (std::vector<double>* V : {&DXg, &DYg, &DZg, &HeightG})
             V->resize((size_t)TotalG);
@@ -252,6 +258,7 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
 
     EvaluateLayers(XG.data(), YG.data(), ZG.data(), TotalG,
                    Cg.data(), Mg.data(), Hg.data(), Dg.data());
+    EvaluateTempNoise(XG.data(), YG.data(), ZG.data(), TotalG, Tg.data());
     for (int32_t i = 0; i < TotalG; ++i)
         HeightG[i] = ComposeHeight(Cg[i], Mg[i], Dg[i]);
 
@@ -263,6 +270,8 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
             OutHalo->Height[i]    = HeightG[i];
             OutHalo->Continent[i] = Cg[i];
             OutHalo->Mountain[i]  = Mg[i];
+            OutHalo->Humidity[i]  = Hg[i];
+            OutHalo->TempNoise[i] = Tg[i];
         }
     }
 
@@ -283,6 +292,7 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
             S.Continent   = Cg[g];
             S.Mountain    = Mg[g];
             S.HumidityRaw = Hg[g];
+            S.TempNoiseRaw = Tg[g];
             S.Height      = HeightG[g];
 
             // Central differences along the grid's U and V directions.
@@ -313,11 +323,12 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
 {
     if (!bValid || Count <= 0) return;
 
-    static thread_local std::vector<float> XU,YU,ZU, XV,YV,ZV, H0,HU,HV, Cb,Mb,Hb,Db;
+    static thread_local std::vector<float> XU,YU,ZU, XV,YV,ZV, H0,HU,HV, Cb,Mb,Hb,Db,Tb;
     XU.resize((size_t)Count); YU.resize((size_t)Count); ZU.resize((size_t)Count);
     XV.resize((size_t)Count); YV.resize((size_t)Count); ZV.resize((size_t)Count);
     H0.resize((size_t)Count); HU.resize((size_t)Count); HV.resize((size_t)Count);
     Cb.resize((size_t)Count); Mb.resize((size_t)Count); Hb.resize((size_t)Count); Db.resize((size_t)Count);
+    Tb.resize((size_t)Count);
 
     const double Eps = 1e-5;   // radians, ~25 m on a 2500 km sphere
 
@@ -333,6 +344,7 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
     }
 
     EvaluateLayers(DirX, DirY, DirZ, Count, Cb.data(), Mb.data(), Hb.data(), Db.data());
+    EvaluateTempNoise(DirX, DirY, DirZ, Count, Tb.data());
     for (int32_t i = 0; i < Count; ++i)
         H0[i] = (float)ComposeHeight(Cb[i], Mb[i], Db[i]);
 
@@ -346,7 +358,7 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
         Surface& S = Out[i];
         const Vec3d Dir((double)DirX[i], (double)DirY[i], (double)DirZ[i]);
 
-        S.Continent = Cb[i]; S.Mountain = Mb[i]; S.HumidityRaw = Hb[i]; S.Height = (double)H0[i];
+        S.Continent = Cb[i]; S.Mountain = Mb[i]; S.HumidityRaw = Hb[i]; S.TempNoiseRaw = Tb[i]; S.Height = (double)H0[i];
 
         const Vec3d S0 = Dir * (R + (double)H0[i]);
         const Vec3d Su = Vec3d((double)XU[i], (double)YU[i], (double)ZU[i]) * (R + (double)HU[i]);

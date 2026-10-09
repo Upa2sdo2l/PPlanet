@@ -206,7 +206,7 @@ public:
         if (bTile)
         {
             PlanetGpu::BuildTile(PlanetCore::FChunkKey(Work->Key.Face, Work->Key.LOD, Work->Key.X, Work->Key.Y),
-                                 ScratchHalo(), Inputs, Gen->GetErosion(), PlanetRadius, *Work->Tile);
+                                 ScratchHalo(), Inputs, Gen->GetErosion(), PlanetRadius, Gen->GetSeaLevel(), *Work->Tile);
         }
         if (Work->bBuildMesh)
         {
@@ -273,6 +273,7 @@ void AProceduralPlanet::BeginPlay()
     // Only the GPU renderer erodes the terrain; heights (camera, gameplay,
     // collision) include erosion exactly when the drawn terrain does.
     Generator.SetErosion(bGPUTerrain, PlanetBridge::ToCoreErosion(Erosion));
+    Generator.SetBiomes(PlanetBridge::ToCoreBiomes(Biomes));
     UpdateGpuShaderParams();
 }
 

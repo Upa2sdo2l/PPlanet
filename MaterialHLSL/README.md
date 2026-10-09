@@ -29,6 +29,7 @@
 | Texture Object Parameter | `PlanetPosAtlas` | любая текстура по умолчанию; в игре подставляется атлас |
 | Texture Sample Parameter 2D | `PlanetNormalAtlas` | Sampler Source: **Shared: Clamp** |
 | Texture Sample Parameter 2D | `PlanetBiomeAtlas` | Sampler Source: **Shared: Clamp** |
+| Texture Sample Parameter 2D | `PlanetBiomeAtlas2` | Sampler Source: **Shared: Clamp** |
 | Scalar Parameter | `AtlasTilesPerRow` | значение по умолчанию 18 |
 | Scalar Parameter | `AtlasTexels` | значение по умолчанию 1170 |
 | Scalar Parameter | `MorphSeconds` | значение по умолчанию 0.35 |
@@ -64,7 +65,23 @@
 2. Выход → нода **Vertex Interpolator** (UV считается в вершинном шейдере, а читается в пиксельном).
 3. Выход Vertex Interpolator → вход **UVs** у `PlanetNormalAtlas` и у `PlanetBiomeAtlas`. Если редактор ругается на размерность, вставьте Component Mask (R G).
 4. Нормаль: `PlanetNormalAtlas` RGB → **× 2** → **− 1** → **Normalize** → пин **Normal**.
-5. Биомы: `PlanetBiomeAtlas` RGBA — это те же веса, что раньше лежали в Vertex Color (R трава, G скалы, B песок, A снег). Скопируйте из старого материала часть, которая смешивает цвета, и подключите вместо ноды Vertex Color.
+5. Цвет поверхности — восемь слоёв из двух атласов (ветка `feature/gravity-biomes`):
+   - добавьте **Texture Sample Parameter 2D `PlanetBiomeAtlas2`** (как `PlanetBiomeAtlas`: Sampler Source **Shared: Clamp**, тот же вход UVs от Vertex Interpolator);
+   - добавьте 8 **Vector Parameter** с цветами слоёв (в пикере цвета удобно вводить в поле **Hex sRGB**):
+
+     | # | Параметр | Слой | Hex sRGB |
+     | --- | --- | --- | --- |
+     | 0 | `LayerSand` | песок (пляжи, пустыни) | `C7B385` |
+     | 1 | `LayerDryGrass` | сухая трава (саванна, степь) | `A39152` |
+     | 2 | `LayerGrass` | трава (луга) | `528033` |
+     | 3 | `LayerForest` | лесная подстилка (умеренный лес, тайга) | `2B4F21` |
+     | 4 | `LayerJungle` | тропический лес | `144D1A` |
+     | 5 | `LayerTundra` | тундра (мох, лишайник) | `7A7861` |
+     | 6 | `LayerSnow` | снег, лёд | `F0F2F7` |
+     | 7 | `LayerRock` | скалы (крутые склоны) | `736E66` |
+
+   - нода **Custom**: Output Type **CMOT Float 3**, Code — всё из `PlanetTerrain_Layers.hlsl` ниже пунктирной линии, входы по порядку: `W0` (`PlanetBiomeAtlas` RGBA), `W1` (`PlanetBiomeAtlas2` RGBA), `C0`…`C7` (параметры из таблицы по порядку);
+   - выход → **Base Color**. Старую схему (трава/скалы/песок/снег) удалите: смысл каналов `PlanetBiomeAtlas` поменялся.
 
 ## 2б. Плагин эрозии
 

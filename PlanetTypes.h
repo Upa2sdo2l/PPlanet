@@ -279,6 +279,64 @@ struct FPlanetErosionSettings
     int32 Seed = 0;
 };
 
+// ── Biomes (GPU terrain renderer) ───────────────────────────────────────────
+// Climate and biome model of planet_core/PlanetBiomes.h, mapped by
+// PlanetBridge::ToCoreBiomes. Ten Earth biomes from temperature and moisture;
+// the material blends eight surface layers (Sand, DryGrass, Grass, Forest,
+// Jungle, Tundra, Snow, Rock). Defaults tuned for MountainAmplitude 10000 m.
+USTRUCT(BlueprintType)
+struct FPlanetBiomeSettings
+{
+    GENERATED_BODY()
+
+    // Sea-level temperature at the equator and at the poles, deg C.
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="-50.0", ClampMax="60.0"))
+    float EquatorTempC = 28.f;
+
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="-80.0", ClampMax="40.0"))
+    float PoleTempC = -28.f;
+
+    // Cooling per km of altitude. Earth's 6.5 would freeze this planet's
+    // highlands (its relief is ~10x Earth's).
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="0.0", ClampMax="10.0"))
+    float LapseCPerKm = 3.f;
+
+    // Share of the continental plateau height ignored for temperature: 0 =
+    // highlands freeze, 1 = only mountains above the plateau get colder.
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float PlateauDiscount = 0.7f;
+
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="0.0", ClampMax="20.0"))
+    float TempNoiseC = 5.f;
+
+    // Share of noise in moisture (the rest: latitude bands, wet at 0 and 60
+    // deg, dry at 30 and 90 deg).
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float MoistureNoise = 0.45f;
+
+    // Moisture lost deep inland (deserts in continental interiors).
+    UPROPERTY(EditAnywhere, Category="Biomes|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float InlandDryness = 0.25f;
+
+    UPROPERTY(EditAnywhere, Category="Biomes|Surface", meta=(ClampMin="0.0", ClampMax="500.0"))
+    float BeachHeightMetres = 25.f;
+
+    UPROPERTY(EditAnywhere, Category="Biomes|Surface", meta=(ClampMin="0.0", ClampMax="5000.0"))
+    float SwampMaxHeightMetres = 300.f;
+
+    // Slope (1 - cos of the angle) where rock starts and where it is full:
+    // 0.30 ~ 46 deg, 0.55 ~ 63 deg.
+    UPROPERTY(EditAnywhere, Category="Biomes|Surface", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float RockSlopeStart = 0.30f;
+
+    UPROPERTY(EditAnywhere, Category="Biomes|Surface", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float RockSlopeFull = 0.55f;
+
+    // Flats colder than this are snow-covered (mountain tops, polar ice).
+    UPROPERTY(EditAnywhere, Category="Biomes|Surface", meta=(ClampMin="-60.0", ClampMax="20.0"))
+    float SnowTempC = -10.f;
+};
+
 inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
 {
     uint64 H = 1469598103934665603ull;   // FNV-1a offset basis

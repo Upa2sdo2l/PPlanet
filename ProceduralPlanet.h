@@ -108,6 +108,11 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|Erosion")
     FPlanetErosionSettings Erosion;
 
+    // Climate and biomes of the surface (GPU renderer; the RealtimeMesh
+    // renderer keeps its four vertex-colour weights).
+    UPROPERTY(EditAnywhere, Category="Planet|Biomes")
+    FPlanetBiomeSettings Biomes;
+
     // Worst-case mountain height above the sphere, used only for bounding
     // spheres and horizon culling. Over-estimating costs a little culling;
     // under-estimating pops chunks, so this is generous on purpose.
@@ -260,6 +265,9 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UTextureRenderTarget2D> BiomeAtlas;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTextureRenderTarget2D> BiomeAtlas2;
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> TerrainMID;

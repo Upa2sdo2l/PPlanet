@@ -62,7 +62,10 @@ public:
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutPos)
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutNormal)
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutBiome)
-        SHADER_PARAMETER(FVector4f, ClimateParams)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutBiome2)
+        SHADER_PARAMETER(FVector4f, BiomeP0)
+        SHADER_PARAMETER(FVector4f, BiomeP1)
+        SHADER_PARAMETER(FVector4f, BiomeP2)
         SHADER_PARAMETER(uint32, TilesPerRow)
     END_SHADER_PARAMETER_STRUCT()
 
@@ -113,11 +116,11 @@ bool IsSupported()
 }
 
 void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRenderTarget2D* NormalAtlas,
-              UTextureRenderTarget2D* BiomeAtlas, int32 TilesPerRow,
+              UTextureRenderTarget2D* BiomeAtlas, UTextureRenderTarget2D* BiomeAtlas2, int32 TilesPerRow,
               const FShaderParams& Params, FTileBatch&& Batch)
 {
     check(IsInGameThread());
-    if (!PosAtlas || !NormalAtlas || !BiomeAtlas || Batch.NumTiles <= 0) return;
+    if (!PosAtlas || !NormalAtlas || !BiomeAtlas || !BiomeAtlas2 || Batch.NumTiles <= 0) return;
     // The shaders exist only for SM5+ (ShouldCompilePermutation); asking for
     // them below that would assert. The game module falls back earlier.
     if (!IsSupported()) return;
@@ -132,10 +135,11 @@ void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRende
     FTextureRenderTargetResource* PosRes    = PosAtlas->GameThread_GetRenderTargetResource();
     FTextureRenderTargetResource* NormalRes = NormalAtlas->GameThread_GetRenderTargetResource();
     FTextureRenderTargetResource* BiomeRes  = BiomeAtlas->GameThread_GetRenderTargetResource();
-    if (!PosRes || !NormalRes || !BiomeRes) return;
+    FTextureRenderTargetResource* Biome2Res = BiomeAtlas2->GameThread_GetRenderTargetResource();
+    if (!PosRes || !NormalRes || !BiomeRes || !Biome2Res) return;
 
     ENQUEUE_RENDER_COMMAND(PlanetErosionDispatch)(
-        [Owner, PosRes, NormalRes, BiomeRes, TilesPerRow, Params, Batch = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
+        [Owner, PosRes, NormalRes, BiomeRes, Biome2Res, TilesPerRow, Params, Batch = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             TShaderMapRef<FPlanetErodeCS> ErodeCS(ShaderMap);
@@ -145,7 +149,8 @@ void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRende
             FRHITexture* PosRHI    = PosRes->GetRenderTargetTexture();
             FRHITexture* NormalRHI = NormalRes->GetRenderTargetTexture();
             FRHITexture* BiomeRHI  = BiomeRes->GetRenderTargetTexture();
-            if (!PosRHI || !NormalRHI || !BiomeRHI) return;
+            FRHITexture* Biome2RHI = Biome2Res->GetRenderTargetTexture();
+            if (!PosRHI || !NormalRHI || !BiomeRHI || !Biome2RHI) return;
 
             FRDGBuilder GraphBuilder(RHICmdList);
             const uint32 NumTiles  = (uint32)Batch.NumTiles;
@@ -162,6 +167,7 @@ void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRende
             FRDGTextureRef PosTex    = RegisterExternalTexture(GraphBuilder, PosRHI,    TEXT("PlanetPosAtlas"));
             FRDGTextureRef NormalTex = RegisterExternalTexture(GraphBuilder, NormalRHI, TEXT("PlanetNormalAtlas"));
             FRDGTextureRef BiomeTex  = RegisterExternalTexture(GraphBuilder, BiomeRHI,  TEXT("PlanetBiomeAtlas"));
+            FRDGTextureRef Biome2Tex = RegisterExternalTexture(GraphBuilder, Biome2RHI, TEXT("PlanetBiomeAtlas2"));
 
             FRDGBufferSRVRef VertexSRV = GraphBuilder.CreateSRV(VertexBuf);
 
@@ -190,7 +196,10 @@ void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRende
                 P->OutPos        = GraphBuilder.CreateUAV(PosTex);
                 P->OutNormal     = GraphBuilder.CreateUAV(NormalTex);
                 P->OutBiome      = GraphBuilder.CreateUAV(BiomeTex);
-                P->ClimateParams = Params.Climate;
+                P->OutBiome2     = GraphBuilder.CreateUAV(Biome2Tex);
+                P->BiomeP0       = Params.Biome0;
+                P->BiomeP1       = Params.Biome1;
+                P->BiomeP2       = Params.Biome2;
                 P->TilesPerRow   = (uint32)FMath::Max(1, TilesPerRow);
                 FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("PlanetTerrainTiles (%u tiles)", NumTiles),
                                              WriteCS, P, FIntVector(9, 9, (int32)NumTiles));
@@ -208,6 +217,7 @@ void Dispatch(const void* Owner, UTextureRenderTarget2D* PosAtlas, UTextureRende
             GraphBuilder.SetTextureAccessFinal(PosTex,    ERHIAccess::SRVMask);
             GraphBuilder.SetTextureAccessFinal(NormalTex, ERHIAccess::SRVMask);
             GraphBuilder.SetTextureAccessFinal(BiomeTex,  ERHIAccess::SRVMask);
+            GraphBuilder.SetTextureAccessFinal(Biome2Tex, ERHIAccess::SRVMask);
             GraphBuilder.Execute();
 
             PendingReadbacks().Add(MoveTemp(Pending));

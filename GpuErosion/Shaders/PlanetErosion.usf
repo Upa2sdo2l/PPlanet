@@ -8,7 +8,7 @@
 // Two passes over a batch of chunk tiles (one dispatch each, z = tile):
 //   ErodeCS  every point of each tile's 67 x 67 halo grid -> erosion delta
 //   WriteCS  every chunk vertex (65 x 65): eroded position, normal from the
-//            eroded neighbours, biomes -> the three atlas textures
+//            eroded neighbours, eight surface-layer weights -> four atlases
 #include "/Engine/Public/Platform.ush"
 #include "/PlanetErosion/PlanetErosionCommon.ush"
 
@@ -34,7 +34,10 @@ StructuredBuffer<float> DeltaIn;
 RWTexture2D<float4> OutPos;
 RWTexture2D<float4> OutNormal;
 RWTexture2D<float4> OutBiome;
-float4 ClimateParams;
+RWTexture2D<float4> OutBiome2;
+float4 BiomeP0;
+float4 BiomeP1;
+float4 BiomeP2;
 uint   TilesPerRow;
 
 [numthreads(8, 8, 1)]
@@ -62,6 +65,10 @@ void WriteCS(uint3 Id : SV_DispatchThreadID)
     if (Id.x >= TILE_SIDE || Id.y >= TILE_SIDE) return;
 
     FPlanetTileIn T = Tiles[Id.z];
+    FPlanetBiomeParams BP;
+    BP.P0 = BiomeP0;
+    BP.P1 = BiomeP1;
+    BP.P2 = BiomeP2;
     uint Base = Id.z * HALO_POINTS;
     uint G = Base + (Id.y + 1) * HALO_SIDE + (Id.x + 1);
 
@@ -71,7 +78,7 @@ void WriteCS(uint3 Id : SV_DispatchThreadID)
         Vertices[G + 1],         DeltaIn[G + 1],
         Vertices[G - HALO_SIDE], DeltaIn[G - HALO_SIDE],
         Vertices[G + HALO_SIDE], DeltaIn[G + HALO_SIDE],
-        T, ClimateParams);
+        T, BP);
 
     uint TileIndex = (uint)T.AtlasTile;
     uint2 Texel = uint2((TileIndex % TilesPerRow) * TILE_SIDE + Id.x,
@@ -79,4 +86,5 @@ void WriteCS(uint3 Id : SV_DispatchThreadID)
     OutPos[Texel]    = O.Pos;
     OutNormal[Texel] = O.Normal;
     OutBiome[Texel]  = O.Biome;
+    OutBiome2[Texel] = O.Biome2;
 }

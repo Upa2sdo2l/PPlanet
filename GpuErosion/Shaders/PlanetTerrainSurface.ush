@@ -1,0 +1,234 @@
+// PlanetTerrainSurface.ush
+// Textured planet surface for the terrain material (M_PlanetTerrainGPU).
+// Included by the material's Custom node through the PlanetErosion plugin's
+// shader folder ("/PlanetErosion/PlanetTerrainSurface.ush"), so changes here
+// arrive with git: no re-pasting into the material. Setup and inputs:
+// MaterialHLSL/PlanetTerrain_Surface.hlsl and MaterialHLSL/README_Textures.md.
+//
+// Per pixel:
+//   * only the two strongest of the eight layers are textured; they are
+//     mixed by their height maps (sharp, natural borders: grass in the gaps
+//     between stones, snow in the hollows first);
+//   * biplanar projection (the two dominant world axes, Inigo Quilez): no UVs
+//     needed on a sphere, no stretching on cliffs;
+//   * two tiling scales: Mid everywhere, Near blended in close to the camera,
+//     plus a Macro sample that breaks visible repetition;
+//   * parallax occlusion on the near scale (dominant plane, strongest layer);
+//   * beyond FarStart the textures fade into the flat layer colours, so from
+//     orbit the planet shows clean biome colours and the relief from the atlas
+//     normals. Past FarEnd no texture is sampled at all.
+// Texture coordinates come in already wrapped (Frac of the large-world
+// position, done by the material graph in double precision); their
+// derivatives come from the camera-relative position, which is continuous,
+// so mip selection has no seams at the wrap.
+#pragma once
+
+struct FPlanetSurfaceOut
+{
+    float3 Color;
+    float3 Normal;      // world space
+    float  Roughness;
+    float  AO;
+};
+
+float4 PlanetSurf_Sample(Texture2DArray Tex, SamplerState S, float2 UV, float2 DX, float2 DY, float Slice)
+{
+    return Tex.SampleGrad(S, float3(UV, Slice), DX, DY);
+}
+
+// Plane coordinates of a 3D vector for projection axis A (0 = X, 1 = Y, 2 = Z):
+// X plane uses (z, y), Y plane (x, z), Z plane (x, y)  (Golus' triplanar layout).
+float2 PlanetSurf_Plane(float3 V, int A)
+{
+    return (A == 0) ? float2(V.z, V.y) : ((A == 1) ? float2(V.x, V.z) : float2(V.x, V.y));
+}
+
+// Tangent normal of plane A -> world, whiteout blend with the surface normal.
+float3 PlanetSurf_ToWorld(float3 TN, float3 Nw, int A)
+{
+    if (A == 0) { float3 T = float3(TN.xy + Nw.zy, abs(TN.z) * Nw.x); return T.zyx; }
+    if (A == 1) { float3 T = float3(TN.xy + Nw.xz, abs(TN.z) * Nw.y); return T.xzy; }
+    float3 T = float3(TN.xy + Nw.xy, abs(TN.z) * Nw.z);
+    return T.xyz;
+}
+
+float3 PlanetSurf_Unpack(float4 NRA)
+{
+    float2 XY = NRA.rg * 2.0 - 1.0;
+    return float3(XY, sqrt(saturate(1.0 - dot(XY, XY))));
+}
+
+// Height-based mix of two layers: weights shifted by their heights.
+float2 PlanetSurf_HeightMix(float Wa, float Ha, float Wb, float Hb)
+{
+    float Depth = 0.2;
+    float Top = max(Ha + Wa, Hb + Wb) - Depth;
+    float Ba = max(Ha + Wa - Top, 0.0);
+    float Bb = max(Hb + Wb - Top, 0.0);
+    return float2(Ba, Bb) / max(Ba + Bb, 1e-4);
+}
+
+// W0, W1   layer weights (PlanetBiomeAtlas, PlanetBiomeAtlas2)
+// N        world normal from PlanetNormalAtlas (any length)
+// RelPos   camera-relative world position, cm
+// UV*      Frac(absolute world position / tile size) for the three scales
+// AH, NRA  Texture2DArrays, 8 slices: albedo + height | normal XY, roughness, AO
+// Col      the eight layer colours (far distance)
+// P0       TileNear, TileMid, TileMacro (cm), NearEnd (cm)
+// P1       FarStart, FarEnd (cm), ParallaxDepth, ParallaxSteps
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
+                                float3 UVNear, float3 UVMid, float3 UVMacro,
+                                Texture2DArray AH, SamplerState AHSampler,
+                                Texture2DArray NRA, SamplerState NRASampler,
+                                float3 C0, float3 C1, float3 C2, float3 C3,
+                                float3 C4, float3 C5, float3 C6, float3 C7,
+                                float4 P0, float4 P1)
+{
+
+    // ── Layer weights: the two strongest, renormalised ─────────────────────────
+    float W[8] = { W0.x, W0.y, W0.z, W0.w, W1.x, W1.y, W1.z, W1.w };
+    float3 Col[8] = { C0, C1, C2, C3, C4, C5, C6, C7 };
+    float WSum = 0.0;
+    for (int k = 0; k < 8; ++k) WSum += W[k];
+    WSum = max(WSum, 1e-4);
+
+    float3 FarColour = float3(0.0, 0.0, 0.0);
+    int L0 = 0;
+    for (int a = 0; a < 8; ++a)
+    {
+        FarColour += Col[a] * (W[a] / WSum);
+        if (W[a] > W[L0]) L0 = a;
+    }
+    int L1 = (L0 == 0) ? 1 : 0;
+    for (int b = 0; b < 8; ++b)
+    {
+        if (b != L0 && W[b] > W[L1]) L1 = b;
+    }
+    float LW0 = W[L0] / max(W[L0] + W[L1], 1e-4);
+    float LW1 = 1.0 - LW0;
+
+    float3 Nw = normalize(N);
+    float  Dist  = length(RelPos);
+    // Screen derivatives once, outside every branch and loop (they are only
+    // defined in uniform control flow); the planes and scales reuse them.
+    float3 RelDX = ddx(RelPos);
+    float3 RelDY = ddy(RelPos);
+    float  FarT  = smoothstep(P1.x, P1.y, Dist);
+    float  NearT = 1.0 - smoothstep(P0.w * 0.5, P0.w, Dist);
+
+    float3 Colour = FarColour;
+    FPlanetSurfaceOut Out;
+    Out.Normal    = Nw;
+    Out.Roughness = 0.85;
+    Out.AO        = 1.0;
+
+    if (FarT < 0.999)
+    {
+        // ── Biplanar: dominant (MA) and second (ME) projection axes ─────────────
+        float3 An = abs(Nw);
+        int MA = (An.x > An.y && An.x > An.z) ? 0 : ((An.y > An.z) ? 1 : 2);
+        int MI = (An.x < An.y && An.x < An.z) ? 0 : ((An.y < An.z) ? 1 : 2);
+        int ME = 3 - MI - MA;
+        float2 PW = float2(pow(An[MA], 8.0), pow(An[ME], 8.0));
+        // Fade the second plane out where the first clearly dominates (IQ).
+        PW.y *= saturate((An[ME] - 0.5773) / (1.0 - 0.5773) * 4.0);
+        PW /= max(PW.x + PW.y, 1e-4);
+
+        int   Axis[2] = { MA, ME };
+        float Sgn[2]  = { sign(Nw[MA] + 1e-6), sign(Nw[ME] + 1e-6) };
+
+        // ── Parallax offset (near scale, dominant plane, strongest layer) ───────
+        float2 PomOffset = float2(0.0, 0.0);
+        {
+            float2 UV  = PlanetSurf_Plane(UVNear, MA);
+            UV.x *= Sgn[0];
+            float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.x * float2(Sgn[0], 1.0);
+            float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * float2(Sgn[0], 1.0);
+
+            int Steps = (int)lerp(max(P1.w, 1.0), 2.0, saturate(Dist / max(P0.w, 1.0)));
+            if (NearT > 0.0 && P1.z > 0.0 && Steps > 1)
+            {
+                float3 V = -RelPos / max(Dist, 1e-3);                 // towards the camera
+                float2 VT = PlanetSurf_Plane(V, MA) * float2(Sgn[0], 1.0);     // along the plane
+                float  VN = max(abs(V[MA]), 0.15);                     // along the plane normal
+                float2 Delta = VT / VN * P1.z / (float)Steps;
+                float  LayerDepth = 1.0 / (float)Steps;
+                float  Depth = 0.0;
+                float2 CUV = UV;
+                float  MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
+                for (int s = 0; s < 32; ++s)
+                {
+                    if (s >= Steps || Depth >= MapDepth) break;
+                    CUV -= Delta;
+                    Depth += LayerDepth;
+                    MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
+                }
+                PomOffset = (CUV - UV) * NearT;
+            }
+        }
+
+        // ── Sample both layers on both planes at the Mid (and Near) scale ───────
+        float3 Alb = float3(0.0, 0.0, 0.0);
+        float3 Nrm = float3(0.0, 0.0, 0.0);
+        float  Rgh = 0.0;
+        float  Occ = 0.0;
+
+        for (int p = 0; p < 2; ++p)
+        {
+            if (PW[p] < 0.001) continue;
+            int A = Axis[p];
+            float2 SFlip = float2(Sgn[p], 1.0);
+
+            // scale 0 = Mid, scale 1 = Near
+            float3 PAlb = float3(0.0, 0.0, 0.0);
+            float3 PTN  = float3(0.0, 0.0, 0.0);
+            float  PRgh = 0.0;
+            float  POcc = 0.0;
+            for (int sc = 0; sc < 2; ++sc)
+            {
+                float ScaleW = (sc == 0) ? 1.0 - NearT : NearT;
+                if (ScaleW < 0.001) continue;
+                float  Tile = (sc == 0) ? P0.y : P0.x;
+                float2 UV   = PlanetSurf_Plane((sc == 0) ? UVMid : UVNear, A) * SFlip;
+                float2 DX = PlanetSurf_Plane(RelDX, A) / Tile * SFlip;
+                float2 DY = PlanetSurf_Plane(RelDY, A) / Tile * SFlip;
+                if (sc == 1 && p == 0) UV += PomOffset;
+
+                float4 A0 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L0);
+                float4 A1 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L1);
+                float4 N0 = PlanetSurf_Sample(NRA, NRASampler, UV, DX, DY, (float)L0);
+                float4 N1 = PlanetSurf_Sample(NRA, NRASampler, UV, DX, DY, (float)L1);
+                float2 HM = PlanetSurf_HeightMix(LW0, A0.a, LW1, A1.a);
+
+                PAlb += (A0.rgb * HM.x + A1.rgb * HM.y) * ScaleW;
+                float3 T0 = PlanetSurf_Unpack(N0);
+                float3 T1 = PlanetSurf_Unpack(N1);
+                PTN  += (T0 * HM.x + T1 * HM.y) * ScaleW;
+                PRgh += (N0.b * HM.x + N1.b * HM.y) * ScaleW;
+                POcc += (N0.a * HM.x + N1.a * HM.y) * ScaleW;
+            }
+            float3 TN = normalize(float3(PTN.x * Sgn[p], PTN.y, max(PTN.z, 1e-3)));
+            Alb += PAlb * PW[p];
+            Nrm += PlanetSurf_ToWorld(TN, Nw, A) * PW[p];
+            Rgh += PRgh * PW[p];
+            Occ += POcc * PW[p];
+        }
+
+        // ── Macro variation: large-scale brightness of the strongest layer ──────
+        {
+            float2 UV  = PlanetSurf_Plane(UVMacro, MA);
+            float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.z;
+            float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.z;
+            float3 M = PlanetSurf_Sample(AH, AHSampler, UV, DX, DY, (float)L0).rgb;
+            float  Ratio = dot(M, float3(0.333, 0.333, 0.333)) / max(dot(Col[L0], float3(0.333, 0.333, 0.333)), 0.03);
+            Alb *= lerp(1.0, clamp(Ratio, 0.6, 1.4), 0.5);
+        }
+
+        Colour        = lerp(Alb, FarColour, FarT);
+        Out.Normal    = normalize(lerp(normalize(Nrm), Nw, FarT));
+        Out.Roughness = lerp(Rgh, 0.85, FarT);
+        Out.AO        = lerp(Occ, 1.0, FarT);
+    }
+    Out.Color = Colour;
+    return Out;
+}

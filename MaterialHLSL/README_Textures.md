@@ -76,11 +76,11 @@ python Tools/pack_terrain_layers.py <папка с наборами> <папка
 | Scalar Parameter | `TileNear` | 300 (см: текстура повторяется каждые 3 м) |
 | Scalar Parameter | `TileMid` | 3000 |
 | Scalar Parameter | `TileMacro` | 40000 |
-| Scalar Parameter | `NearEnd` | 4000 (до 40 м — детальный масштаб и parallax) |
+| Scalar Parameter | `NearEnd` | 3000 (до 30 м — детальный масштаб и parallax) |
 | Scalar Parameter | `FarStart` | 150000 (с 1.5 км текстуры уходят в цвет) |
 | Scalar Parameter | `FarEnd` | 600000 (с 6 км — только цвет) |
 | Scalar Parameter | `ParallaxDepth` | 0.05 |
-| Scalar Parameter | `ParallaxSteps` | 12 |
+| Scalar Parameter | `ParallaxSteps` | 8 |
 
 Координаты (делаются в графе, в двойной точности — так текстуры не «дрожат» вдали от центра мира):
 
@@ -107,9 +107,11 @@ python Tools/pack_terrain_layers.py <папка с наборами> <папка
 
 - Повторение текстуры заметно → увеличьте `TileMid`; мыльно под ногами → уменьшите `TileNear`.
 - Parallax: `ParallaxDepth` 0.03–0.08; `ParallaxSteps` 8–16 (дороже). 0 — выключить.
+- Значения по умолчанию рассчитаны на ноутбучную RTX 3050 (4 ГБ). Память: 16 текстур 2K в BC7 —
+  около 90 МБ вместе с мипами; при нехватке видеопамяти упакуйте с `--size 1024` (~22 МБ).
 - Резкая граница «текстуры → цвет» вдали → раздвиньте `FarStart`/`FarEnd` или поправьте средние цвета.
-- Стоимость на пиксель: дальше `FarEnd` — 0 выборок; средняя дистанция — 9; ближе `NearEnd` — до ~33
-  (с parallax). Это обычный уровень для ландшафтного материала.
+- Стоимость на пиксель: дальше `FarEnd` — 0 выборок; средняя дистанция — 9; ближе `NearEnd` — до ~25
+  (с parallax на 8 шагов). Это обычный уровень для ландшафтного материала.
 
 ## Если что-то не так
 

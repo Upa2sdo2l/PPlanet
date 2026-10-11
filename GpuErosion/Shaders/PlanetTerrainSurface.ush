@@ -138,32 +138,54 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
         float Sgn[2]  = { sign(Nw[MA] + 1e-6), sign(Nw[ME] + 1e-6) };
 
         // ── Parallax offset (near scale, dominant plane, strongest layer) ───────
+        // The view ray is marched below the TRUE surface (normal Nw) and its
+        // path projected onto the texture plane, so the offset is right for any
+        // tilt between the surface and the projection plane. At grazing angles
+        // parallax breaks into streaks whatever the step count, so it fades out
+        // there (and with distance); the last two steps are refined linearly,
+        // which removes the visible stair-step layers.
         float2 PomOffset = float2(0.0, 0.0);
         {
-            float2 UV  = PlanetSurf_Plane(UVNear, MA);
-            UV.x *= Sgn[0];
-            float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.x * float2(Sgn[0], 1.0);
-            float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * float2(Sgn[0], 1.0);
-
-            int Steps = (int)lerp(max(P1.w, 1.0), 2.0, saturate(Dist / max(P0.w, 1.0)));
-            if (NearT > 0.0 && P1.z > 0.0 && Steps > 1)
+            float3 V      = -RelPos / max(Dist, 1e-3);             // towards the camera
+            float  NdotV  = dot(V, Nw);
+            float  PomFade = NearT * smoothstep(0.12, 0.35, NdotV);
+            if (PomFade > 0.0 && P1.z > 0.0)
             {
-                float3 V = -RelPos / max(Dist, 1e-3);                 // towards the camera
-                float2 VT = PlanetSurf_Plane(V, MA) * float2(Sgn[0], 1.0);     // along the plane
-                float  VN = max(abs(V[MA]), 0.15);                     // along the plane normal
-                float2 Delta = VT / VN * P1.z / (float)Steps;
+                float2 Flip = float2(Sgn[0], 1.0);
+                float2 UV = PlanetSurf_Plane(UVNear, MA) * Flip;
+                float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.x * Flip;
+                float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * Flip;
+
+                // Full depth (P1.z, in tile units) reached after this UV shift.
+                float2 MaxOffset = PlanetSurf_Plane(V, MA) * Flip / max(NdotV, 0.25) * P1.z;
+                // More steps at grazing angles, fewer with distance.
+                float  StepsF = lerp(max(P1.w, 2.0), max(P1.w * 0.5, 2.0), saturate(NdotV))
+                              * lerp(1.0, 0.5, saturate(Dist / max(P0.w, 1.0)));
+                int    Steps = clamp((int)(StepsF + 0.5), 2, 32);
                 float  LayerDepth = 1.0 / (float)Steps;
+                float2 Delta = MaxOffset * LayerDepth;
+
+                float2 CUV = UV, PrevUV = UV;
                 float  Depth = 0.0;
-                float2 CUV = UV;
                 float  MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
+                float  PrevMapDepth = MapDepth;
                 for (int s = 0; s < 32; ++s)
                 {
                     if (s >= Steps || Depth >= MapDepth) break;
+                    PrevUV = CUV;
+                    PrevMapDepth = MapDepth;
                     CUV -= Delta;
                     Depth += LayerDepth;
                     MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
                 }
-                PomOffset = (CUV - UV) * NearT;
+                // Intersection between the last two samples (linear).
+                float After  = MapDepth - Depth;                       // <= 0 after a hit
+                float Before = PrevMapDepth - (Depth - LayerDepth);    // >= 0
+                float Denom  = After - Before;
+                float T = (Denom < -1e-5) ? saturate(After / Denom) : 0.0;
+                CUV = lerp(CUV, PrevUV, T);
+
+                PomOffset = (CUV - UV) * PomFade;
             }
         }
 

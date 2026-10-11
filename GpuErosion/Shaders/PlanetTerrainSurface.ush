@@ -115,6 +115,15 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
     float3 RelDY = ddy(RelPos);
     float  FarT  = smoothstep(P1.x, P1.y, Dist);
     float  NearT = 1.0 - smoothstep(P0.w * 0.5, P0.w, Dist);
+    // The height-based layer mix picks, per texel, whichever layer's height
+    // map is higher: up close that is the look (stones poking through sand),
+    // but once a texel is smaller than a pixel it turns into salt-and-pepper
+    // between two layers whose normals differ, which shimmers in motion. It
+    // goes over to a plain weight blend between NearEnd and 8 x NearEnd.
+    float  HMFlat = smoothstep(P0.w, P0.w * 8.0, Dist);
+    // Detail normals are halved towards FarStart: sub-pixel bumps only add
+    // lighting noise there; the relief comes from the atlas normals.
+    float  NStr = lerp(1.0, 0.5, smoothstep(P0.w, P1.x, Dist));
 
     float3 Colour = FarColour;
     FPlanetSurfaceOut Out;
@@ -220,7 +229,7 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 float4 A1 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L1);
                 float4 N0 = PlanetSurf_Sample(NRA, NRASampler, UV, DX, DY, (float)L0);
                 float4 N1 = PlanetSurf_Sample(NRA, NRASampler, UV, DX, DY, (float)L1);
-                float2 HM = PlanetSurf_HeightMix(LW0, A0.a, LW1, A1.a);
+                float2 HM = lerp(PlanetSurf_HeightMix(LW0, A0.a, LW1, A1.a), float2(LW0, LW1), HMFlat);
 
                 PAlb += (A0.rgb * HM.x + A1.rgb * HM.y) * ScaleW;
                 float3 T0 = PlanetSurf_Unpack(N0);
@@ -229,7 +238,7 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 PRgh += (N0.b * HM.x + N1.b * HM.y) * ScaleW;
                 POcc += (N0.a * HM.x + N1.a * HM.y) * ScaleW;
             }
-            float3 TN = normalize(float3(PTN.x * Sgn[p], PTN.y, max(PTN.z, 1e-3)));
+            float3 TN = normalize(float3(PTN.x * Sgn[p] * NStr, PTN.y * NStr, max(PTN.z, 1e-3)));
             Alb += PAlb * PW[p];
             Nrm += PlanetSurf_ToWorld(TN, Nw, A) * PW[p];
             Rgh += PRgh * PW[p];

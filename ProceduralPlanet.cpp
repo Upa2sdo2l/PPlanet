@@ -206,7 +206,8 @@ public:
         if (bTile)
         {
             PlanetGpu::BuildTile(PlanetCore::FChunkKey(Work->Key.Face, Work->Key.LOD, Work->Key.X, Work->Key.Y),
-                                 ScratchHalo(), Inputs, Gen->GetErosion(), PlanetRadius, Gen->GetSeaLevel(), *Work->Tile);
+                                 ScratchHalo(), Inputs, Gen->GetErosion(), PlanetRadius, Gen->GetSeaLevel(), *Work->Tile,
+                                 Work->TileMarginCm);
         }
         if (Work->bBuildMesh)
         {
@@ -453,6 +454,7 @@ void AProceduralPlanet::Tick(float DeltaSeconds)
             GpuRebaseIfNeeded(CameraRel);
             GpuPollHeights();
             SyncSlotPresentationGpu();
+            GpuUpdateDetail(CameraRel);
         }
         else
         {
@@ -625,6 +627,7 @@ void AProceduralPlanet::PumpWorkers()
         // the GPU reads back (SyncSlotPresentationGpu).
         W.bBuildMesh      = !bGPUTerrain;
         W.bGpuTile        = bGPUTerrain;
+        W.TileMarginCm    = (bGPUTerrain && bTerrainDetail) ? DisplacementBoundsMarginMetres * PLANET_METRES_TO_UE_CM : 0.0;
         if (bGPUTerrain && !W.Tile.IsValid())
         {
             // Not value-initialised (215 KB): BuildTile writes every field.
@@ -1014,14 +1017,26 @@ FString AProceduralPlanet::GetStreamingStatsString() const
     for (uint8 L : LODs)
         LODStats += FString::Printf(TEXT("L%d:%d "), L, LODCounts[L]);
 
+    // Detail levels: derived chunks by LOD.
+    FString DetailStats;
+    if (bGPUTerrain && DetailInstanceCount > 0)
+    {
+        TMap<uint8, int32> DCounts;
+        for (const FDetailInstance& D : DetailInstances) DCounts.FindOrAdd(D.Key.LOD)++;
+        TArray<uint8> DL; DCounts.GetKeys(DL); DL.Sort();
+        DetailStats = FString::Printf(TEXT("| Detail %d/%d from %d chunks%s: "), DetailInstances.Num(), DetailInstanceCount,
+                                      DetailSplitBases, bDetailBudgetHit ? TEXT(" (budget)") : TEXT(""));
+        for (uint8 L : DL) DetailStats += FString::Printf(TEXT("L%d:%d "), L, DCounts[L]);
+    }
+
     return FString::Printf(
         TEXT("Pool %d | Active %d Ready %d Building %d Requested %d Free %d Retiring %d | ")
-        TEXT("Desired %d Rejected %d Stale %d | LOD leaves %d visited %d budgetHit:%s | %s"),
+        TEXT("Desired %d Rejected %d Stale %d | LOD leaves %d visited %d budgetHit:%s | %s%s"),
         S.PoolSize, S.Active, S.Ready, S.Building, S.Requested, S.Free, S.Retiring,
         S.Desired, S.RejectedByCapacity, S.StaleCompletionsDropped,
         (int32)LastSelection.Chunks.size(), LastSelection.Visited,
         LastSelection.bBudgetHit ? TEXT("YES") : TEXT("NO"),
-        *LODStats);
+        *LODStats, *DetailStats);
 }
 
 

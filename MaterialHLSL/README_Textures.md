@@ -2,8 +2,10 @@
 
 Делает поверхность из восьми слоёв (Sand, DryGrass, Grass, Forest, Jungle, Tundra, Snow, Rock):
 
-- вблизи — детальные текстуры (масштаб Near) с parallax, переходы между слоями по карте высот
-  (трава в щелях между камнями, снег сначала в ложбинах);
+- вблизи — детальные текстуры (масштаб Near), переходы между слоями по карте высот (трава в щелях
+  между камнями, снег сначала в ложбинах), объём без parallax: ложбины темнее, камешки отбрасывают
+  микротени от солнца, а у камеры вершины сетки реально поднимаются картами высот («своя
+  тесселяция», раздел 6);
 - на средних дистанциях — те же текстуры крупнее (Mid) плюс очень крупная вариация (Macro), чтобы
   не было видно повторения;
 - дальше FarStart текстуры плавно уходят в средний цвет слоя, после FarEnd текстуры не читаются
@@ -76,11 +78,13 @@ python Tools/pack_terrain_layers.py <папка с наборами> <папка
 | Scalar Parameter | `TileNear` | 300 (см: текстура повторяется каждые 3 м) |
 | Scalar Parameter | `TileMid` | 3000 |
 | Scalar Parameter | `TileMacro` | 40000 |
-| Scalar Parameter | `NearEnd` | 3000 (до 30 м — детальный масштаб и parallax) |
+| Scalar Parameter | `NearEnd` | 3000 (до 30 м — детальный масштаб) |
 | Scalar Parameter | `FarStart` | 150000 (с 1.5 км текстуры уходят в цвет) |
 | Scalar Parameter | `FarEnd` | 600000 (с 6 км — только цвет) |
-| Scalar Parameter | `ParallaxDepth` | 0.05 |
-| Scalar Parameter | `ParallaxSteps` | 8 |
+| Scalar Parameter | `ReliefDepth` | 0.03 (глубина рельефа карты высот в долях тайла: 0.03 × 3 м = 9 см) |
+| Scalar Parameter | `ShadowSteps` | 8 (шагов микротеней) |
+| Scalar Parameter | `CavityStrength` | 0.6 (затемнение ложбин) |
+| Scalar Parameter | `MicroShadowStrength` | 0.6 (плотность микротеней) |
 
 Координаты (делаются в графе, в двойной точности — так текстуры не «дрожат» вдали от центра мира):
 
@@ -88,16 +92,18 @@ python Tools/pack_terrain_layers.py <папка с наборами> <папка
   Так же для `TileMid` (`UVMid`) и `TileMacro` (`UVMacro`).
 - Ещё одна **World Position** в режиме **Camera Relative World Position** → это `RelPos`.
 - `P0` = **Append**(`TileNear`, `TileMid`, `TileMacro`, `NearEnd`) — три ноды Append подряд.
-- `P1` = **Append**(`FarStart`, `FarEnd`, `ParallaxDepth`, `ParallaxSteps`).
+- `P1` = **Append**(`FarStart`, `FarEnd`, `ReliefDepth`, `ShadowSteps`).
+- `P2` = **Append**(`CavityStrength`, `MicroShadowStrength`, 0, 0) — нули: ноды Constant.
+- **SkyAtmosphereLightDirection** (Light Index 0) — направление на солнце; это `SunDir`.
 
 Нода **Custom**:
 
 - Output Type **CMOT Float 3**;
 - **Include File Paths**: `/PlanetErosion/PlanetTerrainSurface.ush`;
-- Code — из `PlanetTerrain_Surface.hlsl` ниже пунктирной линии (5 строк);
+- Code — из `PlanetTerrain_Surface.hlsl` ниже пунктирной линии;
 - Inputs по порядку: `W0` (PlanetBiomeAtlas RGBA), `W1` (PlanetBiomeAtlas2 RGBA), `N` (PlanetNormalAtlas
   RGB ×2 −1), `RelPos`, `UVNear`, `UVMid`, `UVMacro`, `AH` (`PlanetLayersAH`), `NRA` (`PlanetLayersNRA`),
-  `C0`…`C7` (`LayerSand` … `LayerRock`), `P0`, `P1`;
+  `C0`…`C7` (`LayerSand` … `LayerRock`), `P0`, `P1`, `P2`, `SunDir` (22 входа);
 - **Additional Outputs**: `OutNormal` (CMOT Float 3), `OutRoughness` (CMOT Float 1), `OutAO` (CMOT Float 1).
 
 Подключение: основной выход → **Base Color**; `OutNormal` → **Normal** (у материала Tangent Space Normal
@@ -111,14 +117,37 @@ Apply и Save: материал перекомпилируется с новым
 ## 5. Настройка и стоимость
 
 - Повторение текстуры заметно → увеличьте `TileMid`; мыльно под ногами → уменьшите `TileNear`.
-- Parallax: `ParallaxDepth` 0.03–0.08; `ParallaxSteps` 8–16 (дороже). 0 — выключить.
-  Под скользящим углом (взгляд вдоль склона) parallax плавно отключается: там он всегда
-  рассыпается в «иглы», сколько шагов ни давай.
+- Рельеф без parallax (текстура никуда не сдвигается, поэтому ничего не «плывёт»):
+  - `CavityStrength` 0–1: насколько темнеют низкие места карты высот (ложбины, щели между камнями);
+  - `MicroShadowStrength` 0–1: плотность теней, которые бугорки отбрасывают от солнца;
+  - `ReliefDepth`: высота рельефа карты высот в долях тайла; больше — длиннее микротени;
+  - `ShadowSteps` 4–16: качество микротеней (8 — норма, 0 в `MicroShadowStrength` — выключить).
+  Солнце берётся из SkyAtmosphereLightDirection; без Sky Atmosphere на уровне микротеней нет.
 - Значения по умолчанию рассчитаны на ноутбучную RTX 3050 (4 ГБ). Память: 16 текстур 2K в BC7 —
   около 90 МБ вместе с мипами; при нехватке видеопамяти упакуйте с `--size 1024` (~22 МБ).
 - Резкая граница «текстуры → цвет» вдали → раздвиньте `FarStart`/`FarEnd` или поправьте средние цвета.
-- Стоимость на пиксель: дальше `FarEnd` — 0 выборок; средняя дистанция — 9; ближе `NearEnd` — до ~25
-  (с parallax на 8 шагов). Это обычный уровень для ландшафтного материала.
+- Стоимость на пиксель: дальше `FarEnd` — 0 выборок; средняя дистанция — 9 + микротени; ближе
+  `NearEnd` — до ~20. Обычный уровень для ландшафтного материала.
+
+## 6. «Своя тесселяция»: геометрия у камеры
+
+Ниже MaxLOD (14) шум уже упирается в точность float, поэтому новые чанки не генерируются. Вместо
+этого ближайшие чанки делятся дальше на «производные» (`planet_core/PlanetDetail.h`): они ничего не
+строят на CPU, а читают тайл своего базового чанка и в вершинном шейдере поднимаются картами высот
+текстур (`GpuErosion/Shaders/PlanetTerrainVertex.ush`). С `DetailLevels` = 4 вершины под ногами
+стоят через ~0.3 м, дальше кольцами 0.6 / 1.2 / 2.3 м.
+
+- Материал: нода WPO и нода AtlasUV по `README.md` (разделы WPO и «Нормаль и цвет»).
+- `DisplaceNear` (см) — размах бугров из текстур масштаба Near (камни, рябь), `DisplaceMid` (см) — из
+  масштаба Mid (кочки, дюны). Смещение отфильтровано под шаг сетки: грубые чанки получают только
+  крупные бугры, мелочь остаётся микротеням и нормалям.
+- Актор → **Planet → GPU Terrain → Detail**: `bTerrainDetail`, `DetailLevels` (0–6),
+  `DetailSplitDistanceFactor` (меньше — меньше инстансов), `DetailMaxInstances`,
+  `DisplacementBoundsMarginMetres` (запас границ чанка: ≥ половины `DisplaceNear` + `DisplaceMid`).
+- Смещение не зависит от камеры: тени (VSM) кэшируются как обычно, бугры не «растут» при подходе.
+  Новые уровни при приближении проявляются морфингом (`MorphSeconds`).
+- Коллизия — по поверхности без смещения: при ±10–20 см ноги местами чуть утопают или висят.
+- `planet.Stats 1` показывает в конце строки `Detail N/M from K chunks: L15:… L18:…`.
 
 ## Если что-то не так
 
@@ -128,4 +157,6 @@ Apply и Save: материал перекомпилируется с новым
 | Чёрная/розовая поверхность | порядок или sRGB у массивов; разный размер текстур в массиве |
 | Свет на рельефе с «неправильной» стороны у одного слоя | нормаль OpenGL: перепакуйте с `--flip-green` |
 | Текстуры «плывут» или дрожат при движении | пришлите видео/скриншот — проверим точность координат |
+| Дырки-«искры» или щели между чанками у ног | пришлите скриншот с `planet.Stats 1`; временно `DetailLevels` = 0 |
+| Бугры висят в воздухе или проваливаются по краям экрана | увеличьте `DisplacementBoundsMarginMetres` (действует на новые чанки) |
 | Видны швы-линии по сетке тайлов | пришлите скриншот (выбор мипов на границе тайла) |

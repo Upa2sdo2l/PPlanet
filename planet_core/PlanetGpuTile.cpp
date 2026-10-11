@@ -13,7 +13,7 @@ namespace
 
 void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Halo,
                const PlanetErosion::ChunkInputs* Inputs, const PlanetErosion::Params& Erosion,
-               double PlanetRadiusMetres, float SeaLevel, TileData& Out)
+               double PlanetRadiusMetres, float SeaLevel, TileData& Out, double ExtraMarginCm)
 {
     using PlanetCore::Vec3d;
 
@@ -70,6 +70,8 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Hal
                 Frame(Dir * ((PlanetRadiusMetres + Halo.Height[g] + ErodeHi * M) * METRES_TO_CM), q); Grow(q);
             }
         }
+
+    for (int a = 0; a < 3; ++a) { Min[a] -= ExtraMarginCm; Max[a] += ExtraMarginCm; }
 
     // ── Box -> instance transform. Thin boxes get a minimum thickness so the
     //    scale never degenerates (a flat ocean chunk would otherwise be 0 cm).

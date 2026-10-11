@@ -1,0 +1,311 @@
+// PlanetTerrainVertex.ush
+// Vertex shader of the GPU terrain (World Position Offset of M_PlanetTerrainGPU).
+// Included by the WPO Custom node ("/PlanetErosion/PlanetTerrainVertex.ush"),
+// node code: MaterialHLSL/PlanetTerrain_WPO.hlsl. Returns a WORLD offset (cm).
+//
+// Per grid vertex (gx, gy) of the 65x65 instance grid:
+//   * its target position comes from the chunk's atlas tile. A derived chunk
+//     (detail level, planet_core/PlanetDetail.h) covers a sub-rectangle of its
+//     base chunk's tile and reads it bilinearly between the base's vertices;
+//   * on an edge whose neighbour is d LOD levels coarser it slides onto the
+//     neighbour's edge (linear between every 2^d-th vertex): no cracks;
+//   * a chunk that just replaced its parent morphs from the parent's shape
+//     (every 2nd vertex) over MorphSeconds; border vertices never morph;
+//   * "our own tessellation": the vertex is pushed outwards by the height maps
+//     of the two strongest texture layers, projected on the world planes like
+//     the pixel shader does (Near and Mid tiling), so on open ground the bumps
+//     sit under the stones and ripples you see. (Planes and push direction
+//     follow the instance's up axis, not the atlas normal: see PlanetVtx_Eval.)
+//
+// The displacement does not depend on the camera (shadow-map caches stay
+// valid; nothing moves while you walk). It is filtered for the mesh: the
+// texture mip matches the vertex spacing of the LOD it is evaluated at, so a
+// coarse chunk shows only coarse bumps and nothing aliases. Chunks of
+// different LOD would then displace a shared point differently; to keep them
+// sealed, a point is evaluated at the coarsest LOD around it:
+//   border vertex on an edge with a coarser neighbour : that neighbour's LOD;
+//   chunk corner : the coarsest of the up-to-four chunks there (corner deltas,
+//                  which also see the diagonal neighbour);
+//   everything else : the chunk's own LOD, blended towards a coarser edge over
+//                  the last four rows so the edge row does not stand out.
+// The displacement is applied from DisplacementMinLOD (CD3.z >= 0) on; one
+// level coarser it fades to zero, so the far planet costs nothing.
+//
+// Written in the subset shared with C++ (the planet harness compiles this
+// file against a mock): no swizzles beyond .x/.y/.z/.w, no vector indexing,
+// no out/inout parameters.
+#pragma once
+
+struct FPlanetVtx
+{
+    float3 P;   // target position, instance-local
+    float3 D;   // displacement, world cm
+};
+
+struct FPlanetVtxCtx
+{
+    int    OriginX;  int OriginY;       // atlas texel origin of the (base) tile
+    float  SubX;     float SubY;   float Step;   // base quads per grid step
+    float  SpacingCm;                   // vertex spacing at this chunk's LOD
+    float  AboveMin;                    // LOD - DisplacementMinLOD
+    float3 AX;  float3 AY;  float3 AZ;  // local axes in world cm
+    float3 OFN; float3 OFM;             // frac(origin / TileNear), frac(origin / TileMid)
+    float4 D0;                          // TileNear, TileMid, DisplaceNear, DisplaceMid (cm)
+    float  TexSize;                     // texels per side of the layer textures
+};
+
+float4 PlanetVtx_Bilinear(Texture2D Tex, FPlanetVtxCtx C, float Ax, float Ay)
+{
+    int   x0 = min((int)floor(Ax), 63);
+    int   y0 = min((int)floor(Ay), 63);
+    float fx = Ax - (float)x0;
+    float fy = Ay - (float)y0;
+    float4 T00 = Tex.Load(int3(C.OriginX + x0,     C.OriginY + y0,     0));
+    if (fx == 0.0 && fy == 0.0) return T00;
+    float4 T10 = Tex.Load(int3(C.OriginX + x0 + 1, C.OriginY + y0,     0));
+    float4 T01 = Tex.Load(int3(C.OriginX + x0,     C.OriginY + y0 + 1, 0));
+    float4 T11 = Tex.Load(int3(C.OriginX + x0 + 1, C.OriginY + y0 + 1, 0));
+    float4 A = T00 + (T10 - T00) * fx;
+    float4 B = T01 + (T11 - T01) * fx;
+    return A + (B - A) * fy;
+}
+
+// Plane coordinates for projection axis A (same layout as the pixel shader).
+float2 PlanetVtx_Plane(float3 V, int A)
+{
+    return (A == 0) ? float2(V.z, V.y) : ((A == 1) ? float2(V.x, V.z) : float2(V.x, V.y));
+}
+
+float PlanetVtx_Comp(float3 V, int A)
+{
+    return (A == 0) ? V.x : ((A == 1) ? V.y : V.z);
+}
+
+// Height of the two-layer mix on plane A at one tiling scale. The higher
+// layer wins, like the pixel shader's height mix, but smoothly and with no
+// say for a layer of zero weight: two chunks that disagree on which layer is
+// second (a tie) must still agree on the height.
+float PlanetVtx_Height(Texture2DArray AH, SamplerState S, float3 UV3, int A, float Sgn,
+                       float Mip, int L0, int L1, float LW0, float LW1)
+{
+    float2 UV = PlanetVtx_Plane(UV3, A);
+    UV = float2(UV.x * Sgn, UV.y);
+    float Ha = AH.SampleLevel(S, float3(UV.x, UV.y, (float)L0), Mip).w;
+    float Hb = AH.SampleLevel(S, float3(UV.x, UV.y, (float)L1), Mip).w;
+    float Ba = LW0 * exp2(Ha * 8.0);
+    float Bb = LW1 * exp2(Hb * 8.0);
+    return (Ha * Ba + Hb * Bb) / max(Ba + Bb, 1e-6);
+}
+
+// Grid vertex (ix, iy) of this chunk evaluated DEval levels coarser than its
+// own LOD (may be fractional).
+FPlanetVtx PlanetVtx_Eval(int ix, int iy, float DEval, FPlanetVtxCtx C,
+                          Texture2D PosAtlas, Texture2D NrmAtlas, Texture2D BioAtlas, Texture2D Bio2Atlas,
+                          Texture2DArray AH, SamplerState AHSampler)
+{
+    float Ax = C.SubX + (float)ix * C.Step;
+    float Ay = C.SubY + (float)iy * C.Step;
+
+    FPlanetVtx V;
+    float4 T = PlanetVtx_Bilinear(PosAtlas, C, Ax, Ay);
+    V.P = float3(T.x, T.y, T.z);
+    V.D = float3(0.0, 0.0, 0.0);
+
+    float Amp = saturate(C.AboveMin - DEval + 1.0);
+    if (Amp <= 0.0 || (C.D0.z <= 0.0 && C.D0.w <= 0.0)) return V;
+
+    float4 NT = PlanetVtx_Bilinear(NrmAtlas, C, Ax, Ay);
+    float3 Nw = normalize(float3(NT.x * 2.0 - 1.0, NT.y * 2.0 - 1.0, NT.z * 2.0 - 1.0));
+
+    // Two strongest layers.
+    float4 B0 = PlanetVtx_Bilinear(BioAtlas,  C, Ax, Ay);
+    float4 B1 = PlanetVtx_Bilinear(Bio2Atlas, C, Ax, Ay);
+    float W[8] = { B0.x, B0.y, B0.z, B0.w, B1.x, B1.y, B1.z, B1.w };
+    int L0 = 0;
+    for (int a = 1; a < 8; ++a) { if (W[a] > W[L0]) L0 = a; }
+    int L1 = (L0 == 0) ? 1 : 0;
+    for (int b = 0; b < 8; ++b) { if (b != L0 && W[b] > W[L1]) L1 = b; }
+    // Weights above the third strongest: a layer tied with the one after it
+    // gets weight 0, so which of the two is picked does not matter.
+    float W2 = 0.0;
+    for (int c = 0; c < 8; ++c) { if (c != L0 && c != L1) W2 = max(W2, W[c]); }
+    float LA = W[L0] - W2 + 1e-4;
+    float LB = W[L1] - W2;
+    float LW0 = LA / (LA + LB);
+    float LW1 = LB / (LA + LB);
+
+    // Outwards up axis of the instance: the same for every derived chunk of a
+    // base and within 1e-3 rad between neighbouring bases. The biplanar
+    // planes and the push direction use it rather than the atlas normal,
+    // which neighbours on two cube faces compute on different grids (a few
+    // degrees apart at the cube corners: enough to change the plane weights
+    // and open a gap). On gentle ground the pixel shader picks the same
+    // planes; on cliffs the bumps are not pushed sideways.
+    float3 Up = normalize(C.AZ);
+    if (dot(Up, Nw) < 0.0) Up = Up * -1.0;
+
+    // Planes and weights: all three (triplanar), so the weights are continuous
+    // everywhere; the pixel shader's biplanar drops the weakest plane, which
+    // jumps where all three are equal (the eight cube-corner directions) and
+    // would open a gap between neighbours there. Elsewhere the third weight
+    // is ~0 and the two agree.
+    float3 An = abs(Up);
+    float PW[3] = { pow(An.x, 8.0), pow(An.y, 8.0), pow(An.z, 8.0) };
+    float PWS = max(PW[0] + PW[1] + PW[2], 1e-6);
+
+    // World position (relative to the instance origin) -> texture coordinates.
+    float3 Wv = C.AX * V.P.x + C.AY * V.P.y + C.AZ * V.P.z;
+    float3 UVN = C.OFN + Wv / C.D0.x;
+    float3 UVM = C.OFM + Wv / C.D0.y;
+
+    // Mip whose texel matches the vertex spacing at the evaluated LOD.
+    float Spacing = C.SpacingCm * exp2(DEval);
+    float MipN = max(log2(Spacing * C.TexSize / C.D0.x), 0.0);
+    float MipM = max(log2(Spacing * C.TexSize / C.D0.y), 0.0);
+
+    float HN = 0.0, HM = 0.0;
+    for (int A = 0; A < 3; ++A)
+    {
+        float Wp = PW[A] / PWS;
+        if (Wp < 0.001) continue;
+        float Sg = (PlanetVtx_Comp(Up, A) >= 0.0) ? 1.0 : -1.0;
+        HN += PlanetVtx_Height(AH, AHSampler, UVN, A, Sg, MipN, L0, L1, LW0, LW1) * Wp;
+        HM += PlanetVtx_Height(AH, AHSampler, UVM, A, Sg, MipM, L0, L1, LW0, LW1) * Wp;
+    }
+
+    float Disp = ((HN - 0.5) * C.D0.z + (HM - 0.5) * C.D0.w) * Amp;
+    V.D = Up * Disp;
+    return V;
+}
+
+// Levels coarser at which grid vertex (x, y) is evaluated (see the header).
+float PlanetVtx_DEval(int x, int y, int dU0, int dU1, int dV0, int dV1, int Corners)
+{
+    bool bL = (x == 0), bR = (x == 64), bB = (y == 0), bT = (y == 64);
+    if ((bL || bR) && (bB || bT))
+    {
+        int c = (bR ? 1 : 0) + (bT ? 2 : 0);
+        return (float)((Corners >> (3 * c)) & 7);
+    }
+    if (bL) return (float)dU0;
+    if (bR) return (float)dU1;
+    if (bB) return (float)dV0;
+    if (bT) return (float)dV1;
+    // Interior: towards a coarser edge, blend over the last four rows.
+    float D = 0.0;
+    D = max(D, (float)dU0 * saturate(1.0 - (float)x        / 4.0));
+    D = max(D, (float)dU1 * saturate(1.0 - (float)(64 - x) / 4.0));
+    D = max(D, (float)dV0 * saturate(1.0 - (float)y        / 4.0));
+    D = max(D, (float)dV1 * saturate(1.0 - (float)(64 - y) / 4.0));
+    return D;
+}
+
+float3 PlanetTerrainWPO(float2 UV, float3 LocalPos,
+                        Texture2D PosAtlas, Texture2D NrmAtlas, Texture2D BioAtlas, Texture2D Bio2Atlas,
+                        Texture2DArray AH, SamplerState AHSampler,
+                        float3 CD0, float3 CD1, float3 CD2, float3 CD3,
+                        float3 CD4, float3 CD5, float3 CD6, float3 CD7, float3 CD8,
+                        float TimeSec, float TilesPerRow, float MorphSeconds, float4 D0)
+{
+    int TileIndex = (int)(CD0.x + 0.5);
+    int TPR = max((int)(TilesPerRow + 0.5), 1);
+
+    FPlanetVtxCtx C;
+    C.OriginX  = (TileIndex % TPR) * 65;
+    C.OriginY  = (TileIndex / TPR) * 65;
+    // Instances set up before the detail levels have no CD2: SubSize 0 -> whole tile.
+    float SubSize = (CD2.z > 0.5) ? CD2.z : 64.0;
+    C.SubX     = (CD2.z > 0.5) ? CD2.x : 0.0;
+    C.SubY     = (CD2.z > 0.5) ? CD2.y : 0.0;
+    C.Step     = SubSize / 64.0;
+    C.SpacingCm = max(CD3.y, 1.0);
+    C.AboveMin = CD3.z;
+    C.AX = CD4; C.AY = CD5; C.AZ = CD6;
+    C.OFN = CD7; C.OFM = CD8;
+    C.D0 = float4(max(D0.x, 1.0), max(D0.y, 1.0), D0.z, D0.w);
+    uint TW = 1, TH = 1, TE = 1;
+    AH.GetDimensions(TW, TH, TE);
+    C.TexSize = (float)max(TW, 1u);
+    // No world axes (instances without the 27 floats): no displacement.
+    if (dot(CD4, CD4) <= 0.0) { C.D0 = float4(C.D0.x, C.D0.y, 0.0, 0.0); }
+
+    int gx = clamp((int)round(UV.x * 64.0), 0, 64);
+    int gy = clamp((int)round(UV.y * 64.0), 0, 64);
+
+    int dU0 = clamp((int)(CD0.z + 0.5), 0, 6);
+    int dU1 = clamp((int)(CD1.x + 0.5), 0, 6);
+    int dV0 = clamp((int)(CD1.y + 0.5), 0, 6);
+    int dV1 = clamp((int)(CD1.z + 0.5), 0, 6);
+    int Corners = (int)(CD3.x + 0.5);
+
+    bool bBorder = (gx == 0) || (gx == 64) || (gy == 0) || (gy == 64);
+
+    float Morph = 0.0;
+    if (!bBorder && MorphSeconds > 0.0)
+    {
+        Morph = saturate(1.0 - (TimeSec - CD0.y) / MorphSeconds);
+    }
+
+    float3 RP = float3(0.0, 0.0, 0.0);
+    float3 RD = float3(0.0, 0.0, 0.0);
+    int Passes = (Morph > 0.0) ? 2 : 1;
+
+    for (int Pass = 0; Pass < Passes; ++Pass)
+    {
+        // Pass 0: own shape. Pass 1: parent's shape (step 2, one LOD coarser).
+        int MinStep = (Pass == 0) ? 1 : 2;
+        int sU = MinStep;
+        int sV = MinStep;
+        if (gx == 0)  { sV = max(sV, 1 << dU0); }
+        if (gx == 64) { sV = max(sV, 1 << dU1); }
+        if (gy == 0)  { sU = max(sU, 1 << dV0); }
+        if (gy == 64) { sU = max(sU, 1 << dV1); }
+
+        int x0 = gx - (gx % sU);
+        int y0 = gy - (gy % sV);
+        int x1 = min(x0 + sU, 64);
+        int y1 = min(y0 + sV, 64);
+        float fx = (float)(gx - x0) / (float)sU;
+        float fy = (float)(gy - y0) / (float)sV;
+        float PMin = (Pass == 0) ? 0.0 : 1.0;
+
+        // The mesh splits each quad along v10-v01, so the point lies in
+        // (v00, v10, v01) when fx + fy <= 1, else in (v10, v11, v01).
+        float3 P; float3 D;
+        if (fx + fy <= 1.0)
+        {
+            FPlanetVtx V00 = PlanetVtx_Eval(x0, y0, max(PlanetVtx_DEval(x0, y0, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                            PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+            P = V00.P; D = V00.D;
+            if (fx > 0.0)
+            {
+                FPlanetVtx V10 = PlanetVtx_Eval(x1, y0, max(PlanetVtx_DEval(x1, y0, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                                PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+                P = P + (V10.P - V00.P) * fx; D = D + (V10.D - V00.D) * fx;
+            }
+            if (fy > 0.0)
+            {
+                FPlanetVtx V01 = PlanetVtx_Eval(x0, y1, max(PlanetVtx_DEval(x0, y1, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                                PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+                P = P + (V01.P - V00.P) * fy; D = D + (V01.D - V00.D) * fy;
+            }
+        }
+        else
+        {
+            FPlanetVtx V11 = PlanetVtx_Eval(x1, y1, max(PlanetVtx_DEval(x1, y1, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                            PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+            FPlanetVtx V01 = PlanetVtx_Eval(x0, y1, max(PlanetVtx_DEval(x0, y1, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                            PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+            FPlanetVtx V10 = PlanetVtx_Eval(x1, y0, max(PlanetVtx_DEval(x1, y0, dU0, dU1, dV0, dV1, Corners), PMin), C,
+                                            PosAtlas, NrmAtlas, BioAtlas, Bio2Atlas, AH, AHSampler);
+            P = V11.P + (V01.P - V11.P) * (1.0 - fx) + (V10.P - V11.P) * (1.0 - fy);
+            D = V11.D + (V01.D - V11.D) * (1.0 - fx) + (V10.D - V11.D) * (1.0 - fy);
+        }
+
+        if (Pass == 0) { RP = P; RD = D; }
+        else           { RP = RP + (P - RP) * Morph; RD = RD + (D - RD) * Morph; }
+    }
+
+    float3 L = RP - LocalPos;
+    return C.AX * L.x + C.AY * L.y + C.AZ * L.z + RD;
+}

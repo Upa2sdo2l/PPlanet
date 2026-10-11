@@ -82,9 +82,12 @@ struct TileData
 // Builds the tile for Key from its halo grid (SampleChunkBatch) and the
 // erosion inputs (BuildChunkInputs). Inputs may be null: no erosion (mask 0).
 // SeaLevel: the generator's effective sea level (continent value), for Inland.
+// ExtraMarginCm widens the box on every side: room for the vertex shader's
+// texture displacement (PlanetTerrainVertex.ush), so displaced vertices stay
+// inside the instance bounds.
 void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Halo,
                const PlanetErosion::ChunkInputs* Inputs, const PlanetErosion::Params& Erosion,
-               double PlanetRadiusMetres, float SeaLevel, TileData& Out);
+               double PlanetRadiusMetres, float SeaLevel, TileData& Out, double ExtraMarginCm = 0.0);
 
 // Planet-space position (cm) of a local-space point under the tile transform.
 void LocalToPlanet(const TileData& T, const double Local[3], double OutPlanet[3]);

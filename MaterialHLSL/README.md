@@ -38,30 +38,53 @@
 
 ### World Position Offset (вершинный шейдер)
 
-1. Добавьте ноду **Custom**:
+Код вершинного шейдера лежит в `GpuErosion/Shaders/PlanetTerrainVertex.ush` и подключается
+через Include, нода только вызывает его. Он ставит вершины по атласу, сшивает края с соседями,
+делает морфинг, а у камеры ещё и «свою тесселяцию»: уровни детализации ниже MaxLOD и смещение
+вершин картами высот текстур (`README_Textures.md`, раздел 6).
+
+Сначала добавьте параметры:
+
+| Нода | Имя |
+| --- | --- |
+| Texture Object Parameter | `PlanetNormalAtlasVS` |
+| Texture Object Parameter | `PlanetBiomeAtlasVS` |
+| Texture Object Parameter | `PlanetBiomeAtlas2VS` |
+| Scalar Parameter | `DisplaceNear` (по умолчанию 10) |
+| Scalar Parameter | `DisplaceMid` (по умолчанию 40) |
+
+(Атласы в них подставляет код, текстура по умолчанию любая.)
+
+1. Нода **Custom**:
    - Output Type: **CMOT Float 3**
+   - Include File Paths: `/PlanetErosion/PlanetTerrainVertex.ush`
    - Code: всё из `PlanetTerrain_WPO.hlsl` ниже пунктирной линии
-   - Inputs — **8 штук, в этом порядке и с этими именами**:
+   - Inputs — **20 штук, в этом порядке и с этими именами**:
 
    | # | Имя входа | Что подключить |
    | --- | --- | --- |
    | 1 | `UV` | TexCoord[0] |
    | 2 | `LocalPos` | Pre-Skinned Local Position |
    | 3 | `PosAtlas` | `PlanetPosAtlas` (Texture Object Parameter) |
-   | 4 | `CD0` | PerInstanceCustomData3Vector, Data Index **0** |
-   | 5 | `CD1` | PerInstanceCustomData3Vector, Data Index **3** |
-   | 6 | `TimeSec` | Time |
-   | 7 | `TilesPerRow` | `AtlasTilesPerRow` |
-   | 8 | `MorphSeconds` | `MorphSeconds` |
+   | 4 | `NrmAtlas` | `PlanetNormalAtlasVS` |
+   | 5 | `BioAtlas` | `PlanetBiomeAtlasVS` |
+   | 6 | `Bio2Atlas` | `PlanetBiomeAtlas2VS` |
+   | 7 | `AH` | `PlanetLayersAH` (тот же, что у текстурной ноды) |
+   | 8–16 | `CD0` … `CD8` | PerInstanceCustomData3Vector, Data Index **0, 3, 6, 9, 12, 15, 18, 21, 24** |
+   | 17 | `TimeSec` | Time |
+   | 18 | `TilesPerRow` | `AtlasTilesPerRow` |
+   | 19 | `MorphSeconds` | `MorphSeconds` |
+   | 20 | `D0` | Append(`TileNear`, `TileMid`, `DisplaceNear`, `DisplaceMid`) |
 
-2. Выход Custom → **Transform Vector** (Source: **Local Space**, Destination: **World Space**) → пин **World Position Offset**.
+2. Выход Custom → сразу в пин **World Position Offset** (нода возвращает смещение в мировых
+   координатах; Transform Vector больше не нужен).
 
 ### Нормаль и цвет (пиксельный шейдер)
 
 1. Вторая нода **Custom**:
    - Output Type: **CMOT Float 2**
    - Code: всё из `PlanetTerrain_AtlasUV.hlsl` ниже пунктирной линии
-   - Inputs по порядку: `UV` (TexCoord[0]), `CD0` (PerInstanceCustomData3Vector, Data Index 0), `TilesPerRow` (`AtlasTilesPerRow`), `AtlasTexels` (`AtlasTexels`)
+   - Inputs по порядку: `UV` (TexCoord[0]), `CD0` (PerInstanceCustomData3Vector, Data Index 0), `CD2` (PerInstanceCustomData3Vector, Data Index 6), `TilesPerRow` (`AtlasTilesPerRow`), `AtlasTexels` (`AtlasTexels`)
 2. Выход → нода **Vertex Interpolator** (UV считается в вершинном шейдере, а читается в пиксельном).
 3. Выход Vertex Interpolator → вход **UVs** у `PlanetNormalAtlas` и у `PlanetBiomeAtlas`. Если редактор ругается на размерность, вставьте Component Mask (R G).
 4. Нормаль: `PlanetNormalAtlas` RGB → **× 2** → **− 1** → **Normalize** → пин **Normal**.

@@ -35,6 +35,7 @@
 #include "planet_core/PlanetLOD.h"
 #include "planet_core/PlanetStreaming.h"
 #include "planet_core/PlanetGpuTile.h"
+#include "planet_core/PlanetDetail.h"
 #include "GpuErosion/PlanetErosionGpu.h"
 #include "ProceduralPlanet.generated.h"
 
@@ -102,6 +103,39 @@ public:
     // would open sub-millimetre gaps between chunks near the player.
     UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain", meta=(ClampMin="100.0"))
     double GPUTerrainRebaseDistanceMetres = 4000.0;
+
+    // ── Detail levels near the camera ("own tessellation") ──────────────
+    // Below MaxLOD the noise runs out of float precision, so instead of new
+    // chunks the nearest shown chunks are split further into derived chunks
+    // that build nothing: they read their base chunk's tile and are pushed by
+    // the terrain textures' height maps in the material (DisplaceNear /
+    // DisplaceMid). Needs the material set up as in MaterialHLSL/README_Textures.md.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail")
+    bool bTerrainDetail = true;
+
+    // Levels below MaxLOD. 4: vertices every ~0.3 m under the camera (MaxLOD 14,
+    // R 2500 km), ~0.6 / 1.2 / 2.3 m in the rings around it.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail", meta=(ClampMin="0", ClampMax="6", EditCondition="bTerrainDetail"))
+    int32 DetailLevels = 4;
+
+    // A chunk splits while its nearest point is closer than this many times
+    // its side. Lower: fewer instances, the fine rings shrink.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail", meta=(ClampMin="0.25", ClampMax="4.0", EditCondition="bTerrainDetail"))
+    float DetailSplitDistanceFactor = 1.0f;
+
+    // Instances for derived chunks (65x65 vertices each). Fixed at BeginPlay.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail", meta=(ClampMin="0", ClampMax="1024", EditCondition="bTerrainDetail"))
+    int32 DetailMaxInstances = 128;
+
+    // Shown chunks this coarse may be split too (where the main selection ran
+    // out of budget near the camera: cube corners, fast flight).
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail", meta=(ClampMin="0", ClampMax="18", EditCondition="bTerrainDetail"))
+    int32 DetailMinBaseLOD = 12;
+
+    // Room in the chunk bounds for the displacement (half of DisplaceNear +
+    // DisplaceMid is enough). Applies to chunks built after a change.
+    UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail", meta=(ClampMin="0.0", ClampMax="20.0"))
+    double DisplacementBoundsMarginMetres = 1.0;
 
     // Gullies and ridges of the erosion filter (GPU renderer only; the
     // RealtimeMesh renderer shows the terrain without erosion).
@@ -238,7 +272,10 @@ private:
     // generator's current settings.
     void UpdateGpuShaderParams();
     void GpuShowSlot(int32 SlotIndex, bool bShow, bool bMorphIn);
+    void GpuApplySlotInstance(int32 SlotIndex);
+    void GpuFillChunkData(float* Data, const PlanetLOD::ChunkKey& Key, const PlanetLOD::ChunkKey& BaseKey, int32 BaseSlot) const;
     void GpuUpdateEdgeDeltas();
+    void GpuUpdateDetail(const FVector3d& CameraPos);
     void GpuRebaseIfNeeded(const FVector3d& CameraPos);
     FTransform GpuWorldTransform(int32 SlotIndex) const;
     void SyncSlotPresentationGpu();
@@ -276,8 +313,10 @@ private:
     struct FGpuSlot
     {
         FTransform PlanetTransform = FTransform::Identity;   // planet space, cm
-        float      CustomData[6] = {0.f, -1e6f, 0.f, 0.f, 0.f, 0.f};
+        PlanetDetail::TransformIn TileFrame{};              // the same, as axes + scale + origin (planet space)
+        float      CustomData[PlanetDetail::CUSTOM_DATA_FLOATS] = {0.f, -1e6f};
         bool       bShown = false;
+        bool       bDetailSplit = false;                     // covered by derived chunks: instance hidden
         bool       bHasCollisionMesh = false;
 
         // Erosion heights of the chunk's 65x65 vertices, read back from the
@@ -291,6 +330,22 @@ private:
 
     // Tiles committed this frame, dispatched together by GpuFlushTiles.
     PlanetErosionGpu::FTileBatch  PendingTiles;
+
+    // Detail levels (PlanetDetail): instances SlotCount .. SlotCount + DetailInstanceCount - 1.
+    struct FDetailInstance
+    {
+        PlanetLOD::ChunkKey Key;
+        int32 BaseSlot = -1;
+        float MorphStart = -1e6f;
+    };
+    TArray<FDetailInstance>           DetailInstances;      // shown this frame, in instance order
+    int32                             DetailInstanceBase = 0;
+    int32                             DetailInstanceCount = 0;
+    PlanetLOD::KeySet                 DetailPreviouslySplit;
+    bool                              bDetailDirty = true;
+    bool                              bDetailBudgetHit = false;
+    int32                             DetailSplitBases = 0;
+    float                             DetailTileNear = 300.f, DetailTileMid = 3000.f;
     PlanetErosionGpu::FShaderParams GpuShaderParams;
 
     // Where the instanced component sits, relative to the actor (cm).
@@ -377,6 +432,9 @@ private:
         // The task writing into this slot, if any. EndPlay waits on it
         // before freeing the scratch the task points at.
         TFuture<void>               Future;
+
+        // Extra room in the tile's bounds (cm) for the material's displacement.
+        double                      TileMarginCm = 0.0;
 
         // Worker-side timings of the last run, read by the game thread after
         // bDone (the release/acquire pair makes them visible).

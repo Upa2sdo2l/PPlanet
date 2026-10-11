@@ -15,6 +15,9 @@
 //
 // Hidden slots keep their instance at zero scale: the instance count never
 // changes, so instance index == slot index == atlas tile index, always.
+// After the slots come the detail instances (planet_core/PlanetDetail.h):
+// derived chunks near the camera, drawn with their base slot's transform and
+// tile (custom data 0 = tile, 6..8 = the sub-rectangle they cover).
 //
 // Instance transforms are stored by the engine in float relative to the
 // component, so the component follows the camera (GpuRebaseIfNeeded).
@@ -30,6 +33,9 @@
 #include "StaticMeshAttributes.h"
 #include "TextureResource.h"
 
+#include <unordered_map>
+#include <vector>
+
 namespace
 {
     // Material parameter names. They must match the material exactly.
@@ -40,10 +46,16 @@ namespace
     const FName PARAM_TILES_PER_ROW (TEXT("AtlasTilesPerRow"));
     const FName PARAM_ATLAS_TEXELS  (TEXT("AtlasTexels"));
     const FName PARAM_MORPH_SECONDS (TEXT("MorphSeconds"));
+    // The vertex shader reads the atlases with Load: Texture Object parameters,
+    // separate from the pixel shader's Texture Sample parameters above.
+    const FName PARAM_NORMAL_ATLAS_VS (TEXT("PlanetNormalAtlasVS"));
+    const FName PARAM_BIOME_ATLAS_VS  (TEXT("PlanetBiomeAtlasVS"));
+    const FName PARAM_BIOME_ATLAS2_VS (TEXT("PlanetBiomeAtlas2VS"));
+    const FName PARAM_TILE_NEAR       (TEXT("TileNear"));
+    const FName PARAM_TILE_MID        (TEXT("TileMid"));
 
-    // Per-instance custom data layout (the WPO node reads it as two float3):
-    //   0 atlas tile   1 morph start time (s)   2..5 edge LOD deltas U- U+ V- V+
-    constexpr int32 CUSTOM_DATA_FLOATS = 6;
+    // Per-instance custom data: layout in planet_core/PlanetDetail.h.
+    constexpr int32 CUSTOM_DATA_FLOATS = PlanetDetail::CUSTOM_DATA_FLOATS;
 
     // Atlas written by compute shaders (UAV) and sampled by the material.
     UTextureRenderTarget2D* MakeAtlasTarget(UObject* Outer, int32 Size, EPixelFormat Format,
@@ -128,6 +140,17 @@ void AProceduralPlanet::InitGpuTerrain()
     TerrainMID->SetScalarParameterValue(PARAM_TILES_PER_ROW, (float)AtlasTilesPerRow);
     TerrainMID->SetScalarParameterValue(PARAM_ATLAS_TEXELS,  (float)AtlasTexels);
     TerrainMID->SetScalarParameterValue(PARAM_MORPH_SECONDS, MorphSeconds);
+    TerrainMID->SetTextureParameterValue(PARAM_NORMAL_ATLAS_VS, NormalAtlas);
+    TerrainMID->SetTextureParameterValue(PARAM_BIOME_ATLAS_VS,  BiomeAtlas);
+    TerrainMID->SetTextureParameterValue(PARAM_BIOME_ATLAS2_VS, BiomeAtlas2);
+    // Tiling of the textures, for the displacement's texture coordinates
+    // (instance data 21..26). Missing parameters keep the defaults.
+    {
+        const float Near = TerrainMID->K2_GetScalarParameterValue(PARAM_TILE_NEAR);
+        const float Mid  = TerrainMID->K2_GetScalarParameterValue(PARAM_TILE_MID);
+        if (Near > 1.f) DetailTileNear = Near;
+        if (Mid  > 1.f) DetailTileMid  = Mid;
+    }
 
     TerrainISM = NewObject<UInstancedStaticMeshComponent>(this, TEXT("PlanetTerrainGPU"));
     TerrainISM->SetupAttachment(RootComponent);
@@ -154,10 +177,16 @@ void AProceduralPlanet::InitGpuTerrain()
     GpuTerrainOrigin = LastCameraPosUE;
     TerrainISM->SetWorldLocation(GetActorLocation() + FVector(GpuTerrainOrigin));
 
-    // One instance per slot, all hidden.
+    // One instance per slot, then the detail instances; all hidden.
+    DetailInstanceBase  = SlotCount;
+    DetailInstanceCount = bTerrainDetail ? FMath::Clamp(DetailMaxInstances, 0, 1024) : 0;
+    DetailInstances.Reset();
+    DetailPreviouslySplit.clear();
+    bDetailDirty = true;
+
     const FTransform Hidden(FQuat::Identity, GetActorLocation(), FVector::ZeroVector);
     TArray<FTransform> Instances;
-    Instances.Init(Hidden, SlotCount);
+    Instances.Init(Hidden, SlotCount + DetailInstanceCount);
     TerrainISM->AddInstances(Instances, /*bShouldReturnIndices*/ false, /*bWorldSpace*/ true);
 
     GpuSlots.SetNum(SlotCount);
@@ -166,6 +195,11 @@ void AProceduralPlanet::InitGpuTerrain()
         GpuSlots[i] = FGpuSlot();
         GpuSlots[i].CustomData[0] = (float)i;
         TerrainISM->SetCustomData(i, MakeArrayView(GpuSlots[i].CustomData, CUSTOM_DATA_FLOATS), false);
+    }
+    {
+        float Zero[CUSTOM_DATA_FLOATS] = {0.f, -1e6f};
+        for (int32 i = 0; i < DetailInstanceCount; ++i)
+            TerrainISM->SetCustomData(DetailInstanceBase + i, MakeArrayView(Zero, CUSTOM_DATA_FLOATS), false);
     }
     PendingTiles.Reset();
     TerrainISM->MarkRenderStateDirty();
@@ -177,8 +211,8 @@ void AProceduralPlanet::InitGpuTerrain()
     }
 
     bGPUTerrain = true;
-    UE_LOG(LogTemp, Log, TEXT("[Planet] GPU terrain: %d instances, atlas %dx%d (%d tiles per row)"),
-           SlotCount, AtlasTexels, AtlasTexels, AtlasTilesPerRow);
+    UE_LOG(LogTemp, Log, TEXT("[Planet] GPU terrain: %d chunk + %d detail instances, atlas %dx%d (%d tiles per row)"),
+           SlotCount, DetailInstanceCount, AtlasTexels, AtlasTexels, AtlasTilesPerRow);
 }
 
 // A 65x65 grid in the unit square, z = 0, except one vertex at z = -0.5 and
@@ -282,6 +316,14 @@ void AProceduralPlanet::GpuUploadTile(int32 SlotIndex, PlanetGpu::TileData& Tile
 
     FGpuSlot& G = GpuSlots[SlotIndex];
     G.PlanetTransform     = TileTransform(Tile);
+    for (int32 a = 0; a < 3; ++a)
+    {
+        G.TileFrame.AxisX[a] = Tile.AxisX[a];
+        G.TileFrame.AxisY[a] = Tile.AxisY[a];
+        G.TileFrame.AxisZ[a] = Tile.AxisZ[a];
+        G.TileFrame.Scale[a] = Tile.Scale[a];
+        G.TileFrame.OriginWorld[a] = Tile.Translation[a];   // planet space; the actor is added when filling
+    }
     G.Heights.Reset();
     G.bHeightsReady       = !Generator.HasErosion();   // nothing to wait for without erosion
     G.HeightsRequestFrame = FrameCounter;
@@ -376,21 +418,49 @@ void AProceduralPlanet::GpuShowSlot(int32 SlotIndex, bool bShow, bool bMorphIn)
 {
     FGpuSlot& G = GpuSlots[SlotIndex];
     G.bShown = bShow;
+    bDetailDirty = true;
 
-    if (!bShow)
+    if (bShow)
+    {
+        // Edge and corner deltas start at 0 and are set by GpuUpdateEdgeDeltas this frame.
+        const PlanetLOD::ChunkKey& Key = Scheduler.GetSlots()[SlotIndex].Key;
+        FMemory::Memzero(G.CustomData, sizeof(G.CustomData));
+        G.CustomData[0] = (float)SlotIndex;
+        G.CustomData[1] = (bMorphIn && GetWorld()) ? (float)GetWorld()->GetTimeSeconds() : -1e6f;
+        GpuFillChunkData(G.CustomData, Key, Key, SlotIndex);
+        TerrainISM->SetCustomData(SlotIndex, MakeArrayView(G.CustomData, CUSTOM_DATA_FLOATS), false);
+    }
+    GpuApplySlotInstance(SlotIndex);
+}
+
+// A slot's instance is drawn when the slot is shown and not covered by its
+// derived chunks.
+void AProceduralPlanet::GpuApplySlotInstance(int32 SlotIndex)
+{
+    const FGpuSlot& G = GpuSlots[SlotIndex];
+    if (G.bShown && !G.bDetailSplit)
+    {
+        TerrainISM->UpdateInstanceTransform(SlotIndex, GpuWorldTransform(SlotIndex), true, false, true);
+    }
+    else
     {
         const FTransform Hidden(FQuat::Identity, GetActorLocation(), FVector::ZeroVector);
         TerrainISM->UpdateInstanceTransform(SlotIndex, Hidden, /*bWorldSpace*/ true, /*bMarkRenderStateDirty*/ false, /*bTeleport*/ true);
-        return;
     }
+}
 
-    // Edge deltas start at 0 and are set by GpuUpdateEdgeDeltas this frame.
-    G.CustomData[0] = (float)SlotIndex;
-    G.CustomData[1] = (bMorphIn && GetWorld()) ? (float)GetWorld()->GetTimeSeconds() : -1e6f;
-    G.CustomData[2] = G.CustomData[3] = G.CustomData[4] = G.CustomData[5] = 0.f;
-
-    TerrainISM->UpdateInstanceTransform(SlotIndex, GpuWorldTransform(SlotIndex), true, false, true);
-    TerrainISM->SetCustomData(SlotIndex, MakeArrayView(G.CustomData, CUSTOM_DATA_FLOATS), false);
+// Instance data 6..8 and 10..26 of chunk Key drawn with BaseSlot's tile and
+// transform (Key == BaseKey for a generated chunk).
+void AProceduralPlanet::GpuFillChunkData(float* Data, const PlanetLOD::ChunkKey& Key,
+                                         const PlanetLOD::ChunkKey& BaseKey, int32 BaseSlot) const
+{
+    PlanetDetail::TransformIn T = GpuSlots[BaseSlot].TileFrame;
+    const FVector Actor = GetActorLocation();
+    T.OriginWorld[0] += Actor.X;
+    T.OriginWorld[1] += Actor.Y;
+    T.OriginWorld[2] += Actor.Z;
+    PlanetDetail::FillChunkData(Data, Key, BaseKey, T, PlanetRadiusMetres * PLANET_METRES_TO_UE_CM,
+                                FMath::Clamp(MaxLOD, 1, 18), DetailTileNear, DetailTileMid);
 }
 
 // For every shown chunk, how many levels coarser each edge neighbour is. The
@@ -421,6 +491,14 @@ void AProceduralPlanet::GpuUpdateEdgeDeltas()
                 bChanged = true;
             }
         }
+        // Corner deltas (also the diagonal neighbour): where the displacement
+        // of a shared corner is evaluated.
+        const float Corners = PlanetDetail::PackedCornerDeltas(Slots[i].Key, Shown);
+        if (G.CustomData[9] != Corners)
+        {
+            G.CustomData[9] = Corners;
+            bChanged = true;
+        }
         if (bChanged)
         {
             TerrainISM->SetCustomData(i, MakeArrayView(G.CustomData, CUSTOM_DATA_FLOATS), false);
@@ -437,10 +515,13 @@ void AProceduralPlanet::GpuRebaseIfNeeded(const FVector3d& CameraPos)
     TerrainISM->SetWorldLocation(GetActorLocation() + FVector(GpuTerrainOrigin));
 
     // Stored transforms are relative to the component: re-send them all.
-    const FTransform Hidden(FQuat::Identity, GetActorLocation(), FVector::ZeroVector);
     for (int32 i = 0; i < GpuSlots.Num(); ++i)
     {
-        TerrainISM->UpdateInstanceTransform(i, GpuSlots[i].bShown ? GpuWorldTransform(i) : Hidden, true, false, true);
+        GpuApplySlotInstance(i);
+    }
+    for (int32 i = 0; i < DetailInstances.Num(); ++i)
+    {
+        TerrainISM->UpdateInstanceTransform(DetailInstanceBase + i, GpuWorldTransform(DetailInstances[i].BaseSlot), true, false, true);
     }
     TerrainISM->MarkRenderStateDirty();
 }
@@ -510,4 +591,135 @@ void AProceduralPlanet::SyncSlotPresentationGpu()
         if (CollisionChanges[c].bOn) LaunchCollisionMeshJob(CollisionChanges[c].SlotIndex);
         else                         RemoveCollisionMesh(CollisionChanges[c].SlotIndex);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Detail levels: derived chunks near the camera (planet_core/PlanetDetail.h).
+// Runs every frame after the presentation sync; the selection is cheap (tens
+// of nodes) and instances are only touched when it changes.
+// ─────────────────────────────────────────────────────────────────────────────
+void AProceduralPlanet::GpuUpdateDetail(const FVector3d& CameraPos)
+{
+    if (!bGPUTerrain || !TerrainISM) return;
+
+    const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+    const int32 Count = FMath::Min((int32)Slots.size(), GpuSlots.Num());
+
+    PlanetLOD::KeySet GenShown;
+    GenShown.reserve(Count * 2);
+    std::vector<PlanetDetail::Base> Bases;
+    for (int32 i = 0; i < Count; ++i)
+    {
+        if (!GpuSlots[i].bShown) continue;
+        GenShown.insert(Slots[i].Key);
+        Bases.push_back({Slots[i].Key, i});
+    }
+
+    PlanetDetail::Params P;
+    P.BaseLOD             = FMath::Clamp(MaxLOD, 1, 18);
+    P.Levels              = (bTerrainDetail && DetailInstanceCount > 0) ? FMath::Clamp(DetailLevels, 0, 6) : 0;
+    P.MinBaseLOD          = DetailMinBaseLOD;
+    P.SplitDistanceFactor = DetailSplitDistanceFactor;
+    P.MaxInstances        = DetailInstanceCount;
+    P.CameraPos           = PlanetLOD::Vec3d{CameraPos.X, CameraPos.Y, CameraPos.Z};
+    P.PlanetRadiusCm      = PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
+    P.SurfaceOffsetCm     = CameraTerrainHeightM * PLANET_METRES_TO_UE_CM;
+    P.PreviouslySplit     = &DetailPreviouslySplit;
+    P.GeneratedShown      = &GenShown;
+
+    PlanetDetail::Result R;
+    PlanetDetail::Select(P, Bases, R);
+    DetailPreviouslySplit = R.SplitNodes;
+    bDetailBudgetHit = R.bBudgetHit;
+
+    TArray<uint8, TInlineAllocator<64>> WantSplit;
+    WantSplit.Init(0, Count);
+    for (size_t b = 0; b < Bases.size(); ++b)
+        if (R.BaseSplit[b]) WantSplit[Bases[b].Slot] = 1;
+
+    // Anything to do?
+    bool bChanged = bDetailDirty || (int32)R.Leaves.size() != DetailInstances.Num();
+    for (int32 i = 0; !bChanged && i < DetailInstances.Num(); ++i)
+    {
+        const PlanetDetail::Leaf& L = R.Leaves[i];
+        bChanged = L.Key != DetailInstances[i].Key || Bases[L.BaseIndex].Slot != DetailInstances[i].BaseSlot;
+    }
+    for (int32 s = 0; !bChanged && s < Count; ++s)
+        bChanged = GpuSlots[s].bDetailSplit != (WantSplit[s] != 0);
+    if (!bChanged) return;
+    bDetailDirty = false;
+
+    // What was drawn until now: keeps running morphs, and starts one for a
+    // chunk whose parent was drawn (it appeared by a split).
+    std::unordered_map<PlanetLOD::ChunkKey, float, PlanetLOD::KeyHashFn> PrevMorph;
+    PlanetLOD::KeySet PrevDrawn;
+    for (const FDetailInstance& D : DetailInstances) { PrevMorph[D.Key] = D.MorphStart; PrevDrawn.insert(D.Key); }
+    for (int32 s = 0; s < Count; ++s)
+        if (GpuSlots[s].bShown && !GpuSlots[s].bDetailSplit) PrevDrawn.insert(Slots[s].Key);
+
+    // Hide split bases, show the ones that merged back.
+    DetailSplitBases = 0;
+    for (int32 s = 0; s < Count; ++s)
+    {
+        const bool bSplit = WantSplit[s] != 0;
+        DetailSplitBases += bSplit ? 1 : 0;
+        if (GpuSlots[s].bDetailSplit != bSplit)
+        {
+            GpuSlots[s].bDetailSplit = bSplit;
+            GpuApplySlotInstance(s);
+        }
+    }
+
+    // Everything drawn from now on: edge and corner deltas of derived chunks.
+    PlanetLOD::KeySet Drawn;
+    Drawn.reserve(Count + R.Leaves.size());
+    for (int32 s = 0; s < Count; ++s)
+        if (GpuSlots[s].bShown && !GpuSlots[s].bDetailSplit) Drawn.insert(Slots[s].Key);
+    for (const PlanetDetail::Leaf& L : R.Leaves) Drawn.insert(L.Key);
+
+    const float Now = GetWorld() ? (float)GetWorld()->GetTimeSeconds() : 0.f;
+    const int32 PrevNum = DetailInstances.Num();
+    DetailInstances.SetNum((int32)R.Leaves.size());
+
+    float Data[CUSTOM_DATA_FLOATS];
+    for (int32 i = 0; i < (int32)R.Leaves.size(); ++i)
+    {
+        const PlanetDetail::Leaf& L = R.Leaves[i];
+        const int32 BaseSlot = Bases[L.BaseIndex].Slot;
+        const PlanetLOD::ChunkKey& BaseKey = Bases[L.BaseIndex].Key;
+
+        float Morph = -1e6f;
+        const auto It = PrevMorph.find(L.Key);
+        if (It != PrevMorph.end())
+        {
+            Morph = It->second;
+        }
+        else if (MorphSeconds > 0.f && L.Key.LOD > 0)
+        {
+            const PlanetLOD::ChunkKey Parent{L.Key.Face, (uint8_t)(L.Key.LOD - 1), L.Key.X >> 1, L.Key.Y >> 1};
+            if (PrevDrawn.count(Parent)) Morph = Now;
+        }
+        DetailInstances[i].Key        = L.Key;
+        DetailInstances[i].BaseSlot   = BaseSlot;
+        DetailInstances[i].MorphStart = Morph;
+
+        FMemory::Memzero(Data, sizeof(Data));
+        Data[0] = (float)BaseSlot;
+        Data[1] = Morph;
+        for (int32 Side = 0; Side < 4; ++Side)
+            Data[2 + Side] = (float)FMath::Min(PlanetLOD::CoarserNeighbourLevels(L.Key, Side, Drawn), 6);
+        Data[9] = PlanetDetail::PackedCornerDeltas(L.Key, Drawn);
+        GpuFillChunkData(Data, L.Key, BaseKey, BaseSlot);
+
+        const int32 Inst = DetailInstanceBase + i;
+        TerrainISM->UpdateInstanceTransform(Inst, GpuWorldTransform(BaseSlot), true, false, true);
+        TerrainISM->SetCustomData(Inst, MakeArrayView(Data, CUSTOM_DATA_FLOATS), false);
+    }
+
+    const FTransform Hidden(FQuat::Identity, GetActorLocation(), FVector::ZeroVector);
+    for (int32 i = (int32)R.Leaves.size(); i < PrevNum; ++i)
+    {
+        TerrainISM->UpdateInstanceTransform(DetailInstanceBase + i, Hidden, true, false, true);
+    }
+    TerrainISM->MarkRenderStateDirty();
 }

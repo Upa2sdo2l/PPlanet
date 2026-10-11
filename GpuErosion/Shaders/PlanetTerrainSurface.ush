@@ -13,7 +13,15 @@
 //     needed on a sphere, no stretching on cliffs;
 //   * two tiling scales: Mid everywhere, Near blended in close to the camera,
 //     plus a Macro sample that breaks visible repetition;
-//   * parallax occlusion on the near scale (dominant plane, strongest layer);
+//   * relief WITHOUT moving the texture (parallax was dropped: it shifts the
+//     texture with the view and reads as sliding):
+//       - cavity: low points of the height map are darker (less sky reaches
+//         them), in AO and, partly, in the albedo so it shows in sunlight too;
+//       - micro-shadows: each texel looks towards the sun across the height
+//         map; a higher texel on the way shadows it. Depends on the sun, not
+//         the camera, so it is stable when the view moves;
+//     the real geometry of the bumps near the camera comes from the vertex
+//     shader (PlanetTerrainVertex.ush);
 //   * beyond FarStart the textures fade into the flat layer colours, so from
 //     orbit the planet shows clean biome colours and the relief from the atlas
 //     normals. Past FarEnd no texture is sampled at all.
@@ -68,24 +76,50 @@ float2 PlanetSurf_HeightMix(float Wa, float Ha, float Wb, float Hb)
     return float2(Ba, Bb) / max(Ba + Bb, 1e-4);
 }
 
+// Micro-shadow of one texel: 0 lit .. 1 shadowed.
+// The height map is a relief Depth tile units deep whose top is the surface.
+// From the texel the ray goes towards the sun: along the texture plane by
+// LT per unit of length, up by LdotN (both in tile units). A texel of height
+// h at ray length t sticks out by (h - H0) - t * LdotN / Depth (in height-map
+// units) above the ray; the largest such amount (far ones weighted down),
+// sharpened, is the shadow.
+// Beyond TMax the ray is above the highest possible texel.
+float PlanetSurf_MicroShadow(Texture2DArray Tex, SamplerState S, float2 UV, float2 DX, float2 DY,
+                             float Slice, float H0, float2 LT, float LdotN, float Depth, int Steps)
+{
+    float TMax = min((1.0 - H0) * Depth / max(LdotN, 0.02), 0.5);
+    float Rise = LdotN / max(Depth, 1e-4);
+    float Occ  = 0.0;
+    for (int i = 1; i <= 16; ++i)
+    {
+        if (i > Steps) break;
+        float T = TMax * (float)i / (float)Steps;
+        float H = PlanetSurf_Sample(Tex, S, UV + LT * T, DX, DY, Slice).a;
+        // Far occluders count less: a soft penumbra, and no dotted tails
+        // where the step skips over small stones.
+        Occ = max(Occ, (H - H0 - T * Rise) * (1.0 - 0.75 * (float)i / (float)Steps));
+    }
+    return saturate(Occ * 6.0);
+}
+
 // W0, W1   layer weights (PlanetBiomeAtlas, PlanetBiomeAtlas2)
 // N        world normal from PlanetNormalAtlas (any length)
 // RelPos   camera-relative world position, cm (distance and screen derivatives)
-// CamVec   unit vector from the pixel to the camera (Parameters.CameraVector)
 // UV*      Frac(absolute world position / tile size) for the three scales
 // AH, NRA  Texture2DArrays, 8 slices: albedo + height | normal XY, roughness, AO
 // Col      the eight layer colours (far distance)
 // P0       TileNear, TileMid, TileMacro (cm), NearEnd (cm)
-// P1       FarStart, FarEnd (cm), ParallaxDepth, ParallaxSteps
-FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, float3 CamVec,
+// P1       FarStart, FarEnd (cm), ReliefDepth (height map depth, tile units), ShadowSteps
+// P2       CavityStrength 0..1, MicroShadowStrength 0..1, unused, unused
+// SunDir   direction TOWARDS the sun, world (SkyAtmosphereLightDirection); 0 = no micro-shadows
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                                 float3 UVNear, float3 UVMid, float3 UVMacro,
                                 Texture2DArray AH, SamplerState AHSampler,
                                 Texture2DArray NRA, SamplerState NRASampler,
                                 float3 C0, float3 C1, float3 C2, float3 C3,
                                 float3 C4, float3 C5, float3 C6, float3 C7,
-                                float4 P0, float4 P1)
+                                float4 P0, float4 P1, float4 P2, float3 SunDir)
 {
-
     // ── Layer weights: the two strongest, renormalised ─────────────────────────
     float W[8] = { W0.x, W0.y, W0.z, W0.w, W1.x, W1.y, W1.z, W1.w };
     float3 Col[8] = { C0, C1, C2, C3, C4, C5, C6, C7 };
@@ -147,70 +181,12 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
         int   Axis[2] = { MA, ME };
         float Sgn[2]  = { sign(Nw[MA] + 1e-6), sign(Nw[ME] + 1e-6) };
 
-        // ── Parallax (strongest layer, marched on the dominant plane) ──────────
-        // The view ray is marched below the TRUE surface (normal Nw) and its
-        // path projected onto the texture plane, so the depth runs towards the
-        // planet's centre at any latitude. The hit is turned into a 3D offset
-        // (PomD, cm) that shifts BOTH projection planes and BOTH tiling scales
-        // alike: shifting only one of them leaves a static second image under
-        // the moving one, which reads as "swimming" when the view changes.
-        // The depth must not depend on the view angle: scaling it as the camera
-        // turns moves every texel and reads as the texture sliding. So the
-        // only angle fade is a narrow one at extreme grazing angles (streaks),
-        // steps grow as the view gets flatter, and the last two steps are
-        // refined linearly (no stair-step layers). With distance it fades out
-        // between NearEnd/2 and NearEnd.
-        float3 PomD = float3(0.0, 0.0, 0.0);
-        {
-            float3 V       = normalize(CamVec);                      // towards the camera
-            float  NdotV   = dot(V, Nw);
-            float  PomFade = NearT * smoothstep(0.04, 0.12, NdotV);
-            if (PomFade > 0.0 && P1.z > 0.0)
-            {
-                float2 Flip = float2(Sgn[0], 1.0);
-                float2 UV = PlanetSurf_Plane(UVNear, MA) * Flip;
-                float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.x * Flip;
-                float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * Flip;
-
-                // Ray length (in TileNear units) to reach the full depth P1.z.
-                float  RayLen = P1.z / max(NdotV, 0.12);
-                float2 MaxOffset = PlanetSurf_Plane(V, MA) * Flip * RayLen;
-                // More steps at grazing angles, fewer with distance.
-                float  StepsF = lerp(max(P1.w * 2.0, 2.0), max(P1.w * 0.5, 2.0), saturate(NdotV))
-                              * lerp(1.0, 0.5, saturate(Dist / max(P0.w, 1.0)));
-                int    Steps = clamp((int)(StepsF + 0.5), 2, 32);
-                float  LayerDepth = 1.0 / (float)Steps;
-                float2 Delta = MaxOffset * LayerDepth;
-
-                float2 CUV = UV;
-                float  Depth = 0.0;
-                float  MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
-                float  PrevMapDepth = MapDepth;
-                for (int s = 0; s < 32; ++s)
-                {
-                    if (s >= Steps || Depth >= MapDepth) break;
-                    PrevMapDepth = MapDepth;
-                    CUV -= Delta;
-                    Depth += LayerDepth;
-                    MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
-                }
-                // Intersection between the last two samples (linear).
-                float After  = MapDepth - Depth;                       // <= 0 after a hit
-                float Before = PrevMapDepth - (Depth - LayerDepth);    // >= 0
-                float Denom  = After - Before;
-                float T = (Denom < -1e-5) ? saturate(After / Denom) : 0.0;
-                float DepthHit = max(Depth - T * LayerDepth, 0.0);
-
-                // The same hit as a world-space offset, cm.
-                PomD = -V * (DepthHit * RayLen * P0.x * PomFade);
-            }
-        }
-
         // ── Sample both layers on both planes at the Mid (and Near) scale ───────
         float3 Alb = float3(0.0, 0.0, 0.0);
         float3 Nrm = float3(0.0, 0.0, 0.0);
         float  Rgh = 0.0;
         float  Occ = 0.0;
+        float  Hgt = 0.0;     // height-mixed height map value, for the cavity
 
         for (int p = 0; p < 2; ++p)
         {
@@ -223,6 +199,7 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
             float3 PTN  = float3(0.0, 0.0, 0.0);
             float  PRgh = 0.0;
             float  POcc = 0.0;
+            float  PHgt = 0.0;
             for (int sc = 0; sc < 2; ++sc)
             {
                 float ScaleW = (sc == 0) ? 1.0 - NearT : NearT;
@@ -231,7 +208,6 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
                 float2 UV   = PlanetSurf_Plane((sc == 0) ? UVMid : UVNear, A) * SFlip;
                 float2 DX = PlanetSurf_Plane(RelDX, A) / Tile * SFlip;
                 float2 DY = PlanetSurf_Plane(RelDY, A) / Tile * SFlip;
-                UV += PlanetSurf_Plane(PomD, A) * SFlip / Tile;
 
                 float4 A0 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L0);
                 float4 A1 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L1);
@@ -245,12 +221,14 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
                 PTN  += (T0 * HM.x + T1 * HM.y) * ScaleW;
                 PRgh += (N0.b * HM.x + N1.b * HM.y) * ScaleW;
                 POcc += (N0.a * HM.x + N1.a * HM.y) * ScaleW;
+                PHgt += (A0.a * HM.x + A1.a * HM.y) * ScaleW;
             }
             float3 TN = normalize(float3(PTN.x * Sgn[p] * NStr, PTN.y * NStr, max(PTN.z, 1e-3)));
             Alb += PAlb * PW[p];
             Nrm += PlanetSurf_ToWorld(TN, Nw, A) * PW[p];
             Rgh += PRgh * PW[p];
             Occ += POcc * PW[p];
+            Hgt += PHgt * PW[p];
         }
 
         // ── Macro variation: large-scale brightness of the strongest layer ──────
@@ -263,6 +241,46 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
             Alb *= lerp(1.0, clamp(Ratio, 0.6, 1.4), 0.5);
         }
 
+        // ── Cavity: low points darker. Mostly in AO (sky light), a little in the
+        //    albedo, since UE's material AO does not touch direct sunlight. ─────
+        float Cavity = lerp(1.0, 0.35 + 0.65 * smoothstep(0.0, 0.65, Hgt), saturate(P2.x));
+        Occ *= Cavity;
+        Alb *= lerp(1.0, Cavity, 0.5);
+
+        // ── Micro-shadows towards the sun (dominant plane, strongest layer). ────
+        //    Near scale within NearEnd, Mid scale out to FarStart / 2; the two
+        //    are blended like the albedo. Skipped when the sun is under the
+        //    local horizon (no direct light to block) or not provided.
+        float SunLen = length(SunDir);
+        float Shadow = 0.0;
+        if (P2.y > 0.0 && P1.z > 0.0 && SunLen > 0.5)
+        {
+            float3 L     = SunDir / SunLen;
+            float  LdotN = dot(L, Nw);
+            int    Steps = clamp((int)(P1.w + 0.5), 1, 16);
+            float  SunFade = smoothstep(0.0, 0.08, LdotN);     // no shadows from a sun at the horizon
+            float2 Flip  = float2(Sgn[0], 1.0);
+            float2 LT    = PlanetSurf_Plane(L, MA) * Flip;
+            float  MidW  = (1.0 - NearT) * (1.0 - smoothstep(P1.x * 0.25, P1.x * 0.5, Dist));
+            if (SunFade > 0.0)
+            {
+                for (int sc = 0; sc < 2; ++sc)
+                {
+                    float ScaleW = (sc == 0) ? MidW : NearT;
+                    if (ScaleW < 0.001) continue;
+                    float  Tile = (sc == 0) ? P0.y : P0.x;
+                    float2 UV   = PlanetSurf_Plane((sc == 0) ? UVMid : UVNear, MA) * Flip;
+                    float2 DX = PlanetSurf_Plane(RelDX, MA) / Tile * Flip;
+                    float2 DY = PlanetSurf_Plane(RelDY, MA) / Tile * Flip;
+                    float  H0 = PlanetSurf_Sample(AH, AHSampler, UV, DX, DY, (float)L0).a;
+                    Shadow += PlanetSurf_MicroShadow(AH, AHSampler, UV, DX, DY, (float)L0, H0,
+                                                     LT, LdotN, P1.z, Steps) * ScaleW;
+                }
+                Shadow *= SunFade * PW[0];
+            }
+        }
+        Alb *= 1.0 - saturate(P2.y) * Shadow;
+
         Colour        = lerp(Alb, FarColour, FarT);
         Out.Normal    = normalize(lerp(normalize(Nrm), Nw, FarT));
         Out.Roughness = lerp(Rgh, 0.85, FarT);
@@ -272,8 +290,21 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
     return Out;
 }
 
-// Old call without the camera vector (materials set up before the parallax
-// fix): the view direction comes from the camera-relative position instead.
+// Older Code fields (materials set up before micro-shadows): no cavity
+// strength, no sun. They still compile; set up the new call to get both.
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, float3 CamVec,
+                                float3 UVNear, float3 UVMid, float3 UVMacro,
+                                Texture2DArray AH, SamplerState AHSampler,
+                                Texture2DArray NRA, SamplerState NRASampler,
+                                float3 C0, float3 C1, float3 C2, float3 C3,
+                                float3 C4, float3 C5, float3 C6, float3 C7,
+                                float4 P0, float4 P1)
+{
+    return PlanetSurface(W0, W1, N, RelPos, UVNear, UVMid, UVMacro, AH, AHSampler, NRA, NRASampler,
+                         C0, C1, C2, C3, C4, C5, C6, C7, P0, float4(P1.x, P1.y, 0.0, 0.0),
+                         float4(0.5, 0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0));
+}
+
 FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                                 float3 UVNear, float3 UVMid, float3 UVMacro,
                                 Texture2DArray AH, SamplerState AHSampler,
@@ -282,7 +313,7 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                                 float3 C4, float3 C5, float3 C6, float3 C7,
                                 float4 P0, float4 P1)
 {
-    return PlanetSurface(W0, W1, N, RelPos, -RelPos, UVNear, UVMid, UVMacro,
-                         AH, AHSampler, NRA, NRASampler,
-                         C0, C1, C2, C3, C4, C5, C6, C7, P0, P1);
+    return PlanetSurface(W0, W1, N, RelPos, UVNear, UVMid, UVMacro, AH, AHSampler, NRA, NRASampler,
+                         C0, C1, C2, C3, C4, C5, C6, C7, P0, float4(P1.x, P1.y, 0.0, 0.0),
+                         float4(0.5, 0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0));
 }

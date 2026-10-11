@@ -23,12 +23,16 @@
 //     OutNormal     CMOT Float 3  -> Normal
 //     OutRoughness  CMOT Float 1  -> Roughness
 //     OutAO         CMOT Float 1  -> Ambient Occlusion
+// Parameters.CameraVector is UE's own per-pixel direction to the camera (no
+// extra input needed). After updating PlanetTerrainSurface.ush, change the
+// version comment at the end of the code to force a recompile.
 // Paste everything below the dashed line into the node's Code field.
 // -----------------------------------------------------------------------------
-FPlanetSurfaceOut S = PlanetSurface(W0, W1, N, RelPos, UVNear, UVMid, UVMacro,
+FPlanetSurfaceOut S = PlanetSurface(W0, W1, N, RelPos, Parameters.CameraVector, UVNear, UVMid, UVMacro,
                                     AH, AHSampler, NRA, NRASampler,
                                     C0, C1, C2, C3, C4, C5, C6, C7, P0, P1);
 OutNormal    = S.Normal;
 OutRoughness = S.Roughness;
 OutAO        = S.AO;
 return S.Color;
+// v4

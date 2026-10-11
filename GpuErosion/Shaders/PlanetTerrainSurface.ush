@@ -70,13 +70,14 @@ float2 PlanetSurf_HeightMix(float Wa, float Ha, float Wb, float Hb)
 
 // W0, W1   layer weights (PlanetBiomeAtlas, PlanetBiomeAtlas2)
 // N        world normal from PlanetNormalAtlas (any length)
-// RelPos   camera-relative world position, cm
+// RelPos   camera-relative world position, cm (distance and screen derivatives)
+// CamVec   unit vector from the pixel to the camera (Parameters.CameraVector)
 // UV*      Frac(absolute world position / tile size) for the three scales
 // AH, NRA  Texture2DArrays, 8 slices: albedo + height | normal XY, roughness, AO
 // Col      the eight layer colours (far distance)
 // P0       TileNear, TileMid, TileMacro (cm), NearEnd (cm)
 // P1       FarStart, FarEnd (cm), ParallaxDepth, ParallaxSteps
-FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, float3 CamVec,
                                 float3 UVNear, float3 UVMid, float3 UVMacro,
                                 Texture2DArray AH, SamplerState AHSampler,
                                 Texture2DArray NRA, SamplerState NRASampler,
@@ -146,17 +147,20 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
         int   Axis[2] = { MA, ME };
         float Sgn[2]  = { sign(Nw[MA] + 1e-6), sign(Nw[ME] + 1e-6) };
 
-        // ── Parallax offset (near scale, dominant plane, strongest layer) ───────
+        // ── Parallax (strongest layer, marched on the dominant plane) ──────────
         // The view ray is marched below the TRUE surface (normal Nw) and its
-        // path projected onto the texture plane, so the offset is right for any
-        // tilt between the surface and the projection plane. At grazing angles
-        // parallax breaks into streaks whatever the step count, so it fades out
-        // there (and with distance); the last two steps are refined linearly,
-        // which removes the visible stair-step layers.
-        float2 PomOffset = float2(0.0, 0.0);
+        // path projected onto the texture plane, so the depth runs towards the
+        // planet's centre at any latitude. The hit is turned into a 3D offset
+        // (PomD, cm) that shifts BOTH projection planes and BOTH tiling scales
+        // alike: shifting only one of them leaves a static second image under
+        // the moving one, which reads as "swimming" when the view changes.
+        // Parallax fades out at grazing angles (it breaks into streaks there
+        // whatever the step count) and with distance; the last two steps are
+        // refined linearly (no stair-step layers).
+        float3 PomD = float3(0.0, 0.0, 0.0);
         {
-            float3 V      = -RelPos / max(Dist, 1e-3);             // towards the camera
-            float  NdotV  = dot(V, Nw);
+            float3 V       = normalize(CamVec);                      // towards the camera
+            float  NdotV   = dot(V, Nw);
             float  PomFade = NearT * smoothstep(0.12, 0.35, NdotV);
             if (PomFade > 0.0 && P1.z > 0.0)
             {
@@ -165,8 +169,9 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 float2 DX = PlanetSurf_Plane(RelDX, MA) / P0.x * Flip;
                 float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * Flip;
 
-                // Full depth (P1.z, in tile units) reached after this UV shift.
-                float2 MaxOffset = PlanetSurf_Plane(V, MA) * Flip / max(NdotV, 0.25) * P1.z;
+                // Ray length (in TileNear units) to reach the full depth P1.z.
+                float  RayLen = P1.z / max(NdotV, 0.25);
+                float2 MaxOffset = PlanetSurf_Plane(V, MA) * Flip * RayLen;
                 // More steps at grazing angles, fewer with distance.
                 float  StepsF = lerp(max(P1.w, 2.0), max(P1.w * 0.5, 2.0), saturate(NdotV))
                               * lerp(1.0, 0.5, saturate(Dist / max(P0.w, 1.0)));
@@ -174,14 +179,13 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 float  LayerDepth = 1.0 / (float)Steps;
                 float2 Delta = MaxOffset * LayerDepth;
 
-                float2 CUV = UV, PrevUV = UV;
+                float2 CUV = UV;
                 float  Depth = 0.0;
                 float  MapDepth = 1.0 - PlanetSurf_Sample(AH, AHSampler, CUV, DX, DY, (float)L0).a;
                 float  PrevMapDepth = MapDepth;
                 for (int s = 0; s < 32; ++s)
                 {
                     if (s >= Steps || Depth >= MapDepth) break;
-                    PrevUV = CUV;
                     PrevMapDepth = MapDepth;
                     CUV -= Delta;
                     Depth += LayerDepth;
@@ -192,9 +196,10 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 float Before = PrevMapDepth - (Depth - LayerDepth);    // >= 0
                 float Denom  = After - Before;
                 float T = (Denom < -1e-5) ? saturate(After / Denom) : 0.0;
-                CUV = lerp(CUV, PrevUV, T);
+                float DepthHit = max(Depth - T * LayerDepth, 0.0);
 
-                PomOffset = (CUV - UV) * PomFade;
+                // The same hit as a world-space offset, cm.
+                PomD = -V * (DepthHit * RayLen * P0.x * PomFade);
             }
         }
 
@@ -223,7 +228,7 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
                 float2 UV   = PlanetSurf_Plane((sc == 0) ? UVMid : UVNear, A) * SFlip;
                 float2 DX = PlanetSurf_Plane(RelDX, A) / Tile * SFlip;
                 float2 DY = PlanetSurf_Plane(RelDY, A) / Tile * SFlip;
-                if (sc == 1 && p == 0) UV += PomOffset;
+                UV += PlanetSurf_Plane(PomD, A) * SFlip / Tile;
 
                 float4 A0 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L0);
                 float4 A1 = PlanetSurf_Sample(AH,  AHSampler,  UV, DX, DY, (float)L1);
@@ -262,4 +267,19 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
     }
     Out.Color = Colour;
     return Out;
+}
+
+// Old call without the camera vector (materials set up before the parallax
+// fix): the view direction comes from the camera-relative position instead.
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
+                                float3 UVNear, float3 UVMid, float3 UVMacro,
+                                Texture2DArray AH, SamplerState AHSampler,
+                                Texture2DArray NRA, SamplerState NRASampler,
+                                float3 C0, float3 C1, float3 C2, float3 C3,
+                                float3 C4, float3 C5, float3 C6, float3 C7,
+                                float4 P0, float4 P1)
+{
+    return PlanetSurface(W0, W1, N, RelPos, -RelPos, UVNear, UVMid, UVMacro,
+                         AH, AHSampler, NRA, NRASampler,
+                         C0, C1, C2, C3, C4, C5, C6, C7, P0, P1);
 }

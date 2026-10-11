@@ -154,14 +154,17 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
         // (PomD, cm) that shifts BOTH projection planes and BOTH tiling scales
         // alike: shifting only one of them leaves a static second image under
         // the moving one, which reads as "swimming" when the view changes.
-        // Parallax fades out at grazing angles (it breaks into streaks there
-        // whatever the step count) and with distance; the last two steps are
-        // refined linearly (no stair-step layers).
+        // The depth must not depend on the view angle: scaling it as the camera
+        // turns moves every texel and reads as the texture sliding. So the
+        // only angle fade is a narrow one at extreme grazing angles (streaks),
+        // steps grow as the view gets flatter, and the last two steps are
+        // refined linearly (no stair-step layers). With distance it fades out
+        // between NearEnd/2 and NearEnd.
         float3 PomD = float3(0.0, 0.0, 0.0);
         {
             float3 V       = normalize(CamVec);                      // towards the camera
             float  NdotV   = dot(V, Nw);
-            float  PomFade = NearT * smoothstep(0.12, 0.35, NdotV);
+            float  PomFade = NearT * smoothstep(0.04, 0.12, NdotV);
             if (PomFade > 0.0 && P1.z > 0.0)
             {
                 float2 Flip = float2(Sgn[0], 1.0);
@@ -170,10 +173,10 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos, f
                 float2 DY = PlanetSurf_Plane(RelDY, MA) / P0.x * Flip;
 
                 // Ray length (in TileNear units) to reach the full depth P1.z.
-                float  RayLen = P1.z / max(NdotV, 0.25);
+                float  RayLen = P1.z / max(NdotV, 0.12);
                 float2 MaxOffset = PlanetSurf_Plane(V, MA) * Flip * RayLen;
                 // More steps at grazing angles, fewer with distance.
-                float  StepsF = lerp(max(P1.w, 2.0), max(P1.w * 0.5, 2.0), saturate(NdotV))
+                float  StepsF = lerp(max(P1.w * 2.0, 2.0), max(P1.w * 0.5, 2.0), saturate(NdotV))
                               * lerp(1.0, 0.5, saturate(Dist / max(P0.w, 1.0)));
                 int    Steps = clamp((int)(StepsF + 0.5), 2, 32);
                 float  LayerDepth = 1.0 / (float)Steps;

@@ -124,6 +124,25 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.MasterSeed          = P.MasterSeed;
     C.NoiseSwapYZ         = P.bNoiseLabOrientation;
 
+    // ── Tectonic terrain ────────────────────────────────────────────────
+    C.bTectonics                      = P.bTectonicTerrain;
+    C.Tectonics.ContinentalPlates     = P.ContinentalPlates;
+    C.Tectonics.TotalPlates           = P.ContinentalPlates + P.OceanicPlates;
+    C.Tectonics.BoundaryWarp          = P.PlateBoundaryWarp;
+    C.Tectonics.InteriorHeight        = P.InteriorHeightMetres;
+    C.Tectonics.UpliftHeight          = P.UpliftHeightMetres;
+    C.Tectonics.HillsHeight           = P.HillsHeightMetres;
+    C.Tectonics.RangeHeight           = P.RangeHeightMetres;
+    C.Tectonics.RangeWidthMetres      = P.RangeWidthKm * 1000.f;
+    C.Tectonics.CoastalRangeOffsetMetres = P.CoastalRangeInlandKm * 1000.f;
+    C.Tectonics.PlateauHeight         = P.PlateauHeightMetres;
+    C.Tectonics.ShelfDepth            = P.ShelfDepthMetres;
+    C.Tectonics.AbyssDepth            = P.AbyssDepthMetres;
+    C.Tectonics.TrenchDepth           = P.TrenchDepthMetres;
+    C.Tectonics.RidgeHeight           = P.RidgeHeightMetres;
+    // DEFAULT (lab-tuned): LandScale auto, LowlandHeight, RiftDepth,
+    // OldRangeShare, ShelfWidth, SlopeWidth, Detail* amplitudes.
+
     // ── DEFAULT: not exposed as sliders yet ─────────────────────────────
     C.ContinentOctaves    = P.ContinentOctaves;
     C.ContinentGain       = P.ContinentGain;
@@ -151,6 +170,7 @@ inline PlanetErosion::Params ToCoreErosion(const FPlanetErosionSettings& S)
     P.HeightOffset         = S.HeightOffset;
     P.GradientStepFraction = S.GradientStepFraction;
     P.Seed                 = (uint32_t)S.Seed;
+    P.CrestSoftness        = S.CrestSoftness;
     return P;
 }
 

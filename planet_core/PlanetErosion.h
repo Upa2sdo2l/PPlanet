@@ -48,6 +48,10 @@ struct Params
     double Lacunarity      = 2.0;
     double Gain            = 0.5;
     double HeightOffset    = -0.5;    // -1 only lowers, +1 only raises (times the total magnitude)
+    // Slope (m/m) of the low-pass gradient below which gullies fade out:
+    // keeps crests clean (no comb of teeth where the gullies of the two
+    // sides meet). 0 = the original filter; 0.3 rounds the summits.
+    double CrestSoftness   = 0.15;
     uint32_t Seed          = 0;
 
     // Step of the central difference that gives the steering gradient, as a
@@ -72,7 +76,7 @@ struct Result
 //            difference with step Prm.GradientStepMetres() of the base layers
 //            (continent + mountains, no detail). See BuildChunkInputs.
 // FadeTarget -1 in valleys .. +1 on peaks of the input terrain
-// Mask       0..1 multiplier of the whole effect (land mask)
+// Mask       0..1 multiplier of the whole effect (Surface::ErosionMask)
 //
 // Every octave is always evaluated, at every LOD: the height at a point must
 // not depend on the chunk that samples it, or chunks of different LOD would

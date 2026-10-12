@@ -45,11 +45,11 @@ struct Params
 {
     double EquatorTempC     = 28.0;   // sea level, equator
     double PoleTempC        = -28.0;  // sea level, poles
-    // Degrees per km of altitude. Earth is ~6.5, but this planet's relief is
-    // ~10x Earth's (median land 4.8 km with 10 km mountains).
-    double LapseCPerKm      = 3.0;
-    // Share of the continental plateau (the continent layer's own height, not
-    // the mountains) that does NOT count as altitude for temperature. With 0
+    // Degrees per km of altitude. Earth's ~6.5 suits the tectonic terrain;
+    // the original terrain (relief ~10x Earth's) needs ~3.
+    double LapseCPerKm      = 6.5;
+    // Share of the continental plateau (Inland * 12000: the broad base height,
+    // not the mountains) that does NOT count as altitude for temperature. With 0
     // every highland freezes; with 0.7 plateaus keep their latitude's biome
     // and only the mountains on them get cold and snowy.
     double PlateauDiscount  = 0.7;
@@ -71,7 +71,8 @@ struct Climate
 
 // SinLat: Up.z (polar axis is +Z). HeightM: above sea level (negative under
 // water). HumidityRaw, TempNoise: the noise layers, about -1..1. Inland:
-// continent value above sea level (0 at the coast).
+// Surface::Inland (broad plateau height / 12000 on land; with the original
+// terrain, the continent value above sea level).
 Climate ClimateAt(double SinLat, double HeightM, double HumidityRaw, double TempNoise,
                   double Inland, const Params& P);
 

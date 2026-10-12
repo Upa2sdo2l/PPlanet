@@ -19,6 +19,10 @@ namespace
 {
     constexpr double TAU = 6.28318530717959;
     constexpr double PHACELLE_CUTOFF_D2 = 2.2499;   // same constant in the shader
+    // Stripe phase. The original's 0.25 makes the pattern flip sign when the
+    // stripe direction turns by 180 degrees (it does across every crest);
+    // with 0 the pattern is the same both ways. Same constant in the shader.
+    constexpr double PHACELLE_PHASE = 0.0;
 
     inline double Clamp01(double T) { return std::clamp(T, 0.0, 1.0); }
     inline double Mix(double A, double B, double T) { return A + (B - A) * T; }
@@ -140,6 +144,14 @@ Result Erode(const Vec3d& Up, double RadiusMetres, const Vec3d& Gradient, double
 
     const double RoundingForInput = Mix(Prm.Rounding[1], Prm.Rounding[0], Clamp01(FadeTarget + 0.5)) * Prm.Rounding[2];
     double CombiMask = EaseOut(SmoothStart(SlopeLength * Prm.Onset[0], RoundingForInput * Prm.Onset[0]));
+    // Crests: the low-pass gradient passes through zero there and flips, so
+    // the gullies of the two sides would meet in a comb of teeth. Fade them
+    // out until the slope reaches CrestSoftness: a clean ridge line.
+    if (Prm.CrestSoftness > 0.0)
+    {
+        const double T = Clamp01(SlopeLength / Prm.CrestSoftness);
+        CombiMask *= T * T * (3.0 - 2.0 * T);
+    }
 
     double RidgeMapCombiMask  = EaseOut(SlopeLength * Prm.Onset[2]);
     double RidgeMapFadeTarget = FadeTarget;
@@ -149,7 +161,7 @@ Result Erode(const Vec3d& Up, double RadiusMetres, const Vec3d& Gradient, double
     for (int i = 0; i < Prm.Octaves; ++i)
     {
         const Phacelle Ph = PhacelleNoise3(P * Freq, Up, SafeNormalize(GullySlope),
-                                           Prm.CellScale, 0.25, Prm.Normalization, Prm.Seed + (uint32_t)i * 0x9E3779B9u);
+                                           Prm.CellScale, PHACELLE_PHASE, Prm.Normalization, Prm.Seed + (uint32_t)i * 0x9E3779B9u);
         // Derivative direction in metres; negated because slopes point down.
         const Vec3d Side = Ph.Side * (-Freq);
         const double Sloping = std::fabs(Ph.S);
@@ -221,11 +233,9 @@ double DeltaAt(const PlanetCore::NoiseGraph& Graph, const Vec3d& Dir, const Para
 {
     if (!IsEnabled(Prm) || !Graph.IsValid()) return 0.0;
     const PlanetCore::Surface S = Graph.SampleSurface(Dir);
-    float Mask = 0.f, Fade = 0.f;
-    Graph.ErosionMaskFade(S.Continent, S.Mountain, Mask, Fade);
-    if (Mask <= 0.f) return 0.0;
+    if (S.ErosionMask <= 0.f) return 0.0;
     const Vec3d G = GradientAt(Graph, Dir, Prm);
-    return Erode(Dir, Graph.GetParams().PlanetRadiusMetres, G, Fade, Mask, Prm).DeltaHeight;
+    return Erode(Dir, Graph.GetParams().PlanetRadiusMetres, G, S.ErosionFade, S.ErosionMask, Prm).DeltaHeight;
 }
 
 void BuildChunkInputs(const PlanetCore::NoiseGraph& Graph, const PlanetCore::FChunkKey& Key,
@@ -243,12 +253,17 @@ void BuildChunkInputs(const PlanetCore::NoiseGraph& Graph, const PlanetCore::FCh
     constexpr int32_t SubMin = -1, SubMax = (N - 1) / SubStep + 1;   // node index range -1 .. 17
     constexpr int32_t SubCount = SubMax - SubMin + 1;                // 19
 
+    bool bAnyMask = false;
     for (int32_t i = 0; i < ChunkInputs::Count; ++i)
     {
-        Graph.ErosionMaskFade(Halo.Continent[i], Halo.Mountain[i], Out.Mask[i], Out.Fade[i]);
+        Out.Mask[i] = Halo.ErosionMask[i];
+        Out.Fade[i] = Halo.ErosionFade[i];
         Out.Gradient[i] = Vec3d();
+        bAnyMask |= Out.Mask[i] > 0.f;
     }
-    if (!IsEnabled(Prm)) return;
+    // Nothing erodes in this chunk (plains, sea): Erode returns 0 wherever
+    // the mask is 0 whatever the gradient, so skip the 2212 base samples.
+    if (!IsEnabled(Prm) || !bAnyMask) return;
 
     // Direction of chunk vertex (x, y), also outside the halo grid: the same
     // parametrisation a neighbour chunk uses for its own vertex there (UV is

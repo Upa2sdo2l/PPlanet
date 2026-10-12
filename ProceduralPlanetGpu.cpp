@@ -397,7 +397,7 @@ void AProceduralPlanet::UpdateGpuShaderParams()
     P.Rounding = FVector4f((float)E.Rounding[0], (float)E.Rounding[1], (float)E.Rounding[2], (float)E.Rounding[3]);
     P.Onset    = FVector4f((float)E.Onset[0], (float)E.Onset[1], (float)E.Onset[2], (float)E.Onset[3]);
     P.P3       = FVector4f((float)E.AssumedSlope[0], (float)E.AssumedSlope[1], (float)E.CellScale, (float)E.Normalization);
-    P.P4       = FVector4f((float)E.Lacunarity, (float)E.Gain, (float)E.HeightOffset, 0.f);
+    P.P4       = FVector4f((float)E.Lacunarity, (float)E.Gain, (float)E.HeightOffset, (float)E.CrestSoftness);
     P.Octaves  = PlanetErosion::IsEnabled(E) ? E.Octaves : 0;
     P.Seed     = E.Seed;
 

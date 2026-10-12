@@ -35,7 +35,7 @@ namespace PlanetErosionGpu
         FVector4f Rounding = FVector4f(0.f, 0.f, 0.f, 0.f);
         FVector4f Onset    = FVector4f(0.f, 0.f, 0.f, 0.f);
         FVector4f P3       = FVector4f(0.f, 0.f, 0.f, 0.f);   // AssumedSlope value, override, CellScale, Normalization
-        FVector4f P4       = FVector4f(0.f, 0.f, 0.f, 0.f);   // Lacunarity, Gain, HeightOffset, -
+        FVector4f P4       = FVector4f(0.f, 0.f, 0.f, 0.f);   // Lacunarity, Gain, HeightOffset, CrestSoftness
         int32     Octaves  = 0;                               // 0 = no erosion
         uint32    Seed     = 0;
         // Biomes (PlanetBiomes::Params): EquatorTempC, PoleTempC, LapseCPerKm, TempNoiseC |

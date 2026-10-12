@@ -16,6 +16,7 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Hal
                double PlanetRadiusMetres, float SeaLevel, TileData& Out, double ExtraMarginCm)
 {
     using PlanetCore::Vec3d;
+    (void)SeaLevel;   // Inland now comes with the halo grid
 
     // ── Chunk frame: origin on the reference sphere at the chunk centre,
     //    X along +U, Y along +V (orthogonalised), Z = X x Y.
@@ -120,7 +121,7 @@ void BuildTile(const PlanetCore::FChunkKey& Key, const PlanetCore::HaloGrid& Hal
         V.PRef[2] = (float)(Dir.Z * PlanetRadiusMetres);
         V.Humidity  = Halo.Humidity[g];
         V.TempNoise = Halo.TempNoise[g];
-        V.Inland    = Halo.Continent[g] - SeaLevel;
+        V.Inland    = Halo.Inland[g];
         V.Pad       = 0.f;
         if (Inputs)
         {

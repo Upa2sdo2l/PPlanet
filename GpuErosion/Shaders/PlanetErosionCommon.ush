@@ -25,10 +25,10 @@ struct FPlanetVertexIn
     float3 PRef;        // direction * radius, metres
     float  Fade;        // -1 valleys .. +1 peaks
     float3 Gradient;    // steering gradient, planet space, m/m
-    float  Mask;        // land mask; 0 = no erosion
+    float  Mask;        // erosion mask (mountains); 0 = no erosion
     float  Humidity;    // humidity noise, about -1..1
     float  TempNoise;   // temperature noise, about -1..1
-    float  Inland;      // continent value above sea level (0 at the coast)
+    float  Inland;      // plateau height / 12000 on land (HaloGrid::Inland)
     float  Pad;
 };
 
@@ -47,7 +47,7 @@ struct FPlanetErosionParams
     float4 Rounding;   // ridges, creases, input multiplier, per-octave multiplier
     float4 Onset;      // input, octave, ridge-map input, ridge-map octave
     float4 P3;         // AssumedSlope value, AssumedSlope override, CellScale, Normalization
-    float4 P4;         // Lacunarity, Gain, HeightOffset, (unused)
+    float4 P4;         // Lacunarity, Gain, HeightOffset, CrestSoftness
     int    Octaves;
     uint   Seed;
 };
@@ -165,6 +165,8 @@ float PlanetEro_DeltaHeight(float3 PRef, float3 Gradient, float FadeTarget, floa
 
     float RoundingForInput = lerp(E.Rounding.y, E.Rounding.x, saturate(Fade + 0.5)) * E.Rounding.z;
     float CombiMask = PlanetEro_EaseOut(PlanetEro_SmoothStart(SlopeLength * E.Onset.x, RoundingForInput * E.Onset.x));
+    // Crests: fade the gullies out below CrestSoftness (see PlanetErosion.cpp).
+    if (E.P4.w > 0.0) CombiMask *= smoothstep(0.0, 1.0, SlopeLength / E.P4.w);
 
     float3 GullySlope = Gradient + ((Gradient / SlopeLength) * E.P3.x - Gradient) * E.P3.y;
 
@@ -172,7 +174,7 @@ float PlanetEro_DeltaHeight(float3 PRef, float3 Gradient, float FadeTarget, floa
     {
         uint OctaveSeed = E.Seed + (uint)i * 0x9E3779B9u;
         FPlanetPhacelle Ph = PlanetEro_Phacelle(PRef * Freq, Up, PlanetEro_SafeNormalize(GullySlope),
-                                                CellScale, 0.25, Normalization, OctaveSeed);
+                                                CellScale, 0.0, Normalization, OctaveSeed);   // phase 0: see PlanetErosion.cpp
         float3 Side = Ph.Side * (-Freq);
         float Sloping = abs(Ph.S);
 

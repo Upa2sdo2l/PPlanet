@@ -43,7 +43,7 @@ Climate ClimateAt(double SinLat, double HeightM, double HumidityRaw, double Temp
 {
     Climate C;
     const double CosLat = std::sqrt(std::max(0.0, 1.0 - SinLat * SinLat));
-    const double Plateau  = std::max(0.0, Inland) * 12000.0;   // continent layer height, m
+    const double Plateau  = std::max(0.0, Inland) * 12000.0;   // broad plateau height, m (Surface::Inland)
     const double Altitude = std::max(0.0, HeightM - P.PlateauDiscount * Plateau);
     C.TemperatureC = P.PoleTempC + (P.EquatorTempC - P.PoleTempC) * CosLat
                    - P.LapseCPerKm * Altitude * 0.001

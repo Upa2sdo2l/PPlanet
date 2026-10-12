@@ -48,7 +48,7 @@ struct GpuVertex
     float Mask;           // 0..1 land mask; 0 = no erosion
     float Humidity;       // climate noise (biomes)
     float TempNoise;
-    float Inland;         // continent value above sea level, 0 at the coast
+    float Inland;         // HaloGrid::Inland: plateau height / 12000 on land, continent value below sea
     float Pad;
 };
 static_assert(sizeof(GpuVertex) == 64, "GpuVertex must match FPlanetVertexIn");
@@ -81,7 +81,7 @@ struct TileData
 
 // Builds the tile for Key from its halo grid (SampleChunkBatch) and the
 // erosion inputs (BuildChunkInputs). Inputs may be null: no erosion (mask 0).
-// SeaLevel: the generator's effective sea level (continent value), for Inland.
+// SeaLevel: unused (kept for callers); Inland comes from HaloGrid::Inland.
 // ExtraMarginCm widens the box on every side: room for the vertex shader's
 // texture displacement (PlanetTerrainVertex.ush), so displaced vertices stay
 // inside the instance bounds.

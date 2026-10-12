@@ -14,6 +14,7 @@
 //      the one the mesh uses.
 
 #include "PlanetNoiseCore.h"
+#include "PlanetTectonics.h"
 #include <cstring>
 #include <random>
 
@@ -46,6 +47,17 @@ void ChunkVertexUV(const FChunkKey& Key, int32_t GridX, int32_t GridY,
     const double Step = D / (double)PLANET_QUADS_PER_SIDE;
     OutU = U0 + (double)(GridX - 1) * Step;
     OutV = V0 + (double)(GridY - 1) * Step;
+}
+
+NoiseGraph::NoiseGraph() : Plates(std::make_unique<PlanetTectonics::Plates>()) {}
+NoiseGraph::~NoiseGraph() = default;
+
+int32_t NoiseGraph::GetPlateCount() const { return Plates ? Plates->Num() : 0; }
+
+void NoiseGraph::Gen(const FastNoise::SmartNode<>& Node, float* Out, int32_t Count,
+                     const float* X, const float* Y, const float* Z) const
+{
+    Node->GenPositionArray3D(Out, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f, 0.f, 0.f, Params.MasterSeed);
 }
 
 void NoiseGraph::Build(const NoiseParams& P)
@@ -134,18 +146,72 @@ void NoiseGraph::Build(const NoiseParams& P)
     DetailFractal->SetGain(0.5f);
     DetailFractal->SetLacunarity(2.2f);
 
+    // ── Tectonic terrain (sizes in metres where they are physical) ──────────
+    auto Fbm = [](float ScaleUnits, int32_t Seed, int32_t Octaves, float Lacunarity, float Gain) -> FastNoise::SmartNode<>
+    {
+        auto Src = FastNoise::New<FastNoise::Simplex>();
+        Src->SetScale(ScaleUnits); Src->SetSeedOffset(Seed);
+        auto F = FastNoise::New<FastNoise::FractalFBm>();
+        F->SetSource(Src); F->SetOctaveCount(Octaves); F->SetGain(Gain); F->SetLacunarity(Lacunarity);
+        return F;
+    };
+    const float R = (float)Radius;
+    UpliftNode     = Fbm(1.f / 1.6f,   P.LayerSeed(Layer_Uplift),     4, 2.1f, 0.5f);    // broad highlands and basins
+    HillsNode      = Fbm(40000.f / R,  P.LayerSeed(Layer_Hills),      5, 2.1f, 0.38f);   // rolling hills, 40 km .. 2 km
+    HillRegimeNode = Fbm(500000.f / R, P.LayerSeed(Layer_HillRegime), 3, 2.0f, 0.5f);    // where hills, where plains
+    OldRangesNode  = Fbm(700000.f / R, P.LayerSeed(Layer_OldRanges),  3, 2.0f, 0.5f);    // worn-down ranges inside plates
+    WarpNode[0]    = Fbm(1.f / 2.5f,   P.LayerSeed(Layer_PlateWarpX), 3, 2.0f, 0.5f);    // wiggly plate boundaries
+    WarpNode[1]    = Fbm(1.f / 2.5f,   P.LayerSeed(Layer_PlateWarpY), 3, 2.0f, 0.5f);
+    WarpNode[2]    = Fbm(1.f / 2.5f,   P.LayerSeed(Layer_PlateWarpZ), 3, 2.0f, 0.5f);
+    {
+        // Alpine relief inside ranges: ridged, peaks 20-60 km apart, down to ~3 km.
+        auto Src = FastNoise::New<FastNoise::Simplex>();
+        Src->SetScale(90000.f / R); Src->SetSeedOffset(P.LayerSeed(Layer_Alpine));
+        auto F = FastNoise::New<FastNoise::FractalRidged>();
+        F->SetSource(Src); F->SetOctaveCount(6); F->SetGain(0.5f); F->SetLacunarity(2.0f);
+        AlpineNode = F;
+    }
+
     bValid = (ContinentWarp && MountainFractal && HumidityFractal && DetailFractal);
     SeaLevel = P.SeaLevelNorm;
+    if (bValid) BuildTectonics();
 }
 
-void NoiseGraph::EvaluateLayers(const float* X, const float* Y, const float* Z, int32_t Count,
-                                float* OutContinent, float* OutMountain,
-                                float* OutHumidity, float* OutDetail) const
+void NoiseGraph::BuildTectonics()
 {
-    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    HumidityFractal->GenPositionArray3D(OutHumidity,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+    if (!Params.bTectonics) { Plates->Centre.clear(); return; }
+
+    // The continents sampled on a Fibonacci sphere: plate centres go to the
+    // continent interiors and the ocean basins, and the 90th percentile of
+    // land sets the scale of the hypsometric curve.
+    constexpr int32_t NP = 6000;
+    std::vector<Vec3d> Pts(NP);
+    std::vector<float> X(NP), Y(NP), Z(NP), C(NP), Above(NP);
+    for (int32_t i = 0; i < NP; ++i)
+    {
+        const double z = 1.0 - 2.0 * (i + 0.5) / NP, r = std::sqrt(1.0 - z * z), ph = i * 2.399963229728653;
+        Pts[i] = Vec3d(r * std::cos(ph), r * std::sin(ph), z);
+        X[i] = (float)Pts[i].X; Y[i] = (float)Pts[i].Y; Z[i] = (float)Pts[i].Z;
+    }
+    Gen(ContinentWarp, C.data(), NP, X.data(), Y.data(), Z.data());
+    std::vector<float> Land;
+    for (int32_t i = 0; i < NP; ++i)
+    {
+        Above[i] = C[i] - SeaLevel;
+        if (Above[i] > 0.f) Land.push_back(Above[i]);
+    }
+    LandScale = Params.Tectonics.LandScale;
+    if (!(LandScale > 0.f))
+    {
+        LandScale = 0.64f;
+        if (Land.size() > 20)
+        {
+            const size_t k = (size_t)(0.9 * (double)(Land.size() - 1));
+            std::nth_element(Land.begin(), Land.begin() + (ptrdiff_t)k, Land.end());
+            LandScale = std::max(0.05f, Land[k]);
+        }
+    }
+    Plates->Build((uint32_t)Params.LayerSeed(Layer_Plates), Pts, Above, Params.Tectonics);
 }
 
 void NoiseGraph::EvaluateTempNoise(const float* X, const float* Y, const float* Z, int32_t Count,
@@ -154,40 +220,109 @@ void NoiseGraph::EvaluateTempNoise(const float* X, const float* Y, const float* 
     HumidityFractal->GenPositionArray3D(Out, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 17.31f, -9.17f, 5.73f, Params.MasterSeed);
 }
 
-void NoiseGraph::EvaluateLayersNoHumidity(const float* X, const float* Y, const float* Z, int32_t Count,
-                                          float* OutContinent, float* OutMountain,
-                                          float* OutDetail) const
-{
-    ContinentWarp->GenPositionArray3D(  OutContinent, Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(OutMountain,  Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    DetailFractal->GenPositionArray3D(  OutDetail,    Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-}
-
 void NoiseGraph::EvaluateHeightField(const float* X, const float* Y, const float* Z,
                                      int32_t Count, float* OutHeight) const
 {
-    // thread_local scratch: this is called twice per chunk, and allocating four
-    // vectors each time cost a measurable slice of the chunk budget.
-    static thread_local std::vector<float> C, M, D;
-    if ((int32_t)C.size() < Count)
-    { C.resize((size_t)Count); M.resize((size_t)Count); D.resize((size_t)Count); }
-
-    EvaluateLayersNoHumidity(X, Y, Z, Count, C.data(), M.data(), D.data());
-    for (int32_t i = 0; i < Count; ++i)
-        OutHeight[i] = (float)ComposeHeight(C[i], M[i], D[i]);
+    static thread_local std::vector<double> H;
+    if ((int32_t)H.size() < Count) H.resize((size_t)Count);
+    EvaluateTerrain(X, Y, Z, Count, true, H.data(), nullptr, nullptr, nullptr, nullptr, nullptr);
+    for (int32_t i = 0; i < Count; ++i) OutHeight[i] = (float)H[i];
 }
 
 void NoiseGraph::EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,
                                          int32_t Count, double* OutHeight) const
 {
     if (!bValid || Count <= 0) return;
-    static thread_local std::vector<float> C, M;
-    if ((int32_t)C.size() < Count) { C.resize((size_t)Count); M.resize((size_t)Count); }
+    EvaluateTerrain(X, Y, Z, Count, false, OutHeight, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
 
-    ContinentWarp->GenPositionArray3D(  C.data(), Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
-    MountainFractal->GenPositionArray3D(M.data(), Count, X, NoiseY(Y, Z), NoiseZ(Y, Z), 0.f,0.f,0.f, Params.MasterSeed);
+void NoiseGraph::EvaluateTerrain(const float* X, const float* Y, const float* Z, int32_t Count, bool bDetail,
+                                 double* OutHeight, float* OutC, float* OutM,
+                                 float* OutInland, float* OutMask, float* OutFade) const
+{
+    if (!bValid || Count <= 0) return;
+    // thread_local scratch: called several times per chunk.
+    static thread_local std::vector<float> C, M, D, U, Hl, HR, OR, Al, W0, W1, W2;
+    static thread_local std::vector<PlanetTectonics::Boundary> B;
+    static thread_local std::vector<Vec3d> Q;
+    static thread_local std::vector<int32_t> Cand;
+    if ((int32_t)C.size() < Count)
+    {
+        for (std::vector<float>* V : {&C, &M, &D, &U, &Hl, &HR, &OR, &Al, &W0, &W1, &W2}) V->resize((size_t)Count);
+        B.resize((size_t)Count);
+        Q.resize((size_t)Count);
+    }
+    Gen(ContinentWarp, C.data(), Count, X, Y, Z);
+    Gen(MountainFractal, M.data(), Count, X, Y, Z);
+    if (bDetail) Gen(DetailFractal, D.data(), Count, X, Y, Z);
+    else std::fill(D.begin(), D.begin() + Count, 0.f);
+
+    if (OutC) std::memcpy(OutC, C.data(), sizeof(float) * (size_t)Count);
+    if (OutM) std::memcpy(OutM, M.data(), sizeof(float) * (size_t)Count);
+
+    if (!Params.bTectonics || Plates->Num() < 3)
+    {
+        for (int32_t i = 0; i < Count; ++i)
+        {
+            if (OutHeight) OutHeight[i] = ComposeHeight(C[i], M[i], D[i]);
+            if (OutInland) OutInland[i] = C[i] - SeaLevel;
+            if (OutMask || OutFade)
+            {
+                float Mk, Fd;
+                ErosionMaskFade(C[i], M[i], Mk, Fd);
+                if (OutMask) OutMask[i] = Mk;
+                if (OutFade) OutFade[i] = Fd;
+            }
+        }
+        return;
+    }
+
+    const TectonicParams& T = Params.Tectonics;
+    Gen(UpliftNode, U.data(), Count, X, Y, Z);
+    Gen(HillsNode, Hl.data(), Count, X, Y, Z);
+    Gen(WarpNode[0], W0.data(), Count, X, Y, Z);
+    Gen(WarpNode[1], W1.data(), Count, X, Y, Z);
+    Gen(WarpNode[2], W2.data(), Count, X, Y, Z);
+
+    // Plate boundaries at the warped point. The land-only and range-only
+    // layers are skipped for the whole batch when no point needs them: that
+    // never changes a result, so chunks sharing a border still agree.
+    const double R = Params.PlanetRadiusMetres;
     for (int32_t i = 0; i < Count; ++i)
-        OutHeight[i] = ComposeHeight(C[i], M[i], 0.f);
+        Q[i] = (Vec3d(X[i], Y[i], Z[i]) + Vec3d(W0[i], W1[i], W2[i]) * (double)T.BoundaryWarp).Normalised();
+    // A chunk sees only a few of the plates.
+    Plates->Candidates(Q.data(), Count, Cand);
+    bool bAnyLand = false, bAnyRange = false;
+    for (int32_t i = 0; i < Count; ++i)
+    {
+        B[i] = PlanetTectonics::BoundaryAt(*Plates, Q[i], R, T, Cand.data(), (int32_t)Cand.size());
+        bAnyLand  |= (C[i] - SeaLevel) >= 0.f;
+        bAnyRange |= PlanetTectonics::NeedsAlpine(B[i]);
+    }
+    if (bAnyLand)
+    {
+        Gen(HillRegimeNode, HR.data(), Count, X, Y, Z);
+        Gen(OldRangesNode, OR.data(), Count, X, Y, Z);
+    }
+    if (bAnyRange) Gen(AlpineNode, Al.data(), Count, X, Y, Z);
+
+    for (int32_t i = 0; i < Count; ++i)
+    {
+        PlanetTectonics::Layers L;
+        L.Above = C[i] - SeaLevel; L.Mountain = M[i]; L.Detail = D[i];
+        L.Uplift = U[i]; L.Hills = Hl[i];
+        L.HillRegime = bAnyLand ? HR[i] : 0.f;
+        L.OldRanges  = bAnyLand ? OR[i] : 0.f;
+        L.Alpine     = bAnyRange ? Al[i] : 0.f;
+        const PlanetTectonics::Result Res = PlanetTectonics::Compose(L, B[i], LandScale, T);
+        if (OutHeight) OutHeight[i] = Res.Height;
+        if (OutInland) OutInland[i] = Res.Inland;
+        if (OutFade)   OutFade[i]   = Res.ErosionFade;
+        // Erosion only in the mountains, ramped in above the waterline (the
+        // filter lowers the ground by ~0.4 km: a hard cut would leave a step).
+        if (OutMask)   OutMask[i]   = std::clamp(1.6f * Res.ErosionMask, 0.f, 1.f)
+                                    * (float)std::clamp(Res.Height / 300.0, 0.0, 1.0);
+    }
 }
 
 void NoiseGraph::ErosionMaskFade(float Continent, float Mountain, float& OutMask, float& OutFade) const
@@ -226,11 +361,11 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
     const int32_t G = PLANET_GRID_WITH_HALO;     // 67
     const int32_t TotalG = G * G;
 
-    static thread_local std::vector<float>  XG, YG, ZG, Cg, Mg, Hg, Dg, Tg;
+    static thread_local std::vector<float>  XG, YG, ZG, Cg, Mg, Hg, Tg, Ig, Kg, Fg;
     static thread_local std::vector<double> DXg, DYg, DZg, HeightG;
     if ((int32_t)XG.size() < TotalG)
     {
-        for (std::vector<float>* V : {&XG, &YG, &ZG, &Cg, &Mg, &Hg, &Dg, &Tg})
+        for (std::vector<float>* V : {&XG, &YG, &ZG, &Cg, &Mg, &Hg, &Tg, &Ig, &Kg, &Fg})
             V->resize((size_t)TotalG);
         for (std::vector<double>* V : {&DXg, &DYg, &DZg, &HeightG})
             V->resize((size_t)TotalG);
@@ -256,11 +391,10 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
         }
     }
 
-    EvaluateLayers(XG.data(), YG.data(), ZG.data(), TotalG,
-                   Cg.data(), Mg.data(), Hg.data(), Dg.data());
+    EvaluateTerrain(XG.data(), YG.data(), ZG.data(), TotalG, true,
+                    HeightG.data(), Cg.data(), Mg.data(), Ig.data(), Kg.data(), Fg.data());
+    Gen(HumidityFractal, Hg.data(), TotalG, XG.data(), YG.data(), ZG.data());
     EvaluateTempNoise(XG.data(), YG.data(), ZG.data(), TotalG, Tg.data());
-    for (int32_t i = 0; i < TotalG; ++i)
-        HeightG[i] = ComposeHeight(Cg[i], Mg[i], Dg[i]);
 
     if (OutHalo)
     {
@@ -272,6 +406,9 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
             OutHalo->Mountain[i]  = Mg[i];
             OutHalo->Humidity[i]  = Hg[i];
             OutHalo->TempNoise[i] = Tg[i];
+            OutHalo->Inland[i]      = Ig[i];
+            OutHalo->ErosionMask[i] = Kg[i];
+            OutHalo->ErosionFade[i] = Fg[i];
         }
     }
 
@@ -294,6 +431,9 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
             S.HumidityRaw = Hg[g];
             S.TempNoiseRaw = Tg[g];
             S.Height      = HeightG[g];
+            S.Inland      = Ig[g];
+            S.ErosionMask = Kg[g];
+            S.ErosionFade = Fg[g];
 
             // Central differences along the grid's U and V directions.
             const Vec3d Su = SurfacePoint(g + 1) - SurfacePoint(g - 1);
@@ -323,12 +463,13 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
 {
     if (!bValid || Count <= 0) return;
 
-    static thread_local std::vector<float> XU,YU,ZU, XV,YV,ZV, H0,HU,HV, Cb,Mb,Hb,Db,Tb;
+    static thread_local std::vector<float> XU,YU,ZU, XV,YV,ZV, HU,HV, Cb,Mb,Hb,Tb,Ib,Kb,Fb;
+    static thread_local std::vector<double> H0;
     XU.resize((size_t)Count); YU.resize((size_t)Count); ZU.resize((size_t)Count);
     XV.resize((size_t)Count); YV.resize((size_t)Count); ZV.resize((size_t)Count);
     H0.resize((size_t)Count); HU.resize((size_t)Count); HV.resize((size_t)Count);
-    Cb.resize((size_t)Count); Mb.resize((size_t)Count); Hb.resize((size_t)Count); Db.resize((size_t)Count);
-    Tb.resize((size_t)Count);
+    Cb.resize((size_t)Count); Mb.resize((size_t)Count); Hb.resize((size_t)Count);
+    Tb.resize((size_t)Count); Ib.resize((size_t)Count); Kb.resize((size_t)Count); Fb.resize((size_t)Count);
 
     const double Eps = 1e-5;   // radians, ~25 m on a 2500 km sphere
 
@@ -343,10 +484,9 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
         XV[i]=(float)dv.X; YV[i]=(float)dv.Y; ZV[i]=(float)dv.Z;
     }
 
-    EvaluateLayers(DirX, DirY, DirZ, Count, Cb.data(), Mb.data(), Hb.data(), Db.data());
+    EvaluateTerrain(DirX, DirY, DirZ, Count, true, H0.data(), Cb.data(), Mb.data(), Ib.data(), Kb.data(), Fb.data());
+    Gen(HumidityFractal, Hb.data(), Count, DirX, DirY, DirZ);
     EvaluateTempNoise(DirX, DirY, DirZ, Count, Tb.data());
-    for (int32_t i = 0; i < Count; ++i)
-        H0[i] = (float)ComposeHeight(Cb[i], Mb[i], Db[i]);
 
     EvaluateHeightField(XU.data(), YU.data(), ZU.data(), Count, HU.data());
     EvaluateHeightField(XV.data(), YV.data(), ZV.data(), Count, HV.data());
@@ -358,9 +498,10 @@ void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const 
         Surface& S = Out[i];
         const Vec3d Dir((double)DirX[i], (double)DirY[i], (double)DirZ[i]);
 
-        S.Continent = Cb[i]; S.Mountain = Mb[i]; S.HumidityRaw = Hb[i]; S.TempNoiseRaw = Tb[i]; S.Height = (double)H0[i];
+        S.Continent = Cb[i]; S.Mountain = Mb[i]; S.HumidityRaw = Hb[i]; S.TempNoiseRaw = Tb[i]; S.Height = H0[i];
+        S.Inland = Ib[i]; S.ErosionMask = Kb[i]; S.ErosionFade = Fb[i];
 
-        const Vec3d S0 = Dir * (R + (double)H0[i]);
+        const Vec3d S0 = Dir * (R + H0[i]);
         const Vec3d Su = Vec3d((double)XU[i], (double)YU[i], (double)ZU[i]) * (R + (double)HU[i]);
         const Vec3d Sv = Vec3d((double)XV[i], (double)YV[i], (double)ZV[i]) * (R + (double)HV[i]);
 
@@ -392,9 +533,9 @@ Surface NoiseGraph::SampleSurface(const Vec3d& UnitDir) const
 double NoiseGraph::EvaluateHeight(const Vec3d& Dir) const
 {
     const float x=(float)Dir.X, y=(float)Dir.Y, z=(float)Dir.Z;
-    float C=0.f,M=0.f,H=0.f,D=0.f;
-    EvaluateLayers(&x,&y,&z,1,&C,&M,&H,&D);
-    return ComposeHeight(C,M,D);
+    double H = 0.0;
+    EvaluateTerrain(&x, &y, &z, 1, true, &H, nullptr, nullptr, nullptr, nullptr, nullptr);
+    return H;
 }
 
 // ── ComposeHeight ───────────────────────────────────────────────────────────
@@ -458,14 +599,15 @@ float NoiseGraph::ComputeSeaLevelForLandFraction(float Target, int32_t SamplesPe
                 X[idx]=(float)d.X; Y[idx]=(float)d.Y; Z[idx]=(float)d.Z;
             }
 
-    std::vector<float> C((size_t)Total), M((size_t)Total), H((size_t)Total), D((size_t)Total);
-    EvaluateLayers(X.data(), Y.data(), Z.data(), Total, C.data(), M.data(), H.data(), D.data());
+    std::vector<float> C((size_t)Total);
+    Gen(ContinentWarp, C.data(), Total, X.data(), Y.data(), Z.data());
     std::sort(C.begin(), C.end());
 
     const double Q = std::clamp(1.0 - (double)Target, 0.0, 1.0);
     const size_t Idx = (size_t)std::clamp(Q * (double)(Total - 1), 0.0, (double)(Total - 1));
 
     SeaLevel = C[Idx];
+    BuildTectonics();   // plates and land scale depend on the sea level
     return SeaLevel;
 }
 

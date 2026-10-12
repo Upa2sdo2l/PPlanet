@@ -141,7 +141,8 @@ Apply и Save: материал перекомпилируется с новым
 - `DisplaceNear` (см) — размах бугров из текстур масштаба Near (камни, рябь), `DisplaceMid` (см) — из
   масштаба Mid (кочки, дюны). Смещение отфильтровано под шаг сетки: грубые чанки получают только
   крупные бугры, мелочь остаётся микротеням и нормалям.
-- Актор → **Planet → GPU Terrain → Detail**: `bTerrainDetail`, `DetailLevels` (0–6),
+- Актор → **Planet → GPU Terrain → Detail**: `bTerrainDetail` (по умолчанию выключен — включите после
+  настройки нод WPO и AtlasUV; со старым материалом каждый дочерний чанк рисуется копией базового), `DetailLevels` (0–6),
   `DetailSplitDistanceFactor` (меньше — меньше инстансов), `DetailMaxInstances`,
   `DisplacementBoundsMarginMetres` (запас границ чанка: ≥ половины `DisplaceNear` + `DisplaceMid`).
 - Смещение не зависит от камеры: тени (VSM) кэшируются как обычно, бугры не «растут» при подходе.

@@ -109,9 +109,11 @@ public:
     // chunks the nearest shown chunks are split further into derived chunks
     // that build nothing: they read their base chunk's tile and are pushed by
     // the terrain textures' height maps in the material (DisplaceNear /
-    // DisplaceMid). Needs the material set up as in MaterialHLSL/README_Textures.md.
+    // DisplaceMid). Needs the material set up as in MaterialHLSL/README_Textures.md;
+    // off by default until it is (an older material would draw every derived
+    // chunk as a full copy of its base chunk).
     UPROPERTY(EditAnywhere, Category="Planet|GPU Terrain|Detail")
-    bool bTerrainDetail = true;
+    bool bTerrainDetail = false;
 
     // Levels below MaxLOD. 4: vertices every ~0.3 m under the camera (MaxLOD 14,
     // R 2500 km), ~0.6 / 1.2 / 2.3 m in the rings around it.

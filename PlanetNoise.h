@@ -124,24 +124,23 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.MasterSeed          = P.MasterSeed;
     C.NoiseSwapYZ         = P.bNoiseLabOrientation;
 
-    // ── Tectonic terrain ────────────────────────────────────────────────
-    C.bTectonics                      = P.bTectonicTerrain;
-    C.Tectonics.ContinentalPlates     = P.ContinentalPlates;
-    C.Tectonics.TotalPlates           = P.ContinentalPlates + P.OceanicPlates;
-    C.Tectonics.BoundaryWarp          = P.PlateBoundaryWarp;
-    C.Tectonics.InteriorHeight        = P.InteriorHeightMetres;
-    C.Tectonics.UpliftHeight          = P.UpliftHeightMetres;
-    C.Tectonics.HillsHeight           = P.HillsHeightMetres;
-    C.Tectonics.RangeHeight           = P.RangeHeightMetres;
-    C.Tectonics.RangeWidthMetres      = P.RangeWidthKm * 1000.f;
-    C.Tectonics.CoastalRangeOffsetMetres = P.CoastalRangeInlandKm * 1000.f;
-    C.Tectonics.PlateauHeight         = P.PlateauHeightMetres;
-    C.Tectonics.ShelfDepth            = P.ShelfDepthMetres;
-    C.Tectonics.AbyssDepth            = P.AbyssDepthMetres;
-    C.Tectonics.TrenchDepth           = P.TrenchDepthMetres;
-    C.Tectonics.RidgeHeight           = P.RidgeHeightMetres;
-    // DEFAULT (lab-tuned): LandScale auto, LowlandHeight, RiftDepth,
-    // OldRangeShare, ShelfWidth, SlopeWidth, Detail* amplitudes.
+    // ── Terrain shape V4 ────────────────────────────────────────────────
+    C.bShapedTerrain          = P.bShapedTerrain;
+    C.Shape.RegionScale       = P.RegionScale;
+    C.Shape.MountainAmount    = P.MountainAmount;
+    C.Shape.HillsAmount       = P.HillsAmount;
+    C.Shape.TableAmount       = P.TableAmount;
+    C.Shape.LowlandHeight     = P.LowlandHeightMetres;
+    C.Shape.InteriorRise      = P.InteriorRiseMetres;
+    C.Shape.HillsMinHeight    = P.HillsMinHeightMetres;
+    C.Shape.HillsMaxHeight    = P.HillsMaxHeightMetres;
+    C.Shape.MountainMinHeight = P.MountainMinHeightMetres;
+    C.Shape.MountainMaxHeight = P.MountainMaxHeightMetres;
+    C.Shape.TableMinHeight    = P.TableMinHeightMetres;
+    C.Shape.TableLevelStep    = P.TableLevelStepMetres;
+    C.Shape.ShelfDepth        = P.ShelfDepthMetres;
+    C.Shape.AbyssDepth        = P.AbyssDepthMetres;
+    // DEFAULT (lab-tuned): LandScale auto, Detail* amplitudes by regime.
 
     // ── DEFAULT: not exposed as sliders yet ─────────────────────────────
     C.ContinentOctaves    = P.ContinentOctaves;

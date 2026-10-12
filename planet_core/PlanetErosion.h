@@ -30,13 +30,14 @@
 namespace PlanetErosion
 {
 
-// Defaults tuned on this planet (R 2500 km, mountains 10 km) in the harness:
-// the demo values (scale 2.5 km, strength 0.22) overwhelm the gentle relief
-// and turn it into noise.
+// Defaults tuned in the terrain lab for the V4 shape (R 2500 km, mountains up
+// to ~3 km): strength 0.06 keeps 90 % of mountain slopes under ~15 deg; the
+// original 0.12 / -0.5 (tuned for 10 km mountains) made them steep and dug
+// valley floors below the sea.
 struct Params
 {
     double ScaleMetres     = 4000.0;  // horizontal and vertical scale of the largest gullies
-    double Strength        = 0.12;    // gully magnitude relative to the scale
+    double Strength        = 0.06;    // gully magnitude relative to the scale
     double GullyWeight     = 0.5;     // 0 = sharpen ridges only, 1 = full gullies
     double Detail          = 2.0;     // lower = fine gullies only on steep slopes
     double Rounding[4]     = {0.1, 0.0, 0.1, 2.0};   // ridges, creases, input multiplier, per-octave multiplier
@@ -47,7 +48,7 @@ struct Params
     int    Octaves         = 8;       // finest gullies 4000 / 2^7 = ~31 m wide: visible on foot
     double Lacunarity      = 2.0;
     double Gain            = 0.5;
-    double HeightOffset    = -0.5;    // -1 only lowers, +1 only raises (times the total magnitude)
+    double HeightOffset    = -0.2;    // -1 only lowers, +1 only raises (times the total magnitude)
     // Slope (m/m) of the low-pass gradient below which gullies fade out:
     // keeps crests clean (no comb of teeth where the gullies of the two
     // sides meet). 0 = the original filter; 0.3 rounds the summits.

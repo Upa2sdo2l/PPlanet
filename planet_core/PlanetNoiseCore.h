@@ -50,8 +50,6 @@
 #include <vector>
 #include <memory>
 
-namespace PlanetTectonics { struct Plates; }
-
 namespace PlanetCore
 {
 
@@ -86,7 +84,7 @@ struct Vec3d
 inline Vec3d operator*(double S, const Vec3d& V) { return V * S; }
 
 // ── Shared constants (must match the UE-side header) ────────────────────────
-static constexpr uint32_t PLANET_GENERATOR_VERSION = 3;   // 3: tectonic terrain; 2: halo-grid normals, detail in metres
+static constexpr uint32_t PLANET_GENERATOR_VERSION = 4;   // 4: terrain shape V4; 2: halo-grid normals, detail in metres
 static constexpr int32_t  BIOME_GRASS = 0;
 static constexpr int32_t  BIOME_ROCK  = 1;
 static constexpr int32_t  BIOME_SAND  = 2;
@@ -130,61 +128,48 @@ enum ELayer : int32_t
     Layer_Detail     = 4,
     Layer_Micro      = 5,
     Layer_COUNT      = 6,
-    // Tectonic terrain (seeds 11+, as in the terrain lab).
-    Layer_Uplift     = 11,
-    Layer_Hills      = 12,
-    Layer_HillRegime = 13,
-    Layer_OldRanges  = 14,
-    Layer_PlateWarpX = 15,
-    Layer_PlateWarpY = 16,
-    Layer_PlateWarpZ = 17,
-    Layer_Alpine     = 19,
-    Layer_Plates     = 20,
+    // Terrain shape V4 (seeds as in the terrain lab).
+    Layer_ShapeErosion = 31,
+    Layer_ShapeWeird   = 32,
+    Layer_ShapePlateau = 33,
+    Layer_ShapeLevel   = 34,
+    Layer_ShapeMass    = 35,
+    Layer_ShapeHills   = 36,
+    Layer_ShapePeaks   = 37,   // + 101 per octave
 };
 
-// Terrain shape "V2+" (PlanetTectonics.h). Heights in metres, angles in
-// radians, continent values in the continent layer's own units.
-struct TectonicParams
+// Terrain shape "V4" (PlanetTerrainShape.h). Heights in metres; "Amount"
+// values 0..1 with 0.5 = the tuned default.
+struct ShapeParams
 {
-    int32_t ContinentalPlates  = 6;       // plates seeded in continent interiors
-    int32_t TotalPlates        = 14;      // the rest in ocean basins
-    double  PlateSeparation    = 0.62;    // min angle between plate centres, rad
-    double  SubductionShare    = 0.7;     // share of ocean plates moving towards a continent
-    float   BoundaryWarp       = 0.09f;   // wiggle of plate boundaries (unit-sphere units)
-
-    // Land: base = Lowland + InteriorHeight * (a ^ 1.7), a = above sea / LandScale.
-    float   LandScale          = 0.f;     // 0: auto, the 90th percentile of land (continent above sea)
-    float   LowlandHeight      = 20.f;
-    float   InteriorHeight     = 1800.f;
-    float   UpliftHeight       = 900.f;   // +- broad highlands and basins
-    float   HillsHeight        = 260.f;   // rolling hills where the hill regime says so
-    float   RangeHeight        = 6500.f;  // mountain ranges above their surroundings
-    float   RangeWidthMetres   = 160000.f;// spine to foot of a range
-    float   CoastalRangeOffsetMetres = 190000.f;  // coastal range: distance inland from the plate boundary
-    float   PlateauHeight      = 1600.f;  // collision highlands
-    float   RiftDepth          = 500.f;
-    float   OldRangeShare      = 0.32f;   // worn-down ranges inside plates, relative height
-
-    // Ocean.
-    float   ShelfDepth         = 140.f;
-    float   AbyssDepth         = 4600.f;
-    float   ShelfWidth         = 0.03f;   // in continent units below sea level
-    float   SlopeWidth         = 0.12f;
-    float   RidgeHeight        = 2300.f;
-    float   TrenchDepth        = 3500.f;
-
-    // Detail amplitude by regime (metres): plains, hills, mountains.
-    float   DetailPlains       = 5.f;
-    float   DetailHills        = 18.f;
-    float   DetailMountains    = 35.f;
+    float   RegionScale       = 1.f;     // size of plains / hills / mountain regions (1 = ~220 km)
+    float   LandScale         = 0.f;     // 0: auto, the 90th percentile of land (continent above sea)
+    float   LowlandHeight     = 25.f;    // at the coast
+    float   InteriorRise      = 220.f;   // + towards the continent interiors
+    float   MountainAmount    = 0.5f;    // more / fewer mountain regions
+    float   HillsAmount       = 0.5f;    // more / fewer hill regions (the rest is plains)
+    float   TableAmount       = 0.5f;    // more / fewer table mountains
+    float   HillsMinHeight    = 180.f;
+    float   HillsMaxHeight    = 400.f;
+    float   MountainMinHeight = 600.f;   // massif in a valley of the peaks & valleys field
+    float   MountainMaxHeight = 3200.f;  // massif on its peak
+    float   TableMinHeight    = 400.f;   // lowest of the 4 table-top levels above the base
+    float   TableLevelStep    = 600.f;   // between levels
+    float   ShelfDepth        = 120.f;
+    float   AbyssDepth        = 3820.f;  // shelf + slope
+    // Detail amplitude by regime (metres): plains, + hills, + mountains, + escarpments.
+    float   DetailPlains      = 4.f;
+    float   DetailHills       = 14.f;
+    float   DetailMountains   = 15.f;
+    float   DetailCliffs      = 8.f;
 };
 
 struct NoiseParams
 {
-    // true: tectonic terrain (PlanetTectonics.h). false: the original
+    // true: terrain shape V4 (PlanetTerrainShape.h). false: the original
     // formula (continent * 12 km + ridged mountains everywhere).
-    bool    bTectonics = true;
-    TectonicParams Tectonics;
+    bool    bShapedTerrain = true;
+    ShapeParams Shape;
 
     // ── Continent ───────────────────────────────────────────────────────
     float   ContinentFrequency = 1.2f;
@@ -294,8 +279,7 @@ struct HaloGrid
 class NoiseGraph
 {
 public:
-    NoiseGraph();
-    ~NoiseGraph();
+    NoiseGraph() = default;
     NoiseGraph(const NoiseGraph&) = delete;
     NoiseGraph& operator=(const NoiseGraph&) = delete;
 
@@ -325,14 +309,13 @@ public:
     void EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,
                                  int32_t Count, double* OutHeight) const;
 
-    // Erosion inputs of the ORIGINAL formula (bTectonics = false): Mask 0..1
-    // is the land mask (0 under water, the shore ramp that fades the mountains
-    // in), Fade -1..1 hints valleys vs peaks. The tectonic terrain computes
-    // its own (mountains only); Surface / HaloGrid carry the result.
+    // Erosion inputs of the ORIGINAL formula (bShapedTerrain = false): Mask
+    // 0..1 is the land mask (0 under water, the shore ramp that fades the
+    // mountains in), Fade -1..1 hints valleys vs peaks. The V4 shape computes
+    // its own (mountains and escarpments); Surface / HaloGrid carry the result.
     void ErosionMaskFade(float Continent, float Mountain, float& OutMask, float& OutFade) const;
 
-    // Tectonic terrain diagnostics.
-    int32_t GetPlateCount() const;
+    // Terrain shape diagnostics.
     float   GetLandScale() const { return LandScale; }
 
     // Branch-free tangent basis; deterministic for a given direction, so a
@@ -344,7 +327,7 @@ public:
 
     float ComputeSeaLevelForLandFraction(float Target, int32_t SamplesPerFace = 32);
 
-    // The original formula (bTectonics = false).
+    // The original formula (bShapedTerrain = false).
     double ComposeHeight(float C, float M, float D) const;
 
     struct Range { float Min = 0.f; float Max = 0.f; double Mean = 0.0; };
@@ -364,9 +347,10 @@ private:
                          double* OutHeight, float* OutContinent, float* OutMountain,
                          float* OutInland, float* OutMask, float* OutFade) const;
 
-    // Places the plates on the continents and measures LandScale. Needs the
-    // sea level: called by Build and again when the sea level is recomputed.
-    void BuildTectonics();
+    // Measures LandScale and the std devs of the V4 noise fields. LandScale
+    // needs the sea level: called by Build and again when the sea level is
+    // recomputed.
+    void BuildShape();
 
     void Gen(const FastNoise::SmartNode<>& Node, float* Out, int32_t Count,
              const float* X, const float* Y, const float* Z) const;
@@ -401,11 +385,13 @@ private:
     FastNoise::SmartNode<FastNoise::Simplex>            DetailSource;
     FastNoise::SmartNode<FastNoise::FractalFBm>         DetailFractal;
 
-    // Tectonic terrain.
-    FastNoise::SmartNode<> UpliftNode, HillsNode, HillRegimeNode, OldRangesNode, AlpineNode;
-    FastNoise::SmartNode<> WarpNode[3];
-    std::unique_ptr<PlanetTectonics::Plates> Plates;
-    float LandScale = 0.64f;
+    // Terrain shape V4.
+    FastNoise::SmartNode<> ShapeErosion, ShapeWeird, ShapePlateau, ShapeLevel, ShapeMass, ShapeHills;
+    FastNoise::SmartNode<> ShapePeaks[5];
+    // Std devs of the fields above (FBm outputs are far from [-1, 1]):
+    // erosion, weird, plateau, level, mass, hills.
+    float ShapeSd[6] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    float LandScale = 0.65f;
 
     NoiseParams Params;
     float SeaLevel = 0.f;

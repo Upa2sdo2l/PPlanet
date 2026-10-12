@@ -45,7 +45,7 @@ struct Params
 {
     double EquatorTempC     = 28.0;   // sea level, equator
     double PoleTempC        = -28.0;  // sea level, poles
-    // Degrees per km of altitude. Earth's ~6.5 suits the tectonic terrain;
+    // Degrees per km of altitude. Earth's ~6.5 suits the V4 terrain;
     // the original terrain (relief ~10x Earth's) needs ~3.
     double LapseCPerKm      = 6.5;
     // Share of the continental plateau (Inland * 12000: the broad base height,

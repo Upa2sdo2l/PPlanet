@@ -29,7 +29,14 @@
 // position, done by the material graph in double precision); their
 // derivatives come from the camera-relative position, which is continuous,
 // so mip selection has no seams at the wrap.
+//
+// PlanetSurfaceEx adds relief parallax near the camera (P3, P4; tracers in
+// PlanetTerrainParallax.ush): the ray from the camera meets the height maps
+// of the two strongest layers, and every texture of the pixel is then read at
+// that point. Mode 0 is exactly the surface without parallax.
 #pragma once
+
+#include "/PlanetErosion/PlanetTerrainParallax.ush"
 
 struct FPlanetSurfaceOut
 {
@@ -112,13 +119,18 @@ float PlanetSurf_MicroShadow(Texture2DArray Tex, SamplerState S, float2 UV, floa
 // P1       FarStart, FarEnd (cm), ReliefDepth (height map depth, tile units), ShadowSteps
 // P2       CavityStrength 0..1, MicroShadowStrength 0..1, unused, unused
 // SunDir   direction TOWARDS the sun, world (SkyAtmosphereLightDirection); 0 = no micro-shadows
-FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
-                                float3 UVNear, float3 UVMid, float3 UVMacro,
-                                Texture2DArray AH, SamplerState AHSampler,
-                                Texture2DArray NRA, SamplerState NRASampler,
-                                float3 C0, float3 C1, float3 C2, float3 C3,
-                                float3 C4, float3 C5, float3 C6, float3 C7,
-                                float4 P0, float4 P1, float4 P2, float3 SunDir)
+// P3       parallax: Mode (0 off, 1 POM fixed steps, 2 cells), Depth (tile units of TileNear;
+//          0 = ReliefDepth), End (cm; fades out from 0.6 x End), Budget (steps / cells, 4..64)
+// P4       parallax: Debug (0 off, 1 steps used, 2 hit depth, 3 mip), MipBias,
+//          GrazeFade (cos of the view angle below which parallax fades out), unused
+FPlanetSurfaceOut PlanetSurfaceEx(float4 W0, float4 W1, float3 N, float3 RelPos,
+                                  float3 UVNear, float3 UVMid, float3 UVMacro,
+                                  Texture2DArray AH, SamplerState AHSampler,
+                                  Texture2DArray NRA, SamplerState NRASampler,
+                                  float3 C0, float3 C1, float3 C2, float3 C3,
+                                  float3 C4, float3 C5, float3 C6, float3 C7,
+                                  float4 P0, float4 P1, float4 P2, float3 SunDir,
+                                  float4 P3, float4 P4)
 {
     // ── Layer weights: the two strongest, renormalised ─────────────────────────
     float W[8] = { W0.x, W0.y, W0.z, W0.w, W1.x, W1.y, W1.z, W1.w };
@@ -161,6 +173,8 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
     float  NStr = lerp(1.0, 0.5, smoothstep(P0.w, P1.x, Dist));
 
     float3 Colour = FarColour;
+    float  PxDebugOn = 0.0;
+    float3 PxDebug = float3(0.0, 0.0, 0.0);
     FPlanetSurfaceOut Out;
     Out.Normal    = Nw;
     Out.Roughness = 0.85;
@@ -180,6 +194,51 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
 
         int   Axis[2] = { MA, ME };
         float Sgn[2]  = { sign(Nw[MA] + 1e-6), sign(Nw[ME] + 1e-6) };
+
+        // ── Parallax: where the view ray meets the relief (PlanetTerrainParallax.ush).
+        //    Traced on the dominant plane at the Near scale; the hit is a WORLD
+        //    offset, so all planes and scales are then read at the same point. The
+        //    relief is Depth deep along the surface normal while the texture runs
+        //    along the projection axis (oblique on a sphere): per unit of depth the
+        //    ray moves Plane(V) / (-V.N) across the texture. ─────────────────────
+        if (P3.x > 0.5)
+        {
+            float3 Vd     = RelPos / max(Dist, 1e-3);           // camera -> pixel
+            float  VdotN  = -dot(Vd, Nw);
+            float  PxFade = (1.0 - smoothstep(P3.z * 0.6, P3.z, Dist))
+                          * smoothstep(0.0, max(P4.z, 0.01), VdotN);
+            float  DepthCm = ((P3.y > 0.0) ? P3.y : P1.z) * P0.x * PxFade;
+            if (DepthCm > 0.05)
+            {
+                float2 SFl  = float2(Sgn[0], 1.0);
+                float  TBot = DepthCm / max(VdotN, 0.05);       // ray length to the bottom, cm
+                float2 UV0  = PlanetSurf_Plane(UVNear, MA) * SFl;
+                float2 D    = PlanetSurf_Plane(Vd, MA) * SFl * (TBot / P0.x);
+                float2 DUx  = PlanetSurf_Plane(RelDX, MA) * SFl / P0.x;
+                float2 DUy  = PlanetSurf_Plane(RelDY, MA) * SFl / P0.x;
+                uint TW, TH, TE, TL;
+                AH.GetDimensions(0, TW, TH, TE, TL);
+                float  Budget = clamp(P3.w, 4.0, 64.0);
+                float  Mip = PlanetPx_Mip(DUx, DUy, D, (float)TW, (float)TL, Budget, P4.y);
+                float  Two = (LW1 > 0.03) ? 1.0 : 0.0;
+                FPlanetPxHit Hit;
+                if (P3.x < 1.5)
+                    Hit = PlanetPx_TracePOM(AH, AHSampler, UV0, D, Mip, Budget, (float)L0, (float)L1, LW0, LW1, Two);
+                else
+                    Hit = PlanetPx_TraceCells(AH, UV0, D, (float)TW, Mip, Budget, (float)L0, (float)L1, LW0, LW1, Two);
+                float3 Shift = Vd * (Hit.S * TBot);              // world cm from the pixel to the hit
+                UVNear  += Shift / P0.x;
+                UVMid   += Shift / P0.y;
+                UVMacro += Shift / P0.z;
+                if (P4.x > 0.5)
+                {
+                    PxDebugOn = 1.0;
+                    if (P4.x < 1.5)      PxDebug = lerp(float3(0.1, 0.2, 1.0), float3(1.0, 0.15, 0.05), Hit.Steps / Budget) * (Hit.Ok > 0.5 ? 1.0 : 0.3);
+                    else if (P4.x < 2.5) PxDebug = Hit.S.xxx;
+                    else                 PxDebug = float3(frac(Hit.Mip * 0.37), frac(Hit.Mip * 0.61 + 0.2), frac(Hit.Mip * 0.83 + 0.5)) * 0.8 + 0.2;
+                }
+            }
+        }
 
         // ── Sample both layers on both planes at the Mid (and Near) scale ───────
         float3 Alb = float3(0.0, 0.0, 0.0);
@@ -286,8 +345,22 @@ FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
         Out.Roughness = lerp(Rgh, 0.85, FarT);
         Out.AO        = lerp(Occ, 1.0, FarT);
     }
-    Out.Color = Colour;
+    Out.Color = (P4.x > 0.5) ? lerp(float3(0.25, 0.25, 0.25), PxDebug, PxDebugOn) : Colour;
     return Out;
+}
+
+// The surface without parallax (the planet material's node calls this).
+FPlanetSurfaceOut PlanetSurface(float4 W0, float4 W1, float3 N, float3 RelPos,
+                                float3 UVNear, float3 UVMid, float3 UVMacro,
+                                Texture2DArray AH, SamplerState AHSampler,
+                                Texture2DArray NRA, SamplerState NRASampler,
+                                float3 C0, float3 C1, float3 C2, float3 C3,
+                                float3 C4, float3 C5, float3 C6, float3 C7,
+                                float4 P0, float4 P1, float4 P2, float3 SunDir)
+{
+    return PlanetSurfaceEx(W0, W1, N, RelPos, UVNear, UVMid, UVMacro, AH, AHSampler, NRA, NRASampler,
+                           C0, C1, C2, C3, C4, C5, C6, C7, P0, P1, P2, SunDir,
+                           float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0));
 }
 
 // Older Code fields (materials set up before micro-shadows): no cavity

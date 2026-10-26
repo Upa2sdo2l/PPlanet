@@ -1,0 +1,244 @@
+// PlanetTerrainParallax.ush
+// Relief parallax for the planet surface (included by PlanetTerrainSurface.ush).
+//
+// Per pixel a ray goes from the camera into the relief described by the height
+// maps of the two strongest layers and finds where it first meets it; the
+// textures are then read at that point, so stones overlap each other and the
+// gaps between them sink in when seen at an angle. No vertex moves.
+//
+// The relief: height 1 is the surface itself, height 0 lies Depth below it,
+// measured along the surface normal. The texture is projected along a world
+// axis (biplanar), so on a planet the projection axis and the normal usually
+// differ; the ray is set up for that oblique case (see PlanetSurfaceEx):
+//   s = depth below the surface / Depth, 0 at the pixel .. 1 at the bottom;
+//   uv(s) = UV0 + D * s  (D = the uv change between s = 0 and s = 1).
+// The ray has met the relief once  s >= 1 - h(uv(s)),  i.e. F(s) = h - 1 + s >= 0.
+//
+// Two tracers, picked per material for comparison:
+//   * PlanetPx_TracePOM   - classic parallax occlusion mapping: evenly spaced
+//     samples of the filtered height, then a secant step. Cheap per step, but
+//     a thin crest between two samples is missed (steps, sliding layers);
+//   * PlanetPx_TraceCells - walks the height map texel cell by texel cell
+//     (a 2D DDA) and solves exactly where the ray meets the bilinear height
+//     inside each cell (a quadratic), so nothing between samples is missed.
+//     The heights of the two layers are mixed per texel the same way the
+//     material mixes them; the field traced is the bilinear interpolation of
+//     those mixed texels. Two texels per layer are loaded per cell (the other
+//     two corners are carried over from the previous cell).
+// Both take a mip: the coarser of the pixel footprint and the mip at which the
+// ray crosses at most Budget cells (grazing rays get a coarser height map
+// instead of a longer walk).
+//
+// Written in the subset shared with C++ (a sandbox harness compiles this file
+// against a mock and checks the tracer against brute force): no swizzles
+// beyond .x/.y/.z/.w, no vector indexing, no out/inout parameters.
+#pragma once
+
+#ifndef PLANET_PX_LOOP
+#define PLANET_PX_LOOP [loop]
+#endif
+
+#define PLANET_PX_MAX_STEPS 64
+
+struct FPlanetPxHit
+{
+    float S;        // depth of the hit: 0 surface .. 1 bottom of the relief
+    float Steps;    // cells (or samples) used
+    float Mip;      // height-map mip used
+    float Ok;       // 1 found within the budget, 0 the budget ran out (S = best guess)
+};
+
+// Height-based mix of two layers, as PlanetSurf_HeightMix in
+// PlanetTerrainSurface.ush (keep in sync), returned as the mixed height.
+float PlanetPx_Mix(float Ha, float Wa, float Hb, float Wb)
+{
+    float Depth = 0.2;
+    float Top = max(Ha + Wa, Hb + Wb) - Depth;
+    float Ba = max(Ha + Wa - Top, 0.0);
+    float Bb = max(Hb + Wb - Top, 0.0);
+    return (Ha * Ba + Hb * Bb) / max(Ba + Bb, 1e-4);
+}
+
+int PlanetPx_Wrap(int X, int Size)
+{
+    int R = X % Size;
+    return (R < 0) ? R + Size : R;
+}
+
+// Mixed height of one texel of the given mip (Size = texels per side at that mip).
+float PlanetPx_Texel(Texture2DArray Tex, int X, int Y, int Size, int Mip,
+                     float L0, float L1, float W0, float W1, float Two)
+{
+    int Xw = PlanetPx_Wrap(X, Size);
+    int Yw = PlanetPx_Wrap(Y, Size);
+    float Ha = Tex.Load(int4(Xw, Yw, (int)L0, Mip)).w;
+    if (Two < 0.5) return Ha;
+    float Hb = Tex.Load(int4(Xw, Yw, (int)L1, Mip)).w;
+    return PlanetPx_Mix(Ha, W0, Hb, W1);
+}
+
+// Mixed filtered height at uv (hardware bilinear), for the POM tracer.
+float PlanetPx_Filtered(Texture2DArray Tex, SamplerState S, float2 UV, float Mip,
+                        float L0, float L1, float W0, float W1, float Two)
+{
+    float Ha = Tex.SampleLevel(S, float3(UV.x, UV.y, L0), Mip).w;
+    if (Two < 0.5) return Ha;
+    float Hb = Tex.SampleLevel(S, float3(UV.x, UV.y, L1), Mip).w;
+    return PlanetPx_Mix(Ha, W0, Hb, W1);
+}
+
+// Mip for the trace: pixel footprint (+ bias), but never so fine that the ray
+// would cross more than Budget cells. UV derivatives in tile units.
+float PlanetPx_Mip(float2 DUx, float2 DUy, float2 D, float Size0, float Levels, float Budget, float Bias)
+{
+    float Fx = (DUx.x * DUx.x + DUx.y * DUx.y) * Size0 * Size0;
+    float Fy = (DUy.x * DUy.x + DUy.y * DUy.y) * Size0 * Size0;
+    float Foot = floor(max(0.5 * log2(max(max(Fx, Fy), 1e-8)) + Bias, 0.0));
+    float Cells = (abs(D.x) + abs(D.y)) * Size0 + 2.0;
+    float Need = ceil(log2(max(Cells / max(Budget, 1.0), 1.0)));
+    return min(max(Foot, Need), Levels - 1.0);
+}
+
+// Smallest root of A s^2 + B s + C in (0, L]; -1 if there is none.
+float PlanetPx_Root(float A, float B, float C, float L)
+{
+    float R = -1.0;
+    if (abs(A) < 1e-7)
+    {
+        if (B > 1e-7)
+        {
+            float S = -C / B;
+            if (S > 0.0 && S <= L) R = S;
+        }
+        return R;
+    }
+    float Disc = B * B - 4.0 * A * C;
+    if (Disc < 0.0) return R;
+    // numerically stable pair of roots
+    float Q = -0.5 * (B + ((B >= 0.0) ? 1.0 : -1.0) * sqrt(Disc));
+    float R1 = Q / A;
+    float R2 = (abs(Q) > 1e-12) ? C / Q : R1;
+    float Lo = min(R1, R2);
+    float Hi = max(R1, R2);
+    if (Lo > 0.0 && Lo <= L) R = Lo;
+    else if (Hi > 0.0 && Hi <= L) R = Hi;
+    return R;
+}
+
+FPlanetPxHit PlanetPx_TracePOM(Texture2DArray Tex, SamplerState Smp, float2 UV0, float2 D, float Mip, float Budget,
+                               float L0, float L1, float W0, float W1, float Two)
+{
+    FPlanetPxHit Hit;
+    Hit.S = 1.0; Hit.Steps = 0.0; Hit.Mip = Mip; Hit.Ok = 1.0;
+    int N = clamp((int)(Budget + 0.5), 2, PLANET_PX_MAX_STEPS);
+    float SPrev = 0.0;
+    float FPrev = PlanetPx_Filtered(Tex, Smp, UV0, Mip, L0, L1, W0, W1, Two) - 1.0;
+    if (FPrev >= 0.0) { Hit.S = 0.0; Hit.Steps = 1.0; return Hit; }
+    PLANET_PX_LOOP
+    for (int i = 1; i <= PLANET_PX_MAX_STEPS; ++i)
+    {
+        if (i > N) break;
+        float S = (float)i / (float)N;
+        float2 UV = float2(UV0.x + D.x * S, UV0.y + D.y * S);
+        float F = PlanetPx_Filtered(Tex, Smp, UV, Mip, L0, L1, W0, W1, Two) - 1.0 + S;
+        Hit.Steps = (float)i;
+        if (F >= 0.0)
+        {
+            // secant between the last sample above and the first one below
+            Hit.S = SPrev + (S - SPrev) * (-FPrev) / max(F - FPrev, 1e-6);
+            return Hit;
+        }
+        SPrev = S; FPrev = F;
+    }
+    return Hit;
+}
+
+FPlanetPxHit PlanetPx_TraceCells(Texture2DArray Tex, float2 UV0, float2 D, float Size0, float MipF, float Budget,
+                                 float L0, float L1, float W0, float W1, float Two)
+{
+    FPlanetPxHit Hit;
+    Hit.S = 1.0; Hit.Steps = 0.0; Hit.Mip = MipF; Hit.Ok = 0.0;
+    int Mip = (int)MipF;
+    int Size = max(((int)Size0) >> Mip, 1);
+    int Bud = clamp((int)(Budget + 0.5), 1, PLANET_PX_MAX_STEPS);
+
+    // texel-centre space: texel k is centred at k; a cell spans [k, k + 1]
+    float X0 = UV0.x * (float)Size - 0.5;
+    float Y0 = UV0.y * (float)Size - 0.5;
+    float DX = D.x * (float)Size;             // per unit of s
+    float DY = D.y * (float)Size;
+    int Cx = (int)floor(X0);
+    int Cy = (int)floor(Y0);
+    int Sx = (DX >= 0.0) ? 1 : -1;
+    int Sy = (DY >= 0.0) ? 1 : -1;
+    float IX = 1.0 / max(abs(DX), 1e-6);
+    float IY = 1.0 / max(abs(DY), 1e-6);
+    float Fx = X0 - (float)Cx;
+    float Fy = Y0 - (float)Cy;
+    float TX = ((Sx > 0) ? 1.0 - Fx : Fx) * IX; // s where the ray leaves through an x / y border
+    float TY = ((Sy > 0) ? 1.0 - Fy : Fy) * IY;
+
+    float H00 = PlanetPx_Texel(Tex, Cx,     Cy,     Size, Mip, L0, L1, W0, W1, Two);
+    float H10 = PlanetPx_Texel(Tex, Cx + 1, Cy,     Size, Mip, L0, L1, W0, W1, Two);
+    float H01 = PlanetPx_Texel(Tex, Cx,     Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+    float H11 = PlanetPx_Texel(Tex, Cx + 1, Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+
+    float SIn = 0.0;
+    PLANET_PX_LOOP
+    for (int i = 0; i < PLANET_PX_MAX_STEPS; ++i)
+    {
+        if (i >= Bud) break;
+        Hit.Steps = (float)(i + 1);
+        float SOut = min(min(TX, TY), 1.0);
+        // bilinear height in the cell, h = H00 + C1 u + C2 v + C3 u v, with
+        // u = U0 + DX t, v = V0 + DY t (t = s - SIn):  F(t) = Aq t^2 + Bq t + Cq
+        float U0 = X0 + DX * SIn - (float)Cx;
+        float V0 = Y0 + DY * SIn - (float)Cy;
+        float C1 = H10 - H00;
+        float C2 = H01 - H00;
+        float C3 = H00 - H10 - H01 + H11;
+        float Aq = C3 * DX * DY;
+        float Bq = C1 * DX + C2 * DY + C3 * (U0 * DY + V0 * DX) + 1.0;
+        float Cq = H00 + C1 * U0 + C2 * V0 + C3 * U0 * V0 - 1.0 + SIn;
+        if (Cq >= 0.0) { Hit.S = SIn; Hit.Ok = 1.0; return Hit; }
+        float R = PlanetPx_Root(Aq, Bq, Cq, SOut - SIn);
+        if (R >= 0.0) { Hit.S = SIn + R; Hit.Ok = 1.0; return Hit; }
+        if (SOut >= 1.0) { Hit.S = 1.0; Hit.Ok = 1.0; return Hit; }
+        // next cell; two corners carry over
+        if (TX < TY)
+        {
+            Cx += Sx; TX += IX;
+            if (Sx > 0)
+            {
+                H00 = H10; H01 = H11;
+                H10 = PlanetPx_Texel(Tex, Cx + 1, Cy,     Size, Mip, L0, L1, W0, W1, Two);
+                H11 = PlanetPx_Texel(Tex, Cx + 1, Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+            }
+            else
+            {
+                H10 = H00; H11 = H01;
+                H00 = PlanetPx_Texel(Tex, Cx, Cy,     Size, Mip, L0, L1, W0, W1, Two);
+                H01 = PlanetPx_Texel(Tex, Cx, Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+            }
+        }
+        else
+        {
+            Cy += Sy; TY += IY;
+            if (Sy > 0)
+            {
+                H00 = H01; H10 = H11;
+                H01 = PlanetPx_Texel(Tex, Cx,     Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+                H11 = PlanetPx_Texel(Tex, Cx + 1, Cy + 1, Size, Mip, L0, L1, W0, W1, Two);
+            }
+            else
+            {
+                H01 = H00; H11 = H10;
+                H00 = PlanetPx_Texel(Tex, Cx,     Cy, Size, Mip, L0, L1, W0, W1, Two);
+                H10 = PlanetPx_Texel(Tex, Cx + 1, Cy, Size, Mip, L0, L1, W0, W1, Two);
+            }
+        }
+        SIn = SOut;
+    }
+    Hit.S = SIn;
+    return Hit;
+}

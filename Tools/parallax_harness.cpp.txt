@@ -1,0 +1,122 @@
+// parallax_harness.cpp.txt (.txt: must not be compiled by UBT)
+// Compiles GpuErosion/Shaders/PlanetTerrainParallax.ush against a mock and
+// checks the cell tracer against brute force on random height maps.
+//   cp ../GpuErosion/Shaders/PlanetTerrainParallax.ush . && cp parallax_harness.cpp.txt harness.cpp
+//   g++ -O2 -std=c++17 harness.cpp -o harness && ./harness
+// Result on 2026-10-27: cells mean |err| 1.3e-5, worst 2.5e-5 (= the brute-force
+// step), budget never ran out; POM with 16 steps off by > 5 % depth in 44 of 1200 rays.
+#include <cmath>
+#include <cstdio>
+#include <random>
+#include <vector>
+#include <algorithm>
+using std::abs;
+#define float double
+struct float2 { float x, y; float2() : x(0), y(0) {} float2(float a, float b) : x(a), y(b) {} };
+struct float3 { float x, y, z; float3(float a, float b, float c) : x(a), y(b), z(c) {} };
+struct float4 { float x, y, z, w; };
+struct int4 { int x, y, z, w; int4(int a, int b, int c, int d) : x(a), y(b), z(c), w(d) {} };
+struct SamplerState {};
+static float min(float a, float b) { return a < b ? a : b; }
+static float max(float a, float b) { return a > b ? a : b; }
+static int min(int a, int b) { return a < b ? a : b; }
+static int max(int a, int b) { return a > b ? a : b; }
+static int clamp(int v, int a, int b) { return v < a ? a : (v > b ? b : v); }
+struct Texture2DArray
+{
+    int Size, Slices, Levels;
+    std::vector<std::vector<std::vector<float>>> M;   // [mip][slice][y*s+x]
+    float4 Load(int4 p) const
+    {
+        const int s = Size >> p.w; float4 r{0, 0, 0, M[p.w][p.z][p.y * s + p.x]}; return r;
+    }
+    float4 SampleLevel(SamplerState, float3 c, float mip) const
+    {
+        const int m = (int)mip, s = Size >> m;
+        const float x = c.x * s - 0.5, y = c.y * s - 0.5;
+        const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+        const float fx = x - x0, fy = y - y0;
+        auto at = [&](int X, int Y) { X = ((X % s) + s) % s; Y = ((Y % s) + s) % s; return M[m][(int)c.z][Y * s + X]; };
+        float v = at(x0, y0) * (1 - fx) * (1 - fy) + at(x0 + 1, y0) * fx * (1 - fy) + at(x0, y0 + 1) * (1 - fx) * fy + at(x0 + 1, y0 + 1) * fx * fy;
+        float4 r{0, 0, 0, v}; return r;
+    }
+};
+#define PLANET_PX_LOOP
+#include "PlanetTerrainParallax.ush"
+
+int main()
+{
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<double> U(0, 1);
+    Texture2DArray T; T.Size = 64; T.Slices = 2; T.Levels = 7;
+    T.M.resize(7);
+    T.M[0].assign(2, std::vector<double>(64 * 64));
+    for (int sl = 0; sl < 2; sl++)
+    {
+        // stones: max of random bumps, sharp edges
+        std::vector<double>& H = T.M[0][sl];
+        for (int k = 0; k < 64 * 64; k++) H[k] = 0.1 * U(rng);
+        for (int b = 0; b < 60; b++)
+        {
+            double cx = U(rng) * 64, cy = U(rng) * 64, r = 2 + 6 * U(rng), hh = 0.4 + 0.6 * U(rng);
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+            {
+                double dx = std::remainder(x - cx, 64.0), dy = std::remainder(y - cy, 64.0);
+                double d = std::sqrt(dx * dx + dy * dy) / r;
+                if (d < 1) H[y * 64 + x] = std::max(H[y * 64 + x], hh * std::sqrt(1 - d * d));
+            }
+        }
+    }
+    for (int m = 1; m < 7; m++)
+    {
+        int s = 64 >> m; T.M[m].assign(2, std::vector<double>(s * s));
+        for (int sl = 0; sl < 2; sl++) for (int y = 0; y < s; y++) for (int x = 0; x < s; x++)
+        {
+            int p = s * 2;
+            auto& A = T.M[m - 1][sl];
+            T.M[m][sl][y * s + x] = 0.25 * (A[(2 * y) * p + 2 * x] + A[(2 * y) * p + 2 * x + 1] + A[(2 * y + 1) * p + 2 * x] + A[(2 * y + 1) * p + 2 * x + 1]);
+        }
+    }
+    // reference: the same field (bilinear of mixed texels), brute force along the ray
+    auto Field = [&](double u, double v, int mip, double W0, double W1, double Two)
+    {
+        int s = 64 >> mip; double x = u * s - 0.5, y = v * s - 0.5; int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+        double fx = x - x0, fy = y - y0;
+        auto h = [&](int X, int Y) { return PlanetPx_Texel(T, X, Y, s, mip, 0, 1, W0, W1, Two); };
+        return h(x0, y0) * (1 - fx) * (1 - fy) + h(x0 + 1, y0) * fx * (1 - fy) + h(x0, y0 + 1) * (1 - fx) * fy + h(x0 + 1, y0 + 1) * fx * fy;
+    };
+    double worstCell = 0, sumCell = 0, worstPom = 0, sumPom = 0; int n = 0, miss = 0, pomMiss = 0;
+    double stepsSum = 0;
+    for (int t = 0; t < 1200; t++)
+    {
+        double W0 = U(rng), W1 = 1 - W0, Two = (t % 2) ? 1.0 : 0.0;
+        if (Two < 0.5) { W0 = 1; W1 = 0; }
+        float2 UV0(U(rng) * 3 - 1, U(rng) * 3 - 1);
+        double ang = U(rng) * 2 * M_PI, len = 0.02 + 0.6 * U(rng) * U(rng);   // up to ~38 texels
+        float2 D(len * std::cos(ang), len * std::sin(ang));
+        int mip = (t / 2) % 3;
+        // brute force
+        double sref = 1.0;
+        for (int k = 0; k <= 40000; k++)
+        {
+            double s = k / 40000.0;
+            if (Field(UV0.x + D.x * s, UV0.y + D.y * s, mip, W0, W1, Two) - 1 + s >= 0) { sref = s; break; }
+        }
+        FPlanetPxHit H = PlanetPx_TraceCells(T, UV0, D, 64.0, (double)mip, 64.0, 0, 1, W0, W1, Two);
+        double e = std::fabs(H.S - sref);
+        if (!(H.Ok > 0.5)) miss++;
+        worstCell = std::max(worstCell, e); sumCell += e; stepsSum += H.Steps;
+        SamplerState S;
+        FPlanetPxHit P = PlanetPx_TracePOM(T, S, UV0, D, (double)mip, 16.0, 0, 1, W0, W1, Two);
+        double ep = std::fabs(P.S - sref);
+        if (ep > 0.05) pomMiss++;
+        worstPom = std::max(worstPom, ep); sumPom += ep;
+        n++;
+    }
+    std::printf("cells: mean |err| %.2e, worst %.2e, budget ran out %d of %d, mean cells %.1f\n", sumCell / n, worstCell, miss, n, stepsSum / n);
+    std::printf("POM 16 steps: mean |err| %.2e, worst %.2e, off by > 0.05 depth: %d of %d\n", sumPom / n, worstPom, pomMiss, n);
+    // mip helper sanity
+    float2 dx(1.0 / 64 / 3, 0), dy(0, 1.0 / 64 / 3), Dm(0.5, 0.1);
+    std::printf("mip: footprint 1/3 texel, ray 38 cells, budget 16 -> %.0f (expect 2)\n", PlanetPx_Mip(dx, dy, Dm, 64, 7, 16, 0));
+    return (worstCell < 1e-3 && miss == 0) ? 0 : 1;
+}

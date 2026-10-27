@@ -227,23 +227,34 @@ inline double ProjectedError(double ChunkWorldSide, double CameraDistance,
     return ErrorWorld * ScreenScale / CameraDistance;
 }
 
+// Horizon test in angles. A point at height h above the reference sphere is
+// visible from the camera (above the sphere) while its angle from the camera's
+// direction is below
+//     acos(R / |camera|)   (the camera's horizon on the sphere)
+//   + acos(R / (R + h))    (how far beyond it a peak of height h still shows).
+// The chunk is culled when even its nearest part (centre angle minus its
+// angular half-diagonal) lies beyond that for the highest possible terrain.
+//
+// The earlier test added a slack to the COSINE of the angle. Near the ground
+// the horizon angle is tiny, cos is flat there, and that slack amounted to an
+// angular margin tens of times too large: almost nothing was culled and the
+// hidden chunks spent the leaf budget.
+//
+//   ChunkDir         unit direction of the chunk centre
+//   HalfDiagRad      angular half-diagonal of the chunk (an upper bound)
+//   MaxTerrainHeight highest terrain above the reference sphere (same units as R)
 inline bool HorizonCulled(const Vec3d& CamPos, double PlanetRadius,
-                          const Vec3d& SphereCentre, double SphereRadius)
+                          const Vec3d& ChunkDir, double HalfDiagRad, double MaxTerrainHeight)
 {
     const double CamDist = std::sqrt(CamPos.X*CamPos.X + CamPos.Y*CamPos.Y + CamPos.Z*CamPos.Z);
+    // Below the reference sphere (under the sea level): no horizon to rely on.
     if (CamDist < PlanetRadius + 1.0) return false;
 
-    const double HorizonCos = PlanetRadius / CamDist;
-    const double SphDist = std::sqrt(SphereCentre.X*SphereCentre.X +
-                                     SphereCentre.Y*SphereCentre.Y +
-                                     SphereCentre.Z*SphereCentre.Z);
-    if (SphDist < 1.0) return false;
-
-    const double CosAngle =
-        (CamPos.X*SphereCentre.X + CamPos.Y*SphereCentre.Y + CamPos.Z*SphereCentre.Z)
-        / (CamDist * SphDist);
-    const double Slack = SphereRadius / std::max(SphDist, 1.0);
-    return (CosAngle + Slack) < HorizonCos;
+    const double CamHorizon  = std::acos(std::clamp(PlanetRadius / CamDist, -1.0, 1.0));
+    const double PeakHorizon = std::acos(std::clamp(PlanetRadius / (PlanetRadius + std::max(0.0, MaxTerrainHeight)), -1.0, 1.0));
+    const double CosA = (CamPos.X*ChunkDir.X + CamPos.Y*ChunkDir.Y + CamPos.Z*ChunkDir.Z) / CamDist;
+    const double Alpha = std::acos(std::clamp(CosA, -1.0, 1.0));
+    return Alpha - HalfDiagRad > CamHorizon + PeakHorizon;
 }
 
 // ── Traversal: budgeted best-first refinement ───────────────────────────────
@@ -255,6 +266,9 @@ struct TraversalParams
 {
     Vec3d  CameraPos        = {0, 0, 0};
     double PlanetRadius     = 2500000.0;
+    // Highest terrain above the reference sphere (same units as PlanetRadius),
+    // erosion included: how far beyond the horizon a peak can still show.
+    // Used only by horizon culling. Too low = far peaks pop out of view.
     double HeightMargin     = 60000.0;
     // Terrain elevation under the camera (cm, may be negative). The error
     // metric measures distance to a sphere through that point instead of to
@@ -343,9 +357,11 @@ inline bool ChunkHorizonCulled(const ChunkKey& K, const TraversalParams& P)
     double U0, V0, Size;
     ChunkExtent(K, U0, V0, Size);
     const Vec3d Dir = CubeFaceDirection(K.Face, U0 + Size*0.5, V0 + Size*0.5);
-    const Vec3d C{Dir.X * P.PlanetRadius, Dir.Y * P.PlanetRadius, Dir.Z * P.PlanetRadius};
-    const double BoundsRadius = Size * P.PlanetRadius * 0.7072 + P.HeightMargin;
-    return HorizonCulled(P.CameraPos, P.PlanetRadius, C, BoundsRadius);
+    // On the cube map |d dir / dU| <= 1, so a UV distance is never a smaller
+    // angle: the UV half-diagonal Size * 0.7072 bounds the angular one.
+    // x1.3 slack on top.
+    const double HalfDiagRad = Size * 0.7072 * 1.3;
+    return HorizonCulled(P.CameraPos, P.PlanetRadius, Dir, HalfDiagRad, P.HeightMargin);
 }
 
 // ── Quadtree containment ────────────────────────────────────────────────────

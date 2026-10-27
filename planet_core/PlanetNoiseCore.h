@@ -318,6 +318,11 @@ public:
     // Terrain shape diagnostics.
     float   GetLandScale() const { return LandScale; }
 
+    // Upper bound of the terrain height above the reference sphere (metres),
+    // from the shape settings, erosion NOT included. Generous on purpose: it
+    // decides how far beyond the horizon chunks are kept (PlanetLOD).
+    double  MaxHeightEstimate() const;
+
     // Branch-free tangent basis; deterministic for a given direction, so a
     // point shared by two chunks gets the same basis from both.
     static void TangentBasis(const Vec3d& Dir, Vec3d& OutT1, Vec3d& OutT2) { BuildNormalBasis(Dir, OutT1, OutT2); }

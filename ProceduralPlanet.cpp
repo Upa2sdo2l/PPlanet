@@ -484,7 +484,12 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
     PlanetLOD::TraversalParams P;
     P.CameraPos        = PlanetLOD::Vec3d{CameraPos.X, CameraPos.Y, CameraPos.Z};
     P.PlanetRadius     = PlanetRadiusMetres * PLANET_METRES_TO_UE_CM;
-    P.HeightMargin     = HeightMarginMetres * PLANET_METRES_TO_UE_CM;
+    // Highest terrain: set by hand, or from the generator (shape + erosion),
+    // plus the room the material's own displacement may take.
+    const double MaxTerrainM = (HeightMarginMetres > 0.0)
+        ? HeightMarginMetres
+        : Generator.GetMaxTerrainHeight() * 1.1 + 200.0 + (bTerrainDetail ? DisplacementBoundsMarginMetres : 0.0);
+    P.HeightMargin     = MaxTerrainM * PLANET_METRES_TO_UE_CM;
     P.ErrorThresholdPx = ErrorThresholdPixels;
     P.ReliefCm         = LODReliefMetres * PLANET_METRES_TO_UE_CM;
 

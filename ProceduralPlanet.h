@@ -149,11 +149,13 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|Biomes")
     FPlanetBiomeSettings Biomes;
 
-    // Worst-case mountain height above the sphere, used only for bounding
-    // spheres and horizon culling. Over-estimating costs a little culling;
-    // under-estimating pops chunks, so this is generous on purpose.
+    // Highest terrain above the sphere, metres, used only by horizon culling:
+    // how far beyond the horizon a peak can still show. 0 = automatic, from
+    // the terrain shape settings and the erosion range (with 10 % slack).
+    // Over-estimating keeps hidden chunks (wasted leaf budget); under-estimating
+    // pops far peaks out of view.
     UPROPERTY(EditAnywhere, Category="Planet", meta=(ClampMin="0.0"))
-    double HeightMarginMetres = 60000.0;
+    double HeightMarginMetres = 0.0;
 
     // ── View for LOD selection ──────────────────────────────────────────
 

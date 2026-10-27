@@ -211,6 +211,25 @@ void NoiseGraph::BuildShape()
     }
 }
 
+double NoiseGraph::MaxHeightEstimate() const
+{
+    const NoiseParams& P = Params;
+    if (!P.bShapedTerrain)
+    {
+        // Continent above the sea stays below ~1.5; ridged peaks below the amplitude.
+        return 1.5 * 12000.0 + (double)P.MountainAmplitude + std::fabs((double)P.DetailAmplitude);
+    }
+    // V4 (PlanetTerrainShape::Compose), every term at its largest. The fields
+    // are std-normalised; |field| < 4.5 there.
+    const ShapeParams& S = P.Shape;
+    const double Base   = S.LowlandHeight + S.InteriorRise * 1.5;
+    const double Rolled = 18.0 * 4.5 + S.HillsMaxHeight + S.MountainMaxHeight;
+    const double Top    = S.TableMinHeight + 4.0 * S.TableLevelStep;
+    const double Table  = 1.45 * Top + 25.0 * 4.5;
+    const double Detail = std::fabs(S.DetailPlains) + std::fabs(S.DetailHills) + std::fabs(S.DetailMountains) + std::fabs(S.DetailCliffs);
+    return Base + std::max(Rolled, Table) + Detail;
+}
+
 void NoiseGraph::EvaluateTempNoise(const float* X, const float* Y, const float* Z, int32_t Count,
                                    float* Out) const
 {

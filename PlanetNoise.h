@@ -59,6 +59,20 @@ public:
     const PlanetErosion::Params& GetErosion() const { return Erosion; }
     bool HasErosion() const { return PlanetErosion::IsEnabled(Erosion); }
 
+    // Highest terrain above the reference sphere (metres), erosion included:
+    // the automatic margin of horizon culling.
+    double GetMaxTerrainHeight() const
+    {
+        double H = Graph.IsValid() ? Graph.MaxHeightEstimate() : 0.0;
+        if (HasErosion())
+        {
+            double Lo = 0.0, Hi = 0.0;
+            PlanetErosion::DeltaRange(Erosion, Lo, Hi);
+            H += FMath::Max(Hi, 0.0);
+        }
+        return H;
+    }
+
     // ── Biomes (climate model shared with the GPU) ──────────────────────
     void SetBiomes(const PlanetBiomes::Params& Params) { Biomes = Params; }
     const PlanetBiomes::Params& GetBiomes() const { return Biomes; }

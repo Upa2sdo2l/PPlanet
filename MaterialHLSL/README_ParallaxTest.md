@@ -57,9 +57,9 @@ C++ не менялся, пересобирать проект не нужно. 
 2. В копии **удалите связь World Position Offset**: вершинный шейдер планеты читает атласы чанков,
    на сфере их нет.
 3. **Веса слоёв вместо атласа биомов.** Новая нода **Custom**, код из `ParallaxTest_Weights.hlsl`:
-   - Output Type CMOT Float 4;
+   - Output Type **CMOT Float 4** (по умолчанию стоит Float 3 — обязательно поменять);
    - Inputs: `LayerA`, `LayerB`, `Mix`, `BlendUV`;
-   - Additional Outputs: `OutW1` (CMOT Float 4).
+   - Additional Outputs: `OutW1`, Output Type **CMOT Float 4** (по умолчанию Float 1).
 
    Подключите:
 
@@ -72,7 +72,37 @@ C++ не менялся, пересобирать проект не нужно. 
 
    Основной выход → вход `W0` ноды поверхности, `OutW1` → вход `W1`.
 4. **Нормаль:** во вход `N` ноды поверхности — нода **VertexNormalWS** (вместо атласа нормалей).
-5. **Нода поверхности:** код из `ParallaxTest_Surface.hlsl`. В конец списка Inputs добавьте `P3` и `P4`.
+5. **Нода поверхности.** Include File Paths не меняется: `/PlanetErosion/PlanetTerrainSurface.ush` (новый
+   файл он подключает сам). Код — из `ParallaxTest_Surface.hlsl`. Полный список Inputs, 24 штуки, имена
+   буква в букву:
+
+   | # | Вход | Что подключить |
+   |---|---|---|
+   | 1 | `W0` | основной выход ноды весов (п. 3) |
+   | 2 | `W1` | `OutW1` ноды весов |
+   | 3 | `N` | **VertexNormalWS** |
+   | 4 | `RelPos` | World Position, режим Camera Relative World Position |
+   | 5 | `UVNear` | Absolute World Position / `TileNear` → Frac |
+   | 6 | `UVMid` | Absolute World Position / `TileMid` → Frac |
+   | 7 | `UVMacro` | Absolute World Position / `TileMacro` → Frac |
+   | 8 | `AH` | Texture Object Parameter `PlanetLayersAH` |
+   | 9 | `NRA` | Texture Object Parameter `PlanetLayersNRA` |
+   | 10–17 | `C0` … `C7` | `LayerSand` … `LayerRock` |
+   | 18 | `P0` | Append(`TileNear`, `TileMid`, `TileMacro`, `NearEnd`) |
+   | 19 | `P1` | Append(`FarStart`, `FarEnd`, `ReliefDepth` 0.03, `ShadowSteps` 8) — **4 числа** |
+   | 20 | `P2` | Append(`CavityStrength` 0.6, `MicroShadowStrength` 0.6, 0, 0) |
+   | 21 | `SunDir` | **SkyAtmosphereLightDirection**, Light Index 0 |
+   | 22 | `P3` | Append(`PxMode`, `PxDepth`, `PxEnd`, `PxBudget`) |
+   | 23 | `P4` | Append(`PxDebug`, `PxMipBias`, `PxGrazeFade`, 0) |
+
+   Append склеивает по два входа: четыре числа = Append(Append(Append(a, b), c), d), нули — нода Constant.
+
+   **Если материал планеты собран по старой инструкции** (20 входов, есть `CamVec`, нет `P2` и
+   `SunDir`, в `P1` два числа): `CamVec` можно оставить или удалить, он не используется; недостающие
+   входы и параметры добавьте по таблице.
+
+   Выходы, как у материала планеты: основной → Base Color, `OutNormal` → Normal (Tangent Space
+   Normal выключен), `OutRoughness` → Roughness, `OutAO` → Ambient Occlusion.
 6. Новые параметры:
 
    | Нода | Имя | По умолчанию | Что |
@@ -137,6 +167,8 @@ C++ не менялся, пересобирать проект не нужно. 
 |---|---|
 | couldn't find include `/PlanetErosion/PlanetTerrainParallax.ush` | файл не скопирован или редактор не перезапущен |
 | Ошибка про `PlanetSurfaceEx` | не обновлён `PlanetTerrainSurface.ush` |
+| `use of undeclared identifier 'P2'` / `'SunDir'` / `'P3'` | у ноды поверхности нет этих входов, см. таблицу в п. 3.5 |
+| `vector swizzle 'w' is out of bounds` в `W0.w` | у ноды весов Output Type не Float 4 (по умолчанию Float 3), у `OutW1` тоже нужен Float 4 |
 | Материал не меняется после правки `.ush` | поменяйте комментарий `// px1` в конце кода ноды, Apply, Save |
 | Нет разницы между режимами | `PxEnd` = 0, камера дальше `PxEnd` или `PxDepth`/`ReliefDepth` = 0 |
 | Чёрные пятна от солнца | нет Sky Atmosphere или у Directional Light выключен Atmosphere Sun Light |

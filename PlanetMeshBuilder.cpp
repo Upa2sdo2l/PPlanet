@@ -28,43 +28,45 @@ namespace
         };
         Vert.SetColor(FColor(Q(S.Biome[0]), Q(S.Biome[1]), Q(S.Biome[2]), Q(S.Biome[3])));
     }
+
+    // Indices are identical for every chunk at this resolution: one array for
+    // every builder (there is one builder per pool slot; a copy each was up to
+    // 320 x 98 KB). Built on first use; a function-local static is initialised
+    // exactly once even when several workers get here together.
+    const TArray<uint32>& PlanetChunkIndices()
+    {
+        static const TArray<uint32> Indices = []
+        {
+            TArray<uint32> I;
+            I.SetNumUninitialized(TRI * 3);
+            int32 w = 0;
+            for (int32 gy = 0; gy < QUAD; ++gy)
+            {
+                for (int32 gx = 0; gx < QUAD; ++gx)
+                {
+                    const uint32 v00 = (uint32)(gx     + gy       * VPS);
+                    const uint32 v10 = (uint32)(gx + 1 + gy       * VPS);
+                    const uint32 v01 = (uint32)(gx     + (gy + 1) * VPS);
+                    const uint32 v11 = (uint32)(gx + 1 + (gy + 1) * VPS);
+
+                    // Winding verified numerically to face outward on all six cube
+                    // faces under UE's left-handed rule. This is the old project's
+                    // order, empirically confirmed to render on this engine
+                    // revision; the alternative diagonal is also outward but
+                    // untested here.
+                    I[w++] = v00; I[w++] = v01; I[w++] = v10;
+                    I[w++] = v10; I[w++] = v01; I[w++] = v11;
+                }
+            }
+            return I;
+        }();
+        return Indices;
+    }
 }
 
 struct FPlanetChunkMeshBuilder::FImpl
 {
     RealtimeMesh::FRealtimeMeshStreamSet StreamSet;
-
-    // Indices are identical for every chunk at this resolution, so they are
-    // built once. Per chunk that turns 24576 index writes into a memcpy.
-    TArray<uint32> Indices;
-    bool bIndicesBuilt = false;
-
-    void BuildIndicesOnce()
-    {
-        if (bIndicesBuilt) return;
-        Indices.SetNumUninitialized(TRI * 3, EAllowShrinking::No);
-
-        int32 w = 0;
-        for (int32 gy = 0; gy < QUAD; ++gy)
-        {
-            for (int32 gx = 0; gx < QUAD; ++gx)
-            {
-                const uint32 v00 = (uint32)(gx     + gy       * VPS);
-                const uint32 v10 = (uint32)(gx + 1 + gy       * VPS);
-                const uint32 v01 = (uint32)(gx     + (gy + 1) * VPS);
-                const uint32 v11 = (uint32)(gx + 1 + (gy + 1) * VPS);
-
-                // Winding verified numerically to face outward on all six cube
-                // faces under UE's left-handed rule. This is the old project's
-                // order, empirically confirmed to render on this engine
-                // revision; the alternative diagonal is also outward but
-                // untested here.
-                Indices[w++] = v00; Indices[w++] = v01; Indices[w++] = v10;
-                Indices[w++] = v10; Indices[w++] = v01; Indices[w++] = v11;
-            }
-        }
-        bIndicesBuilt = true;
-    }
 };
 
 FPlanetChunkMeshBuilder::FPlanetChunkMeshBuilder() : Impl(MakeUnique<FImpl>()) {}
@@ -91,7 +93,7 @@ bool FPlanetChunkMeshBuilder::Build(const FChunkKey& Key,
 {
     if (!Surfaces) return false;
     check(Impl.IsValid());
-    Impl->BuildIndicesOnce();
+    const TArray<uint32>& Indices = PlanetChunkIndices();
 
     const PlanetCore::FChunkKey CoreKey(Key.Face, Key.LOD, Key.X, Key.Y);
 
@@ -160,9 +162,9 @@ bool FPlanetChunkMeshBuilder::Build(const FChunkKey& Key,
 
     for (int32 t = 0; t < TRI; ++t)
     {
-        Builder.AddTriangle(Impl->Indices[t * 3],
-                            Impl->Indices[t * 3 + 1],
-                            Impl->Indices[t * 3 + 2],
+        Builder.AddTriangle(Indices[t * 3],
+                            Indices[t * 3 + 1],
+                            Indices[t * 3 + 2],
                             0);
     }
 

@@ -4,6 +4,7 @@
 #include "RealtimeMeshSimple.h"
 #include "RealtimeMeshComponent.h"
 #include "Engine/World.h"
+#include "Engine/GameViewportClient.h"
 #include "GameFramework/PlayerController.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Async/Async.h"
@@ -502,6 +503,31 @@ void AProceduralPlanet::UpdateLODSelection(const FVector3d& CameraPos)
         P.SurfaceOffsetCm = CameraTerrainHeightM * PLANET_METRES_TO_UE_CM;
     }
     P.MaxLOD           = (uint8_t)FMath::Clamp(MaxLOD, 1, 18);
+
+    // ErrorThresholdPixels is in pixels of the real view: the viewport height
+    // and the camera's vertical field of view (the core's defaults, 1080 px
+    // and 60 deg, stay when there is no game viewport, e.g. on a server).
+    // UE's camera FOV is horizontal (the default aspect constraint keeps X).
+    if (UWorld* World = GetWorld())
+    {
+        FVector2D ViewSize(0.0, 0.0);
+        if (UGameViewportClient* Viewport = World->GetGameViewport())
+        {
+            Viewport->GetViewportSize(ViewSize);
+        }
+        if (ViewSize.X >= 16.0 && ViewSize.Y >= 16.0)
+        {
+            P.ScreenHeightPx = ViewSize.Y;
+            double HorizontalFovDeg = 90.0;
+            if (APlayerController* PC = World->GetFirstPlayerController())
+            {
+                if (PC->PlayerCameraManager) HorizontalFovDeg = PC->PlayerCameraManager->GetFOVAngle();
+            }
+            HorizontalFovDeg = FMath::Clamp(HorizontalFovDeg, 5.0, 170.0);
+            const double HalfH = FMath::DegreesToRadians(HorizontalFovDeg) * 0.5;
+            P.VertFOVRad = 2.0 * FMath::Atan(FMath::Tan(HalfH) * ViewSize.Y / ViewSize.X);
+        }
+    }
 
     // The leaf budget is below the pool size: the spare slots keep replaced
     // chunks on screen until their replacements are built (PlanetStreaming).

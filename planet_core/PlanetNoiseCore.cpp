@@ -167,6 +167,8 @@ void NoiseGraph::Build(const NoiseParams& P)
         ShapePeaks[o] = Src;
     }
 
+    if (P.TerrainShape == ETerrainShape::V6) BuildV6();
+
     bValid = (ContinentWarp && MountainFractal && HumidityFractal && DetailFractal);
     SeaLevel = P.SeaLevelNorm;
     if (bValid) BuildShape();
@@ -174,7 +176,7 @@ void NoiseGraph::Build(const NoiseParams& P)
 
 void NoiseGraph::BuildShape()
 {
-    if (!Params.bShapedTerrain) return;
+    if (!Params.IsShaped()) return;
 
     // Fibonacci sphere: the std devs of the shape fields (their thresholds are
     // in std units) and the 90th percentile of land (scale of the base rise).
@@ -185,14 +187,22 @@ void NoiseGraph::BuildShape()
         const double z = 1.0 - 2.0 * (i + 0.5) / NP, r = std::sqrt(1.0 - z * z), ph = i * 2.399963229728653;
         X[i] = (float)(r * std::cos(ph)); Y[i] = (float)(r * std::sin(ph)); Z[i] = (float)z;
     }
-    const FastNoise::SmartNode<>* Fields[6] = {&ShapeErosion, &ShapeWeird, &ShapePlateau, &ShapeLevel, &ShapeMass, &ShapeHills};
-    for (int32_t f = 0; f < 6; ++f)
+    auto StdDev = [&](const FastNoise::SmartNode<>& Field) -> double
     {
-        Gen(*Fields[f], V.data(), NP, X.data(), Y.data(), Z.data());
+        Gen(Field, V.data(), NP, X.data(), Y.data(), Z.data());
         double S1 = 0.0, S2 = 0.0;
         for (float v : V) { S1 += v; S2 += (double)v * v; }
         S1 /= NP;
-        ShapeSd[f] = (float)std::max(1e-3, std::sqrt(std::max(0.0, S2 / NP - S1 * S1)));
+        return std::max(1e-3, std::sqrt(std::max(0.0, S2 / NP - S1 * S1)));
+    };
+    if (Params.TerrainShape == ETerrainShape::V4)
+    {
+        const FastNoise::SmartNode<>* Fields[6] = {&ShapeErosion, &ShapeWeird, &ShapePlateau, &ShapeLevel, &ShapeMass, &ShapeHills};
+        for (int32_t f = 0; f < 6; ++f) ShapeSd[f] = (float)StdDev(*Fields[f]);
+    }
+    else
+    {
+        for (int32_t f = 0; f < V6_FIELDS; ++f) V6Sd[f] = V6Field[f] ? StdDev(V6Field[f]) : 1.0;
     }
 
     LandScale = Params.Shape.LandScale;
@@ -214,7 +224,8 @@ void NoiseGraph::BuildShape()
 double NoiseGraph::MaxHeightEstimate() const
 {
     const NoiseParams& P = Params;
-    if (!P.bShapedTerrain)
+    if (P.TerrainShape == ETerrainShape::V6) return MaxHeightEstimateV6();
+    if (!P.IsShaped())
     {
         // Continent above the sea stays below ~1.5; ridged peaks below the amplitude.
         return 1.5 * 12000.0 + (double)P.MountainAmplitude + std::fabs((double)P.DetailAmplitude);
@@ -265,12 +276,17 @@ void NoiseGraph::EvaluateTerrain(const float* X, const float* Y, const float* Z,
         for (std::vector<float>* V : {&C, &M, &D, &E, &W, &Pl, &Lv, &Ms, &Hl, &Pk, &Tmp}) V->resize((size_t)Count);
         Rg.resize((size_t)Count);
     }
+    if (Params.TerrainShape == ETerrainShape::V6)
+    {
+        EvaluateTerrainV6(X, Y, Z, Count, bDetail, OutHeight, OutC, OutM, OutInland, OutMask, OutFade);
+        return;
+    }
     Gen(ContinentWarp, C.data(), Count, X, Y, Z);
     if (bDetail) Gen(DetailFractal, D.data(), Count, X, Y, Z);
     else std::fill(D.begin(), D.begin() + Count, 0.f);
     if (OutC) std::memcpy(OutC, C.data(), sizeof(float) * (size_t)Count);
 
-    if (!Params.bShapedTerrain)
+    if (!Params.IsShaped())
     {
         Gen(MountainFractal, M.data(), Count, X, Y, Z);
         if (OutM) std::memcpy(OutM, M.data(), sizeof(float) * (size_t)Count);

@@ -142,8 +142,23 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.MasterSeed          = P.MasterSeed;
     C.NoiseSwapYZ         = P.bNoiseLabOrientation;
 
-    // ── Terrain shape V4 ────────────────────────────────────────────────
-    C.bShapedTerrain          = P.bShapedTerrain;
+    // ── Terrain shape ───────────────────────────────────────────────────
+    switch (P.TerrainShape)
+    {
+        case EPlanetTerrainShape::Original: C.TerrainShape = PlanetCore::ETerrainShape::Original; break;
+        case EPlanetTerrainShape::V4:       C.TerrainShape = PlanetCore::ETerrainShape::V4; break;
+        default:                            C.TerrainShape = PlanetCore::ETerrainShape::V6; break;
+    }
+    C.ShapeV6.RegionScale       = P.V6RegionScale;
+    C.ShapeV6.MountainAmount    = P.V6MountainAmount;
+    C.ShapeV6.MountainMaxHeight = P.V6MountainMaxHeightMetres;
+    C.ShapeV6.RidgeWavelength   = P.V6RidgeWavelengthMetres;
+    C.ShapeV6.RidgeWarp         = P.V6RidgeWarpMetres;
+    C.ShapeV6.Pedestal          = P.V6PedestalMetres;
+    C.ShapeV6.RidgeSharpness    = P.V6RidgeSharpness;
+    C.ShapeV6.RidgeFloor        = P.V6RidgeFloor;
+    C.ShapeV6.RidgeOctaves      = P.V6RidgeOctaves;
+    // V4 (LowlandHeight, InteriorRise, ShelfDepth, AbyssDepth also V6):
     C.Shape.RegionScale       = P.RegionScale;
     C.Shape.MountainAmount    = P.MountainAmount;
     C.Shape.HillsAmount       = P.HillsAmount;
@@ -158,7 +173,8 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.Shape.TableLevelStep    = P.TableLevelStepMetres;
     C.Shape.ShelfDepth        = P.ShelfDepthMetres;
     C.Shape.AbyssDepth        = P.AbyssDepthMetres;
-    // DEFAULT (lab-tuned): LandScale auto, Detail* amplitudes by regime.
+    // DEFAULT (lab-tuned): LandScale auto, Detail* amplitudes by regime
+    // (V6: DetailPlains everywhere + DetailMountains in the ranges).
 
     // ── DEFAULT: not exposed as sliders yet ─────────────────────────────
     C.ContinentOctaves    = P.ContinentOctaves;

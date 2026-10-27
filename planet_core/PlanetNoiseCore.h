@@ -84,7 +84,7 @@ struct Vec3d
 inline Vec3d operator*(double S, const Vec3d& V) { return V * S; }
 
 // ── Shared constants (must match the UE-side header) ────────────────────────
-static constexpr uint32_t PLANET_GENERATOR_VERSION = 4;   // 4: terrain shape V4; 2: halo-grid normals, detail in metres
+static constexpr uint32_t PLANET_GENERATOR_VERSION = 6;   // 6: terrain shape V6; 4: V4; 2: halo-grid normals, detail in metres
 static constexpr int32_t  BIOME_GRASS = 0;
 static constexpr int32_t  BIOME_ROCK  = 1;
 static constexpr int32_t  BIOME_SAND  = 2;
@@ -136,6 +136,44 @@ enum ELayer : int32_t
     Layer_ShapeMass    = 35,
     Layer_ShapeHills   = 36,
     Layer_ShapePeaks   = 37,   // + 101 per octave
+    // Terrain shape V6 (seeds as in the terrain lab, lab6.cpp).
+    Layer_V6Rough      = 51,
+    Layer_V6Swell      = 53,
+    Layer_V6Hills      = 54,
+    Layer_V6Hummock    = 55,
+    Layer_V6RegionF    = 80,
+    Layer_V6RegionG    = 81,
+    Layer_V6RegionWarpX = 82,
+    Layer_V6RegionWarpY = 83,
+    Layer_V6RegionWarpZ = 84,
+    Layer_V6RidgeWarpX = 85,
+    Layer_V6RidgeWarpY = 86,
+    Layer_V6RidgeWarpZ = 87,
+    Layer_V6Activity   = 88,
+    Layer_V6Ridge      = 90,   // + 137 per octave
+};
+
+// Which terrain formula NoiseGraph evaluates.
+enum class ETerrainShape : int32_t
+{
+    Original = 0,   // continent * 12 km + ridged mountains on all land
+    V4       = 4,   // PlanetTerrainShape.h: regions of plains / hills / mountains, table mountains
+    V6       = 6,   // PlanetTerrainShapeV6.h: warped mountain regions, ridged ranges, piedmont
+};
+
+// Terrain shape "V6" (PlanetTerrainShapeV6.h). Metres on the surface. The
+// defaults are those of the terrain lab (lab6.cpp) the shape was tuned in.
+struct ShapeV6Params
+{
+    float   RegionScale       = 1.f;       // size of the mountain regions (1 = fields of 300 / 500 / 1200 km)
+    float   MountainAmount    = 0.5f;      // more / fewer mountain regions (0.5 = tuned)
+    float   MountainMaxHeight = 7000.f;    // relief of the highest ranges above their plain
+    float   RidgeWavelength   = 110000.f;  // largest octave of the ridged ranges
+    float   RidgeWarp         = 14000.f;   // how far the ranges are bent
+    float   Pedestal          = 450.f;     // regional uplift around the ranges (piedmont)
+    float   RidgeSharpness    = 1.4f;      // exponent on the ridged value: higher = narrower peaks
+    float   RidgeFloor        = 0.22f;     // share of the relief every mountain area keeps
+    int32_t RidgeOctaves      = 8;
 };
 
 // Terrain shape "V4" (PlanetTerrainShape.h). Heights in metres; "Amount"
@@ -166,10 +204,12 @@ struct ShapeParams
 
 struct NoiseParams
 {
-    // true: terrain shape V4 (PlanetTerrainShape.h). false: the original
-    // formula (continent * 12 km + ridged mountains everywhere).
-    bool    bShapedTerrain = true;
+    ETerrainShape TerrainShape = ETerrainShape::V6;
+    // V4 settings; LowlandHeight, InteriorRise, ShelfDepth, AbyssDepth,
+    // LandScale and the Detail* amplitudes also apply to V6.
     ShapeParams Shape;
+    ShapeV6Params ShapeV6;
+    bool IsShaped() const { return TerrainShape != ETerrainShape::Original; }
 
     // ── Continent ───────────────────────────────────────────────────────
     float   ContinentFrequency = 1.2f;
@@ -319,7 +359,7 @@ public:
     void EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,
                                  int32_t Count, double* OutHeight) const;
 
-    // Erosion inputs of the ORIGINAL formula (bShapedTerrain = false): Mask
+    // Erosion inputs of the ORIGINAL formula (TerrainShape = Original): Mask
     // 0..1 is the land mask (0 under water, the shore ramp that fades the
     // mountains in), Fade -1..1 hints valleys vs peaks. The V4 shape computes
     // its own (mountains and escarpments); Surface / HaloGrid carry the result.
@@ -342,7 +382,7 @@ public:
 
     float ComputeSeaLevelForLandFraction(float Target, int32_t SamplesPerFace = 32);
 
-    // The original formula (bShapedTerrain = false).
+    // The original formula (TerrainShape = Original).
     double ComposeHeight(float C, float M, float D) const;
 
     struct Range { float Min = 0.f; float Max = 0.f; double Mean = 0.0; };
@@ -362,10 +402,17 @@ private:
                          double* OutHeight, float* OutContinent, float* OutMountain,
                          float* OutInland, float* OutMask, float* OutFade) const;
 
-    // Measures LandScale and the std devs of the V4 noise fields. LandScale
-    // needs the sea level: called by Build and again when the sea level is
-    // recomputed.
+    // Measures LandScale and the std devs of the V4 / V6 noise fields.
+    // LandScale needs the sea level: called by Build and again when the sea
+    // level is recomputed.
     void BuildShape();
+
+    // Terrain shape V6 (PlanetTerrainShapeV6.cpp).
+    void BuildV6();
+    void EvaluateTerrainV6(const float* X, const float* Y, const float* Z, int32_t Count, bool bDetail,
+                           double* OutHeight, float* OutContinent, float* OutMountain,
+                           float* OutInland, float* OutMask, float* OutFade) const;
+    double MaxHeightEstimateV6() const;
 
     void Gen(const FastNoise::SmartNode<>& Node, float* Out, int32_t Count,
              const float* X, const float* Y, const float* Z) const;
@@ -407,6 +454,16 @@ private:
     // erosion, weird, plateau, level, mass, hills.
     float ShapeSd[6] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     float LandScale = 0.65f;
+
+    // Terrain shape V6: fields and their std devs (V6_* indices, PlanetTerrainShapeV6.h).
+    static constexpr int32_t V6_FIELDS = 13;
+public:
+    static constexpr int32_t V6_FIELDS_PUBLIC = V6_FIELDS;
+private:
+    static constexpr int32_t V6_MAX_RIDGE_OCTAVES = 10;
+    FastNoise::SmartNode<> V6Field[V6_FIELDS];
+    FastNoise::SmartNode<> V6Ridge[V6_MAX_RIDGE_OCTAVES];
+    double V6Sd[V6_FIELDS] = {};
 
     NoiseParams Params;
     float SeaLevel = 0.f;

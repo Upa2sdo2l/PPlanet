@@ -22,7 +22,7 @@
 
 // Bump when the noise graph, biome formula or erosion changes. The bake cache
 // hashes this, so stale bakes are evicted without a manual cache bust.
-static constexpr uint32 PLANET_GENERATOR_VERSION = 4;   // 4: terrain shape V4; 2: halo-grid normals, detail in metres
+static constexpr uint32 PLANET_GENERATOR_VERSION = 6;   // 6: terrain shape V6; 4: V4; 2: halo-grid normals, detail in metres
 
 // ── Chunk geometry (must match PlanetNoiseCore.h) ───────────────────────────
 static constexpr int32 PLANET_QUADS_PER_SIDE = 64;
@@ -57,6 +57,18 @@ enum class EPlanetBiome : uint8
     Sand  = 2,
     Snow  = 3,
     Count = 4,
+};
+
+// Terrain formula (PlanetCore::ETerrainShape).
+UENUM(BlueprintType)
+enum class EPlanetTerrainShape : uint8
+{
+    // Continent * 12 km + ridged mountains on all land (the first formula).
+    Original UMETA(DisplayName="Original"),
+    // Regions of plains, hills and mountains, table mountains (planet_core/PlanetTerrainShape.h).
+    V4       UMETA(DisplayName="V4: regions and table mountains"),
+    // Warped mountain regions with ridged ranges and a piedmont (planet_core/PlanetTerrainShapeV6.h).
+    V6       UMETA(DisplayName="V6: mountain belts"),
 };
 
 // ── Chunk key ───────────────────────────────────────────────────────────────
@@ -132,62 +144,103 @@ struct FPlanetNoiseParams
     float ShoreSharpness = 0.4f;
 
     // ── Terrain shape ───────────────────────────────────────────────────
-    // On: terrain shape V4 (planet_core/PlanetTerrainShape.h), Minecraft-style:
-    // broad regions of plains, hills and mountains, table mountains with flat
-    // tops, an ocean shelf. Continent settings above still place the land.
-    // Off: the original formula (continent * 12 km + ridged mountains on all
-    // land); the Mountains section, ShoreSharpness and OceanDepthScale apply
-    // only then.
+    // V6 (default): warped mountain regions with ridged ranges and a
+    // piedmont, plains with swells and hills (planet_core/PlanetTerrainShapeV6.h).
+    // V4: Minecraft-style regions of plains, hills and mountains, table
+    // mountains (planet_core/PlanetTerrainShape.h). Original: continent *
+    // 12 km + ridged mountains on all land; the Mountains section,
+    // ShoreSharpness and OceanDepthScale apply only then. Continent settings
+    // place the land in every shape.
     UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape")
-    bool bShapedTerrain = true;
+    EPlanetTerrainShape TerrainShape = EPlanetTerrainShape::V6;
 
+    // Ground height at the coast and its rise towards the continent interiors (V4 and V6).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="2000.0", EditCondition="TerrainShape != EPlanetTerrainShape::Original"))
+    float LowlandHeightMetres = 25.f;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="TerrainShape != EPlanetTerrainShape::Original"))
+    float InteriorRiseMetres = 220.f;
+
+    // Ocean: shelf depth and shelf + continental slope (V4 and V6).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="2000.0", EditCondition="TerrainShape != EPlanetTerrainShape::Original"))
+    float ShelfDepthMetres = 120.f;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="100.0", ClampMax="11000.0", EditCondition="TerrainShape != EPlanetTerrainShape::Original"))
+    float AbyssDepthMetres = 3820.f;
+
+    // ── Terrain shape V6 ────────────────────────────────────────────────
+    // Size of the mountain regions: 1 = fields of ~300 km (warped by 70 km);
+    // 0.5 = twice as many, smaller.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.1", ClampMax="5.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6RegionScale = 1.f;
+
+    // More / fewer mountain regions (0.5 = tuned default).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6MountainAmount = 0.5f;
+
+    // Relief of the highest ranges above their plain.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="20000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6MountainMaxHeightMetres = 7000.f;
+
+    // Wavelength of the largest ridged octave: the spacing of the main ranges.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="5000.0", ClampMax="500000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6RidgeWavelengthMetres = 110000.f;
+
+    // How far the ranges are bent (domain warp of the ridged field).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="100000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6RidgeWarpMetres = 14000.f;
+
+    // Regional uplift (piedmont) around the ranges.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6PedestalMetres = 450.f;
+
+    // Exponent on the ridged value: higher = narrower peaks, wider valleys.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.3", ClampMax="4.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6RidgeSharpness = 1.4f;
+
+    // Share of the relief every mountain area keeps, even in its valleys.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    float V6RidgeFloor = 0.22f;
+
+    // Ridged octaves: 8 at 110 km reach ~0.9 km.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="1", ClampMax="10", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    int32 V6RidgeOctaves = 8;
+
+    // ── Terrain shape V4 ────────────────────────────────────────────────
     // Size of the plains / hills / mountain regions: 1 = ~220 km, 0.5 = twice as many, smaller.
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.1", ClampMax="5.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.1", ClampMax="5.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float RegionScale = 1.f;
 
     // Share of mountain / hill regions and of table mountains (0.5 = tuned default).
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float MountainAmount = 0.5f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float HillsAmount = 0.5f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float TableAmount = 0.5f;
 
-    // Ground height at the coast and its rise towards the continent interiors.
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="2000.0", EditCondition="bShapedTerrain"))
-    float LowlandHeightMetres = 25.f;
-
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="bShapedTerrain"))
-    float InteriorRiseMetres = 220.f;
-
     // Hills above the plains: low where the peaks & valleys field is low, high on its peaks.
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float HillsMinHeightMetres = 180.f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float HillsMaxHeightMetres = 400.f;
 
     // Mountain massifs above their base, in valleys / on peaks.
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="20000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="20000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float MountainMinHeightMetres = 600.f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="20000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="20000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float MountainMaxHeightMetres = 3200.f;
 
     // Table-top levels above the base: Min, Min + Step, Min + 2 Step, Min + 3 Step.
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="10000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="10000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float TableMinHeightMetres = 400.f;
 
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="bShapedTerrain"))
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V4", meta=(ClampMin="0.0", ClampMax="5000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V4"))
     float TableLevelStepMetres = 600.f;
-
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="0.0", ClampMax="2000.0", EditCondition="bShapedTerrain"))
-    float ShelfDepthMetres = 120.f;
-
-    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape", meta=(ClampMin="100.0", ClampMax="11000.0", EditCondition="bShapedTerrain"))
-    float AbyssDepthMetres = 3820.f;
 
     // ── Mountains ───────────────────────────────────────────────────────
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
@@ -317,8 +370,10 @@ struct FPlanetNoiseParams
 // compute shader (PlanetErosion plugin). Mapped to PlanetErosion::Params by
 // PlanetBridge::ToCoreErosion. Defaults were tuned in the harness for
 // mountains of ~5-10 km; with much higher mountains raise ScaleMetres.
-// Terrain shape V4: erosion acts on the mountains and the table escarpments
-// only; original terrain: on all land.
+// Terrain shapes V4 / V6: erosion acts on the mountains (and V4's table
+// escarpments) only; original terrain: on all land. V6 was tuned in the
+// terrain lab with Strength 0.12 and HeightOffset -0.1 (ScaleMetres 4000,
+// 8 octaves).
 USTRUCT(BlueprintType)
 struct FPlanetErosionSettings
 {
@@ -462,7 +517,7 @@ inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
     Mix(&bAutoSeaLevel,        sizeof(bAutoSeaLevel));
     Mix(&SeaLevel,             sizeof(SeaLevel));
     Mix(&bNoiseLabOrientation, sizeof(bNoiseLabOrientation));
-    Mix(&bShapedTerrain,          sizeof(bShapedTerrain));
+    Mix(&TerrainShape,            sizeof(TerrainShape));
     Mix(&RegionScale,             sizeof(RegionScale));
     Mix(&MountainAmount,          sizeof(MountainAmount));
     Mix(&HillsAmount,             sizeof(HillsAmount));
@@ -477,6 +532,15 @@ inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
     Mix(&TableLevelStepMetres,    sizeof(TableLevelStepMetres));
     Mix(&ShelfDepthMetres,        sizeof(ShelfDepthMetres));
     Mix(&AbyssDepthMetres,        sizeof(AbyssDepthMetres));
+    Mix(&V6RegionScale,             sizeof(V6RegionScale));
+    Mix(&V6MountainAmount,          sizeof(V6MountainAmount));
+    Mix(&V6MountainMaxHeightMetres, sizeof(V6MountainMaxHeightMetres));
+    Mix(&V6RidgeWavelengthMetres,   sizeof(V6RidgeWavelengthMetres));
+    Mix(&V6RidgeWarpMetres,         sizeof(V6RidgeWarpMetres));
+    Mix(&V6PedestalMetres,          sizeof(V6PedestalMetres));
+    Mix(&V6RidgeSharpness,          sizeof(V6RidgeSharpness));
+    Mix(&V6RidgeFloor,              sizeof(V6RidgeFloor));
+    Mix(&V6RidgeOctaves,            sizeof(V6RidgeOctaves));
     return H ^ (uint64)PLANET_GENERATOR_VERSION;
 }
 

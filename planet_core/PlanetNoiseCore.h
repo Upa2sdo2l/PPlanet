@@ -464,6 +464,10 @@ private:
     FastNoise::SmartNode<> V6Field[V6_FIELDS];
     FastNoise::SmartNode<> V6Ridge[V6_MAX_RIDGE_OCTAVES];
     double V6Sd[V6_FIELDS] = {};
+    // Lookup tables of V6's per-point math (x^1.2, x^1.3, x^RidgeSharpness on
+    // [0, 1], tanh on [-6, 6]); built by BuildV6. A pow / tanh per point cost
+    // more than some of the noise layers (those are SIMD, this math is not).
+    std::vector<float> V6Lut;
 
     NoiseParams Params;
     float SeaLevel = 0.f;

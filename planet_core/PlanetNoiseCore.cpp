@@ -483,6 +483,43 @@ void NoiseGraph::SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* 
     }
 }
 
+void NoiseGraph::SampleChunkHalo(const FChunkKey& Key, HaloGrid& Out) const
+{
+    if (!bValid) return;
+    const int32_t G = PLANET_GRID_WITH_HALO;
+    const int32_t TotalG = G * G;
+    static thread_local std::vector<float> XG, YG, ZG;
+    if ((int32_t)XG.size() < TotalG)
+    {
+        XG.resize((size_t)TotalG); YG.resize((size_t)TotalG); ZG.resize((size_t)TotalG);
+    }
+    // Same grid, same order and same float conversion as SampleChunkBatch.
+    for (int32_t gy = 0; gy < G; ++gy)
+        for (int32_t gx = 0; gx < G; ++gx)
+        {
+            const int32_t i = gx + gy * G;
+            double U, V;
+            ChunkVertexUV(Key, gx, gy, U, V);
+            const Vec3d d = CubeFaceDirection(Key.Face, U, V);
+            Out.Dir[i] = d;
+            XG[i] = (float)d.X; YG[i] = (float)d.Y; ZG[i] = (float)d.Z;
+        }
+    EvaluateTerrain(XG.data(), YG.data(), ZG.data(), TotalG, true,
+                    Out.Height, Out.Continent, Out.Mountain, Out.Inland, Out.ErosionMask, Out.ErosionFade);
+    Gen(HumidityFractal, Out.Humidity, TotalG, XG.data(), YG.data(), ZG.data());
+    EvaluateTempNoise(XG.data(), YG.data(), ZG.data(), TotalG, Out.TempNoise);
+}
+
+void NoiseGraph::EvaluatePoint(const Vec3d& Dir, double* OutHeight, float* OutMask, float* OutFade) const
+{
+    const float x = (float)Dir.X, y = (float)Dir.Y, z = (float)Dir.Z;
+    double H = 0.0; float Mk = 0.f, Fd = 0.f;
+    EvaluateTerrain(&x, &y, &z, 1, true, &H, nullptr, nullptr, nullptr, &Mk, &Fd);
+    if (OutHeight) *OutHeight = H;
+    if (OutMask)   *OutMask = Mk;
+    if (OutFade)   *OutFade = Fd;
+}
+
 void NoiseGraph::SampleSurfaceBatch(const float* DirX, const float* DirY, const float* DirZ,
                                     int32_t Count, Surface* Out) const
 {

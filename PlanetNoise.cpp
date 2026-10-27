@@ -14,6 +14,12 @@ void FPlanetNoiseGenerator::Build(const FPlanetNoiseParams& InParams, double Pla
     }
 }
 
+void FPlanetNoiseGenerator::SampleChunkHalo(const FChunkKey& Key, PlanetCore::HaloGrid& Out) const
+{
+    if (!Graph.IsValid()) return;
+    Graph.SampleChunkHalo(PlanetBridge::ToCoreKey(Key), Out);
+}
+
 void FPlanetNoiseGenerator::SampleChunk(const FChunkKey& Key,
                                         TArrayView<PlanetCore::Surface> Out,
                                         PlanetCore::HaloGrid* OutHalo) const
@@ -27,10 +33,13 @@ double FPlanetNoiseGenerator::GetHeightAt(const FVector3d& UnitDir) const
 {
     if (!Graph.IsValid()) return 0.0;
     const PlanetCore::Vec3d Dir = PlanetBridge::ToCore(UnitDir.GetSafeNormal());
-    double H = Graph.EvaluateHeight(Dir);
+    // One evaluation of the point gives the height and the erosion inputs.
+    double H = 0.0;
+    float Mask = 0.f, Fade = 0.f;
+    Graph.EvaluatePoint(Dir, &H, &Mask, &Fade);
     if (HasErosion())
     {
-        H += PlanetErosion::DeltaAt(Graph, Dir, Erosion);
+        H += PlanetErosion::DeltaAt(Graph, Dir, Mask, Fade, Erosion);
     }
     return H;
 }
@@ -41,7 +50,7 @@ PlanetCore::Surface FPlanetNoiseGenerator::GetSurfaceAt(const FVector3d& UnitDir
     const PlanetCore::Vec3d Dir = PlanetBridge::ToCore(UnitDir.GetSafeNormal());
     PlanetCore::Surface S = Graph.SampleSurface(Dir);
     // Height only: normal and biomes stay those of the uneroded surface.
-    if (HasErosion()) S.Height += PlanetErosion::DeltaAt(Graph, Dir, Erosion);
+    if (HasErosion()) S.Height += PlanetErosion::DeltaAt(Graph, Dir, S.ErosionMask, S.ErosionFade, Erosion);
     return S;
 }
 

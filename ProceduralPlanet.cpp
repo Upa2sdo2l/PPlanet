@@ -162,19 +162,13 @@ public:
 
         if (Work->Job == AProceduralPlanet::FSlotWork::EJob::CollisionMesh)
         {
-            // The surfaces were sampled by this slot's Full job and have not
+            // The heights were sampled by this slot's Full job and have not
             // changed since: the slot is Active and reserved for this job.
             // Erosion heights come from the GPU (exactly what is drawn).
             const uint64 BuildStart = FPlatformTime::Cycles64();
-            const PlanetCore::Surface* Src = Work->Surfaces.GetData();
-            if (Work->CollisionDelta.Num() == PLANET_BODY_VERTS)
-            {
-                TArray<PlanetCore::Surface>& Eroded = ScratchSurfaces();
-                FMemory::Memcpy(Eroded.GetData(), Work->Surfaces.GetData(), sizeof(PlanetCore::Surface) * PLANET_BODY_VERTS);
-                for (int32 i = 0; i < PLANET_BODY_VERTS; ++i) Eroded[i].Height += (double)Work->CollisionDelta[i];
-                Src = Eroded.GetData();
-            }
-            Work->bMeshBuilt = Builder->Build(Work->Key, Src, PlanetRadius, Origin);
+            const float* Delta = (Work->CollisionDelta.Num() == PLANET_BODY_VERTS) ? Work->CollisionDelta.GetData() : nullptr;
+            Work->bMeshBuilt = Work->Heights.Num() == PLANET_BODY_VERTS
+                && Builder->BuildCollision(Work->Key, Work->Heights.GetData(), Delta, PlanetRadius, Origin);
             Work->bBuilt     = Work->bMeshBuilt;
             Work->BuildMs    = PlanetMsSince(BuildStart);
             Work->Generation = Generation;
@@ -182,12 +176,28 @@ public:
             return;
         }
 
-        // 1. Sample the surface (and, for the GPU renderer, the halo grid the
-        //    compute shader needs). ~1.7 ms per chunk on one core.
-        TArrayView<PlanetCore::Surface> View(Work->Surfaces.GetData(), Work->Surfaces.Num());
+        // 1. GPU renderer: the halo grid the compute shaders need, and the
+        //    chunk's heights for a later collision mesh. Normals, climate and
+        //    biomes per vertex are not computed: the shaders derive them from
+        //    the eroded heights. RealtimeMesh renderer: the full surfaces.
         const bool bTile = Work->bGpuTile && Work->Tile.IsValid();
         const uint64 NoiseStart = FPlatformTime::Cycles64();
-        Gen->SampleChunk(Work->Key, View, bTile ? &ScratchHalo() : nullptr);
+        if (bTile)
+        {
+            PlanetCore::HaloGrid& Halo = ScratchHalo();
+            Gen->SampleChunkHalo(Work->Key, Halo);
+            if (Work->Heights.Num() != PLANET_BODY_VERTS) Work->Heights.SetNumUninitialized(PLANET_BODY_VERTS);
+            constexpr int32 G = PlanetCore::PLANET_GRID_WITH_HALO;
+            double* Dst = Work->Heights.GetData();
+            for (int32 y = 0; y < PLANET_VERTS_PER_SIDE; ++y)
+                for (int32 x = 0; x < PLANET_VERTS_PER_SIDE; ++x)
+                    Dst[x + y * PLANET_VERTS_PER_SIDE] = Halo.Height[(x + 1) + (y + 1) * G];
+        }
+        else
+        {
+            if (Work->Surfaces.Num() != PLANET_BODY_VERTS) Work->Surfaces.SetNumUninitialized(PLANET_BODY_VERTS);
+            Gen->SampleChunk(Work->Key, TArrayView<PlanetCore::Surface>(Work->Surfaces.GetData(), Work->Surfaces.Num()), nullptr);
+        }
 
         // Erosion inputs: steering gradient (553 points x 4 samples of two
         // layers), land mask and fade. ~0.3 ms. Counted as noise.
@@ -237,12 +247,6 @@ private:
         static thread_local TUniquePtr<PlanetErosion::ChunkInputs> P;
         if (!P) P = MakeUnique<PlanetErosion::ChunkInputs>();
         return *P;
-    }
-    static TArray<PlanetCore::Surface>& ScratchSurfaces()
-    {
-        static thread_local TArray<PlanetCore::Surface> A;
-        if (A.Num() < PLANET_BODY_VERTS) A.SetNumUninitialized(PLANET_BODY_VERTS);
-        return A;
     }
 
     const FPlanetNoiseGenerator* Gen;
@@ -351,9 +355,10 @@ void AProceduralPlanet::CreatePool()
         SlotVisibleApplied.Add(0);
         SlotCollisionApplied.Add(0);
 
-        TUniquePtr<FSlotWork> W = MakeUnique<FSlotWork>();
-        W->Surfaces.SetNumUninitialized(PLANET_BODY_VERTS, EAllowShrinking::No);
-        SlotWork.Add(MoveTemp(W));
+        // Per-slot sample storage is allocated by the first job, for the
+        // renderer in use: full surfaces (RealtimeMesh, 473 KB) or just the
+        // heights (GPU renderer, 34 KB).
+        SlotWork.Add(MakeUnique<FSlotWork>());
 
         Builders.Add(MakeUnique<FPlanetChunkMeshBuilder>());
     }
@@ -1266,8 +1271,9 @@ FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
     TArray<double> NoiseMs, BuildMs, CreateMs, ConfigMs, TotalMs, InputsMs, ErodeMs;
     TUniquePtr<PlanetCore::HaloGrid>         BenchHalo   = MakeUnique<PlanetCore::HaloGrid>();
     TUniquePtr<PlanetErosion::ChunkInputs>   BenchInputs = MakeUnique<PlanetErosion::ChunkInputs>();
-    TArray<double>                           BenchDelta;
+    TArray<double>                           BenchDelta, BenchHeights;
     BenchDelta.SetNumUninitialized(PLANET_BODY_VERTS);
+    BenchHeights.SetNumUninitialized(PLANET_BODY_VERTS);
     const FRealtimeMeshSectionGroupKey GK = FRealtimeMeshSectionGroupKey::Create(0, TEXT("Chunk"));
     const FRealtimeMeshSectionKey      SK = FRealtimeMeshSectionKey::CreateForPolyGroup(GK, 0);
 
@@ -1277,8 +1283,11 @@ FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
             FMath::Clamp(CX - Side / 2 + i % Side, 0, Tiles - 1),
             FMath::Clamp(CY - Side / 2 + i / Side, 0, Tiles - 1));
 
+        // What the workers of the active renderer do: the GPU renderer samples
+        // only the halo grid; the RealtimeMesh renderer the full surfaces.
         uint64 T = FPlatformTime::Cycles64();
-        Generator.SampleChunk(Key, TArrayView<PlanetCore::Surface>(Surfaces.GetData(), Surfaces.Num()), BenchHalo.Get());
+        if (bGPUTerrain) Generator.SampleChunkHalo(Key, *BenchHalo);
+        else             Generator.SampleChunk(Key, TArrayView<PlanetCore::Surface>(Surfaces.GetData(), Surfaces.Num()), BenchHalo.Get());
         NoiseMs.Add(PlanetMsSince(T));
 
         if (Generator.HasErosion())
@@ -1293,7 +1302,18 @@ FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
 
         T = FPlatformTime::Cycles64();
         FVector3d Origin;
-        Builder.Build(Key, Surfaces.GetData(), PlanetRadiusMetres, Origin);
+        if (bGPUTerrain)
+        {
+            // The collision mesh of the GPU renderer, from the heights alone.
+            for (int32 y = 0; y < PLANET_VERTS_PER_SIDE; ++y)
+                for (int32 x = 0; x < PLANET_VERTS_PER_SIDE; ++x)
+                    BenchHeights[x + y * PLANET_VERTS_PER_SIDE] = BenchHalo->Height[(x + 1) + (y + 1) * PLANET_GRID_WITH_HALO];
+            Builder.BuildCollision(Key, BenchHeights.GetData(), nullptr, PlanetRadiusMetres, Origin);
+        }
+        else
+        {
+            Builder.Build(Key, Surfaces.GetData(), PlanetRadiusMetres, Origin);
+        }
         BuildMs.Add(PlanetMsSince(T));
 
         if (Mesh)
@@ -1330,10 +1350,10 @@ FString AProceduralPlanet::RunBenchmark(int32 Count, int32 LOD)
     Lines.Add(FString::Printf(
         TEXT("[Planet] planet.Bench: %d chunks, LOD %d (side ~%.0f m), game thread, one chunk at a time"),
         Count, LOD, TileSize * PlanetRadiusMetres));
-    Lines.Add(Row(TEXT("  noise (SampleChunk)         "), NoiseMs));
+    Lines.Add(Row(bGPUTerrain ? TEXT("  noise (SampleChunkHalo)     ") : TEXT("  noise (SampleChunk)         "), NoiseMs));
     Lines.Add(Row(TEXT("  erosion inputs (every tile) "), InputsMs));
     Lines.Add(Row(TEXT("  CPU erosion (reference only)"), ErodeMs));
-    Lines.Add(Row(TEXT("  mesh build (stream set)     "), BuildMs));
+    Lines.Add(Row(bGPUTerrain ? TEXT("  collision mesh build        ") : TEXT("  mesh build (stream set)     "), BuildMs));
     Lines.Add(Row(TEXT("  RMC remove + create section "), CreateMs));
     Lines.Add(Row(TEXT("  RMC config + collision call "), ConfigMs));
     Lines.Add(Row(TEXT("  total per chunk             "), TotalMs));

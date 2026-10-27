@@ -45,6 +45,10 @@ public:
     void SampleChunk(const FChunkKey& Key, TArrayView<PlanetCore::Surface> Out,
                      PlanetCore::HaloGrid* OutHalo = nullptr) const;
 
+    // GPU renderer: the halo grid only (no per-vertex normals, climate or
+    // biomes; the compute shaders derive them from the eroded heights).
+    void SampleChunkHalo(const FChunkKey& Key, PlanetCore::HaloGrid& Out) const;
+
     const PlanetCore::NoiseGraph& GetGraph() const { return Graph; }
 
     // ── Erosion ──────────────────────────────────────────────────────────

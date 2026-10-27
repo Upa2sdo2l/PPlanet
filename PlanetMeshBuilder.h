@@ -66,6 +66,17 @@ public:
                double PlanetRadius,
                FVector3d& OutChunkOrigin);
 
+    // Collision-only mesh (GPU renderer): positions from heights alone.
+    // The stream layout is the same as Build's, but normals are radial and
+    // UVs and colours zero: the section is never drawn, only cooked.
+    // @param Heights  PLANET_VERTS_PER_SIDE^2 heights above the sphere (metres), row-major
+    // @param Delta    the same count of erosion deltas (metres) added on top, or null
+    bool BuildCollision(const FChunkKey& Key,
+                        const double* Heights,
+                        const float* Delta,
+                        double PlanetRadius,
+                        FVector3d& OutChunkOrigin);
+
     // Valid until the next Build() on this instance.
     RealtimeMesh::FRealtimeMeshStreamSet& GetStreamSet();
 

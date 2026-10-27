@@ -131,5 +131,8 @@ void ErodeChunk(const PlanetCore::HaloGrid& Halo, const ChunkInputs& In, const P
 PlanetCore::Vec3d GradientAt(const PlanetCore::NoiseGraph& Graph, const PlanetCore::Vec3d& Dir,
                              const Params& Prm);
 double DeltaAt(const PlanetCore::NoiseGraph& Graph, const PlanetCore::Vec3d& Dir, const Params& Prm);
+// The same when the caller already has the point's erosion inputs
+// (NoiseGraph::EvaluatePoint): skips evaluating the point again.
+double DeltaAt(const PlanetCore::NoiseGraph& Graph, const PlanetCore::Vec3d& Dir, float Mask, float Fade, const Params& Prm);
 
 } // namespace PlanetErosion

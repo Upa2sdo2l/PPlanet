@@ -415,11 +415,16 @@ private:
     struct FSlotWork
     {
         // Full = sample the surface, then build the GPU tile and/or the mesh.
-        // CollisionMesh = build the mesh from the Surfaces kept from the last
-        // Full job (the chunk is already shown; the camera came close).
+        // CollisionMesh (GPU renderer) = build the collision mesh from the
+        // Heights kept from the last Full job (the chunk is already shown;
+        // the camera came close).
         enum class EJob : uint8 { Full, CollisionMesh };
 
+        // RealtimeMesh renderer: the full surfaces the visible mesh is built from.
         TArray<PlanetCore::Surface> Surfaces;
+        // GPU renderer: the chunk's 65x65 heights (metres, uneroded), for the
+        // collision mesh. Allocated by the first job.
+        TArray<double>              Heights;
         TAtomic<bool>               bDone{false};
         uint32                      Generation = 0;
         FChunkKey                   Key;
@@ -445,12 +450,12 @@ private:
         double                      NoiseMs = 0.0;
         double                      BuildMs = 0.0;
         // GPU renderer, CollisionMesh job: erosion heights read back from the
-        // GPU (65x65, metres), added to Surfaces. Empty = no erosion.
+        // GPU (65x65, metres), added to Heights. Empty = no erosion.
         TArray<float>               CollisionDelta;
     };
     TArray<TUniquePtr<FSlotWork>> SlotWork;
 
-    // One builder per worker keeps the stream-set buffers warm across chunks.
+    // One builder per pool slot (a slot's jobs never overlap).
     TArray<TUniquePtr<FPlanetChunkMeshBuilder>> Builders;
 
     uint64   FrameCounter = 0;

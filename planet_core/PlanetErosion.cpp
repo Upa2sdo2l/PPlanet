@@ -229,13 +229,21 @@ Vec3d GradientAt(const PlanetCore::NoiseGraph& Graph, const Vec3d& Dir, const Pa
     return GradientFromSamples(T1, T2, H, Step);
 }
 
+double DeltaAt(const PlanetCore::NoiseGraph& Graph, const Vec3d& Dir, float Mask, float Fade, const Params& Prm)
+{
+    if (!IsEnabled(Prm) || !Graph.IsValid() || Mask <= 0.f) return 0.0;
+    const Vec3d G = GradientAt(Graph, Dir, Prm);
+    return Erode(Dir, Graph.GetParams().PlanetRadiusMetres, G, Fade, Mask, Prm).DeltaHeight;
+}
+
 double DeltaAt(const PlanetCore::NoiseGraph& Graph, const Vec3d& Dir, const Params& Prm)
 {
     if (!IsEnabled(Prm) || !Graph.IsValid()) return 0.0;
-    const PlanetCore::Surface S = Graph.SampleSurface(Dir);
-    if (S.ErosionMask <= 0.f) return 0.0;
-    const Vec3d G = GradientAt(Graph, Dir, Prm);
-    return Erode(Dir, Graph.GetParams().PlanetRadiusMetres, G, S.ErosionFade, S.ErosionMask, Prm).DeltaHeight;
+    // Mask and fade only: a full SampleSurface also took two more height
+    // samples for the normal, climate and biomes, none of which is used here.
+    float Mask = 0.f, Fade = 0.f;
+    Graph.EvaluatePoint(Dir, nullptr, &Mask, &Fade);
+    return DeltaAt(Graph, Dir, Mask, Fade, Prm);
 }
 
 void BuildChunkInputs(const PlanetCore::NoiseGraph& Graph, const PlanetCore::FChunkKey& Key,

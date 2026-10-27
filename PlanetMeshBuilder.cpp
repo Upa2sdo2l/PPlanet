@@ -170,3 +170,68 @@ bool FPlanetChunkMeshBuilder::Build(const FChunkKey& Key,
 
     return true;
 }
+
+bool FPlanetChunkMeshBuilder::BuildCollision(const FChunkKey& Key,
+                                             const double* Heights,
+                                             const float* Delta,
+                                             double PlanetRadius,
+                                             FVector3d& OutChunkOrigin)
+{
+    if (!Heights) return false;
+    check(Impl.IsValid());
+    const TArray<uint32>& Indices = PlanetChunkIndices();
+
+    const PlanetCore::FChunkKey CoreKey(Key.Face, Key.LOD, Key.X, Key.Y);
+    {
+        // Same origin as Build: the chunk centre on the reference sphere.
+        const double D    = 2.0 / (double)((int64)1 << Key.LOD);
+        const double MidU = -1.0 + (double)Key.X * D + D * 0.5;
+        const double MidV = -1.0 + (double)Key.Y * D + D * 0.5;
+        const PlanetCore::Vec3d C = PlanetCore::CubeFaceDirection(Key.Face, MidU, MidV);
+        OutChunkOrigin = FVector3d(C.X, C.Y, C.Z) * (PlanetRadius * PLANET_METRES_TO_UE_CM);
+    }
+    const PlanetCore::Vec3d O(OutChunkOrigin.X, OutChunkOrigin.Y, OutChunkOrigin.Z);
+
+    Impl->StreamSet = RealtimeMesh::FRealtimeMeshStreamSet();
+    RealtimeMesh::TRealtimeMeshBuilderLocal<uint32, FPackedNormal, FVector2f, 1>
+        Builder(Impl->StreamSet);
+    // The layout Build uses, so the section is set up exactly as before.
+    Builder.EnableTangents();
+    Builder.EnableTexCoords();
+    Builder.EnableColors();
+    Builder.EnablePolyGroups();
+    Builder.ReserveNumVertices(VTX);
+    Builder.ReserveNumTriangles(TRI);
+
+    for (int32 gy = 0; gy < VPS; ++gy)
+    {
+        for (int32 gx = 0; gx < VPS; ++gx)
+        {
+            const int32 i = gx + gy * VPS;
+            double U, V;
+            PlanetCore::ChunkVertexUV(CoreKey, gx + 1, gy + 1, U, V);
+            const PlanetCore::Vec3d R = PlanetCore::CubeFaceDirection(Key.Face, U, V);
+            const double H = Heights[i] + (Delta ? (double)Delta[i] : 0.0);
+            const PlanetCore::Vec3d World = R * (PlanetRadius + H);
+
+            const FVector3f Pos(
+                (float)((World.X * PLANET_METRES_TO_UE_CM) - O.X),
+                (float)((World.Y * PLANET_METRES_TO_UE_CM) - O.Y),
+                (float)((World.Z * PLANET_METRES_TO_UE_CM) - O.Z));
+
+            PlanetCore::Vec3d T1, T2;
+            PlanetCore::NoiseGraph::TangentBasis(R, T1, T2);
+            auto Vert = Builder.AddVertex(Pos);
+            Vert.SetNormalAndTangent(FVector3f((float)R.X, (float)R.Y, (float)R.Z),
+                                     FVector3f((float)T1.X, (float)T1.Y, (float)T1.Z));
+            Vert.SetTexCoord(FVector2f(0.f, 0.f));
+            Vert.SetColor(FColor(0, 0, 0, 0));
+        }
+    }
+
+    for (int32 t = 0; t < TRI; ++t)
+    {
+        Builder.AddTriangle(Indices[t * 3], Indices[t * 3 + 1], Indices[t * 3 + 2], 0);
+    }
+    return true;
+}

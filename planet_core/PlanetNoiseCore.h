@@ -304,6 +304,16 @@ public:
     // OutHalo (optional) receives the whole sampled grid, halo included.
     void SampleChunkBatch(const FChunkKey& Key, Surface* Out, HaloGrid* OutHalo = nullptr) const;
 
+    // The halo grid only: what the GPU renderer needs (heights, climate noise,
+    // erosion inputs). No per-vertex normals, tangents, climate or biomes: the
+    // compute shaders derive those from the eroded heights. Fills Out exactly
+    // as SampleChunkBatch(Key, ..., &Out) does.
+    void SampleChunkHalo(const FChunkKey& Key, HaloGrid& Out) const;
+
+    // One point: height (metres, detail included) and the erosion inputs
+    // (mask, fade) of the uneroded surface. Any output may be null.
+    void EvaluatePoint(const Vec3d& UnitDir, double* OutHeight, float* OutMask, float* OutFade) const;
+
     // The height without the detail layer: the large-scale relief that
     // erosion follows.
     void EvaluateBaseHeightBatch(const float* X, const float* Y, const float* Z,

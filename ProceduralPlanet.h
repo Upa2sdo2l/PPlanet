@@ -281,6 +281,8 @@ private:
     void GpuUpdateEdgeDeltas();
     void GpuUpdateDetail(const FVector3d& CameraPos);
     void GpuRebaseIfNeeded(const FVector3d& CameraPos);
+    // Sends the changed instances to the renderer (planet.IsmPartialUpdate).
+    void GpuMarkInstancesDirty();
     FTransform GpuWorldTransform(int32 SlotIndex) const;
     void SyncSlotPresentationGpu();
 

@@ -32,9 +32,21 @@
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "TextureResource.h"
+#include "HAL/IConsoleManager.h"
 
 #include <unordered_map>
 #include <vector>
+
+// Optimisation p.3 (claude/polish_proposals.md): when chunks change, send only
+// the changed instances to the renderer instead of recreating the terrain's
+// whole render proxy. A recreated proxy is a removed and re-added primitive:
+// Virtual Shadow Maps then drop the cached pages of the whole terrain.
+// 0 = the old full update, for A/B in one build (stat gpu: ShadowDepths,
+// stat VirtualShadowMapCache).
+static TAutoConsoleVariable<int32> CVarPlanetIsmPartialUpdate(
+    TEXT("planet.IsmPartialUpdate"), 1,
+    TEXT("1: send only changed terrain instances to the renderer (default). 0: recreate the terrain render proxy on every change (old behaviour)."),
+    ECVF_Default);
 
 namespace
 {
@@ -296,6 +308,15 @@ UStaticMesh* AProceduralPlanet::BuildGridMesh()
     return Mesh;
 }
 
+// Instance transforms and custom data were changed with bMarkRenderStateDirty =
+// false (the ISM tracks every changed instance); now send them.
+void AProceduralPlanet::GpuMarkInstancesDirty()
+{
+    if (!TerrainISM) return;
+    if (CVarPlanetIsmPartialUpdate.GetValueOnGameThread() != 0) TerrainISM->MarkRenderInstancesDirty();
+    else                                                        TerrainISM->MarkRenderStateDirty();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per chunk
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,7 +544,7 @@ void AProceduralPlanet::GpuRebaseIfNeeded(const FVector3d& CameraPos)
     {
         TerrainISM->UpdateInstanceTransform(DetailInstanceBase + i, GpuWorldTransform(DetailInstances[i].BaseSlot), true, false, true);
     }
-    TerrainISM->MarkRenderStateDirty();
+    GpuMarkInstancesDirty();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -577,7 +598,7 @@ void AProceduralPlanet::SyncSlotPresentationGpu()
     if (bShownChanged)
     {
         GpuUpdateEdgeDeltas();
-        TerrainISM->MarkRenderStateDirty();
+        GpuMarkInstancesDirty();
     }
 
     // Closest first; each "on" launches a collision-mesh job for the slot.
@@ -721,5 +742,5 @@ void AProceduralPlanet::GpuUpdateDetail(const FVector3d& CameraPos)
     {
         TerrainISM->UpdateInstanceTransform(DetailInstanceBase + i, Hidden, true, false, true);
     }
-    TerrainISM->MarkRenderStateDirty();
+    GpuMarkInstancesDirty();
 }

@@ -158,6 +158,20 @@ inline PlanetCore::NoiseParams ToCoreParams(const FPlanetNoiseParams& P, double 
     C.ShapeV6.RidgeSharpness    = P.V6RidgeSharpness;
     C.ShapeV6.RidgeFloor        = P.V6RidgeFloor;
     C.ShapeV6.RidgeOctaves      = P.V6RidgeOctaves;
+    switch (P.V6MountainBlock)
+    {
+        case EPlanetMountainBlock::Hybrid: C.ShapeV6.Block = PlanetCore::EMountainBlock::Hybrid; break;
+        case EPlanetMountainBlock::Uber:   C.ShapeV6.Block = PlanetCore::EMountainBlock::Uber; break;
+        default:                           C.ShapeV6.Block = PlanetCore::EMountainBlock::Musgrave; break;
+    }
+    C.ShapeV6.HybridStartOctave   = P.V6HybridStartOctave;
+    C.ShapeV6.HybridLow           = P.V6HybridLow;
+    C.ShapeV6.HybridHigh          = P.V6HybridHigh;
+    C.ShapeV6.UberSharpness       = P.V6UberSharpness;
+    C.ShapeV6.UberSlopeErosion    = P.V6UberSlopeErosion;
+    C.ShapeV6.UberAltitudeErosion = P.V6UberAltitudeErosion;
+    C.ShapeV6.UberWarp            = P.V6UberWarpMetres;
+    C.ShapeV6.UberRidgesByHeight  = P.bV6UberRidgesByHeight;
     // V4 (LowlandHeight, InteriorRise, ShelfDepth, AbyssDepth also V6):
     C.Shape.RegionScale       = P.RegionScale;
     C.Shape.MountainAmount    = P.MountainAmount;

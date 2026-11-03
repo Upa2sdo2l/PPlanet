@@ -203,6 +203,9 @@ void NoiseGraph::BuildShape()
     else
     {
         for (int32_t f = 0; f < V6_FIELDS; ++f) V6Sd[f] = V6Field[f] ? StdDev(V6Field[f]) : 1.0;
+        // the mountain block map needs the std devs above (Uber's warp); it
+        // does not depend on the sea level (rebuilt with it, same result)
+        if (Params.TerrainShape == ETerrainShape::V6) BuildV6Blocks();
     }
 
     LandScale = Params.Shape.LandScale;

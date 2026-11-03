@@ -71,6 +71,19 @@ enum class EPlanetTerrainShape : uint8
     V6       UMETA(DisplayName="V6: mountain belts"),
 };
 
+// The noise inside V6's mountain regions (PlanetCore::EMountainBlock,
+// claude/idea_mountain_blocks.md). Regions, height, piedmont and plains stay.
+UENUM(BlueprintType)
+enum class EPlanetMountainBlock : uint8
+{
+    // Warped ridged multifractal: long ranges (V6 as before).
+    Musgrave UMETA(DisplayName="Musgrave (V6 as before)"),
+    // fBm body, octaves turn ridged towards the tops: branching flanks, crests and peaks on top.
+    Hybrid   UMETA(DisplayName="Hybrid: fBm + ridged tops"),
+    // "Uber noise" after No Man's Sky: plateaus, escarpments, single big peaks.
+    Uber     UMETA(DisplayName="Uber noise"),
+};
+
 // ── Chunk key ───────────────────────────────────────────────────────────────
 USTRUCT(BlueprintType)
 struct FChunkKey
@@ -186,7 +199,7 @@ struct FPlanetNoiseParams
     UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="5000.0", ClampMax="500000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
     float V6RidgeWavelengthMetres = 110000.f;
 
-    // How far the ranges are bent (domain warp of the ridged field).
+    // How far the ranges are bent (domain warp of the ridged field). Musgrave block only.
     UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="0.0", ClampMax="100000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
     float V6RidgeWarpMetres = 14000.f;
 
@@ -205,6 +218,47 @@ struct FPlanetNoiseParams
     // Ridged octaves: 8 at 110 km reach ~0.9 km.
     UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6", meta=(ClampMin="1", ClampMax="10", EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
     int32 V6RidgeOctaves = 8;
+
+    // ── Mountain block ──────────────────────────────────────────────────
+    // The noise inside the mountain regions. Ridge wavelength, octaves,
+    // sharpness and floor above apply to every block; the ridge warp to
+    // Musgrave only. Hybrid and Uber were tuned in the lab with the erosion
+    // filter at ScaleMetres 4000, Strength 0.12, HeightOffset -0.1.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(EditCondition="TerrainShape == EPlanetTerrainShape::V6"))
+    EPlanetMountainBlock V6MountainBlock = EPlanetMountainBlock::Musgrave;
+
+    // Hybrid (and Uber with ridges by height): first octave that may turn ridged
+    // (1 = half the ridge wavelength, 2 = a quarter: 27.5 km at 110 km).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="1", ClampMax="9", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock != EPlanetMountainBlock::Musgrave"))
+    int32 V6HybridStartOctave = 2;
+
+    // Share of the massif height where the ridges start / are full.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock != EPlanetMountainBlock::Musgrave"))
+    float V6HybridLow = 0.45f;
+
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock != EPlanetMountainBlock::Musgrave"))
+    float V6HybridHigh = 0.80f;
+
+    // Uber: blend of the octaves (from the 2nd) towards ridged.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock == EPlanetMountainBlock::Uber"))
+    float V6UberSharpness = 0.6f;
+
+    // Uber: finer octaves damped where the coarser ones are steep (smooth slopes, detail on flats).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="4.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock == EPlanetMountainBlock::Uber"))
+    float V6UberSlopeErosion = 0.6f;
+
+    // Uber: finer octaves damped in the low parts (smooth valleys and plateaus).
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock == EPlanetMountainBlock::Uber"))
+    float V6UberAltitudeErosion = 0.5f;
+
+    // Uber: domain warp, metres.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(ClampMin="0.0", ClampMax="50000.0", EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock == EPlanetMountainBlock::Uber"))
+    float V6UberWarpMetres = 6000.f;
+
+    // Uber: sharpness grows towards the tops (the hybrid rule, Hybrid settings above)
+    // instead of the same sharpness everywhere: single peaks and plateaus plus crests.
+    UPROPERTY(EditAnywhere, Category="Planet|Terrain Shape V6|Mountain Block", meta=(EditCondition="TerrainShape == EPlanetTerrainShape::V6 && V6MountainBlock == EPlanetMountainBlock::Uber"))
+    bool bV6UberRidgesByHeight = false;
 
     // ── Terrain shape V4 ────────────────────────────────────────────────
     // Size of the plains / hills / mountain regions: 1 = ~220 km, 0.5 = twice as many, smaller.
@@ -541,6 +595,15 @@ inline uint64 FPlanetNoiseParams::ComputeCacheHash() const
     Mix(&V6RidgeSharpness,          sizeof(V6RidgeSharpness));
     Mix(&V6RidgeFloor,              sizeof(V6RidgeFloor));
     Mix(&V6RidgeOctaves,            sizeof(V6RidgeOctaves));
+    Mix(&V6MountainBlock,           sizeof(V6MountainBlock));
+    Mix(&V6HybridStartOctave,       sizeof(V6HybridStartOctave));
+    Mix(&V6HybridLow,               sizeof(V6HybridLow));
+    Mix(&V6HybridHigh,              sizeof(V6HybridHigh));
+    Mix(&V6UberSharpness,           sizeof(V6UberSharpness));
+    Mix(&V6UberSlopeErosion,        sizeof(V6UberSlopeErosion));
+    Mix(&V6UberAltitudeErosion,     sizeof(V6UberAltitudeErosion));
+    Mix(&V6UberWarpMetres,          sizeof(V6UberWarpMetres));
+    Mix(&bV6UberRidgesByHeight,     sizeof(bV6UberRidgesByHeight));
     return H ^ (uint64)PLANET_GENERATOR_VERSION;
 }
 

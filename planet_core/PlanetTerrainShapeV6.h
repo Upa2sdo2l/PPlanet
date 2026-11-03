@@ -15,6 +15,23 @@
 // Tuned in the terrain lab (scratchpad terrain/lab6.cpp, mode 1); the harness
 // checks this port against it. No table mountains (V4 has them).
 //
+// ── Mountain blocks (ShapeV6Params::Block) ───────────────────────────────────
+// The ranges above are the Musgrave block. Two more blocks replace the noise
+// inside the mountain regions (lab7.cpp, claude/idea_mountain_blocks.md):
+//   Hybrid  fBm of the same octaves; from HybridStartOctave on, an octave turns
+//           ridged with the height the coarser ones have built (none below
+//           HybridLow of the massif, full above HybridHigh): the erosion filter
+//           draws branching gullies on the smooth flanks, the tops get crests
+//   Uber    "uber noise" after No Man's Sky: a mild warp, every octave partly
+//           ridged, octaves damped where the coarser ones are steep (Quilez,
+//           derivatives by finite differences: three samples per octave) and
+//           in the low parts: plateaus, escarpments, single big peaks.
+//           UberRidgesByHeight takes the sharpness from the hybrid rule
+// Both are mapped onto the height distribution of plain fBm (same hypsometry,
+// only the shape differs, nothing clamped on top), and give the erosion
+// filter a fade (valleys / peaks) from the height in the massif. Every
+// formula is a function of the point alone: chunks of any LOD agree.
+//
 // ── Large and small scale ────────────────────────────────────────────────────
 // The future global planet map stores, per planet, everything coarser than
 // ~10 km; chunks then add only the small scale. The fields are already split

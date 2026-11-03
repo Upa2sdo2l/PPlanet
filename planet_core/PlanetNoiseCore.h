@@ -161,6 +161,18 @@ enum class ETerrainShape : int32_t
     V6       = 6,   // PlanetTerrainShapeV6.h: warped mountain regions, ridged ranges, piedmont
 };
 
+// The noise inside V6's mountain regions ("mountain block"). Musgrave is the
+// original V6; Hybrid and Uber come from the terrain lab (lab7.cpp, see
+// claude/idea_mountain_blocks.md). The regions, their height, the piedmont and
+// the plains are the same for every block.
+enum class EMountainBlock : int32_t
+{
+    Musgrave = 0,   // warped ridged multifractal: long ranges (the original V6)
+    Hybrid   = 1,   // fBm body, octaves turn ridged towards the tops: branching flanks, crests on top
+    Uber     = 2,   // "uber noise" after No Man's Sky: slope / altitude erosion of the octaves,
+                    // plateaus, escarpments, single big peaks
+};
+
 // Terrain shape "V6" (PlanetTerrainShapeV6.h). Metres on the surface. The
 // defaults are those of the terrain lab (lab6.cpp) the shape was tuned in.
 struct ShapeV6Params
@@ -174,6 +186,24 @@ struct ShapeV6Params
     float   RidgeSharpness    = 1.4f;      // exponent on the ridged value: higher = narrower peaks
     float   RidgeFloor        = 0.22f;     // share of the relief every mountain area keeps
     int32_t RidgeOctaves      = 8;
+
+    // Mountain block. RidgeWavelength, RidgeOctaves, RidgeSharpness and
+    // RidgeFloor apply to every block; RidgeWarp to Musgrave only.
+    EMountainBlock Block      = EMountainBlock::Musgrave;
+    // Hybrid (and Uber with UberRidgesByHeight): from octave HybridStartOctave
+    // on (0 = RidgeWavelength), an octave turns from fBm into ridged with the
+    // height the coarser octaves have built: none below HybridLow of the massif
+    // height, fully ridged above HybridHigh.
+    int32_t HybridStartOctave = 2;
+    float   HybridLow         = 0.45f;
+    float   HybridHigh        = 0.80f;
+    // Uber noise.
+    float   UberSharpness     = 0.6f;      // blend of the octaves (from the 2nd) towards ridged
+    float   UberSlopeErosion  = 0.6f;      // octaves damped where the coarser ones are steep (Quilez)
+    float   UberAltitudeErosion = 0.5f;    // octaves damped in the low parts (smooth valleys, plateaus)
+    float   UberWarp          = 6000.f;    // domain warp, metres (the ranges' warp field, own amplitude)
+    bool    UberRidgesByHeight = false;    // sharpness grows towards the tops (the hybrid rule) instead
+                                           // of UberSharpness everywhere: single peaks + crests
 };
 
 // Terrain shape "V4" (PlanetTerrainShape.h). Heights in metres; "Amount"
@@ -413,6 +443,11 @@ private:
                            double* OutHeight, float* OutContinent, float* OutMountain,
                            float* OutInland, float* OutMask, float* OutFade) const;
     double MaxHeightEstimateV6() const;
+    // Mountain blocks other than Musgrave (PlanetTerrainShapeV6.cpp).
+    void   BuildV6Blocks();
+    void   V6BlockSum(const float* X, const float* Y, const float* Z, int32_t Count, int32_t Used,
+                      int32_t Block, double* OutSum) const;
+    double V6BlockR(double Sum) const;
 
     void Gen(const FastNoise::SmartNode<>& Node, float* Out, int32_t Count,
              const float* X, const float* Y, const float* Z) const;
@@ -468,6 +503,16 @@ private:
     // [0, 1], tanh on [-6, 6]); built by BuildV6. A pow / tanh per point cost
     // more than some of the noise layers (those are SIMD, this math is not).
     std::vector<float> V6Lut;
+    // Mountain blocks: a block's octave sum is mapped onto the height
+    // distribution of plain fBm of the same octaves (same hypsometry for every
+    // block, only the shape differs), then onto R as fBm would be (1st..99th
+    // percentile -> 0..1, unclamped on top). V6BlockMap: V6_BLOCK_KNOTS + 1
+    // knots of the block's sum over [V6BlockLo, V6BlockHi] -> fBm sum.
+    std::vector<double> V6BlockMap;
+    double V6BlockLo = 0.0, V6BlockHi = 1.0;
+    double V6BlockQ01 = -0.5, V6BlockQ99 = 0.5;   // percentiles of the fBm sum
+    double V6BlockRMax = 1.0;                      // largest R the map can return (height bound)
+    double V6RidgeMean = 0.638, V6RidgeSd = 0.241, V6NoiseSd = 0.434;   // one octave: 1 - |n| and n
 
     NoiseParams Params;
     float SeaLevel = 0.f;

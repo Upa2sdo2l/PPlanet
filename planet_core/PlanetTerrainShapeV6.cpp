@@ -50,7 +50,8 @@ namespace
     // still agree exactly.
     constexpr int32_t V6_LUT_N    = 2048;
     constexpr int32_t V6_LUT_SIZE = V6_LUT_N + 2;
-    enum : int32_t { V6_LUT_POW12 = 0, V6_LUT_POW13, V6_LUT_POWSHARP, V6_LUT_TANH, V6_LUT_COUNT };
+    // POWSHARPX: x^RidgeSharpness on [0, 2] (mountain blocks: R is not clamped at 1).
+    enum : int32_t { V6_LUT_POW12 = 0, V6_LUT_POW13, V6_LUT_POWSHARP, V6_LUT_TANH, V6_LUT_POWSHARPX, V6_LUT_COUNT };
     constexpr double V6_TANH_RANGE = 6.0;   // tanh(6) = 0.99999
 
     inline double V6Lookup(const float* Table, double Lo, double Scale, double X)
@@ -68,6 +69,17 @@ namespace
     {
         return V6Lookup(Table, -V6_TANH_RANGE, (double)V6_LUT_N / (2.0 * V6_TANH_RANGE), X);
     }
+    // x in [0, 2]
+    inline double V6PowX(const float* Table, double X) { return V6Lookup(Table, 0.0, 0.5 * (double)V6_LUT_N, X); }
+
+    // Mountain blocks.
+    constexpr int32_t V6_BLOCK_FBM    = -1;       // plain fBm of the same octaves: the reference distribution
+    constexpr int32_t V6_BLOCK_KNOTS  = 1024;     // knots of the block -> fBm map
+    constexpr int32_t V6_BLOCK_POINTS = 131072;   // sphere samples the map is measured on
+    constexpr double  V6_UBER_EPS     = 0.02;     // finite-difference step, share of the octave's wavelength
+    // Sum of the coarser octaves -> 0..1 "height of the massif so far" (fBm
+    // units: the 1st..99th percentile of the normalised sum is about +-0.55).
+    inline double V6HeightSoFar(double S, double ASum) { return std::clamp((S / ASum + 0.55) / 1.1, 0.0, 1.0); }
 }
 
 void NoiseGraph::BuildV6()
@@ -121,7 +133,204 @@ void NoiseGraph::BuildV6()
         V6Lut[(size_t)(V6_LUT_POW13    * V6_LUT_SIZE + i)] = (float)std::pow(X01, 1.3);
         V6Lut[(size_t)(V6_LUT_POWSHARP * V6_LUT_SIZE + i)] = (float)std::pow(X01, Sharp);
         V6Lut[(size_t)(V6_LUT_TANH     * V6_LUT_SIZE + i)] = (float)std::tanh(XT);
+        V6Lut[(size_t)(V6_LUT_POWSHARPX * V6_LUT_SIZE + i)] = (float)std::pow(std::min(2.0, 2.0 * (double)i / (double)V6_LUT_N), Sharp);
     }
+    // The block map needs the std devs of the warp fields: BuildShape builds it.
+    V6BlockMap.clear();
+    V6BlockRMax = 1.0;
+}
+
+// The octave sum of a mountain block (Hybrid, Uber, or V6_BLOCK_FBM for the
+// reference distribution), normalised by the amplitude sum of ALL octaves:
+// the base height (Used < octaves) is the same sum without its fine octaves.
+// Formulas of the terrain lab (lab7.cpp, V7_BLOCK=hybrid|uber).
+void NoiseGraph::V6BlockSum(const float* X, const float* Y, const float* Z, int32_t Count, int32_t Used,
+                            int32_t Block, double* S) const
+{
+    using namespace PlanetTerrainShapeV6;
+    const ShapeV6Params& V = Params.ShapeV6;
+    const double R = Params.PlanetRadiusMetres;
+    const int32_t Oct = V6Octaves(V);
+    const double  L   = V6RidgeWavelength(V);
+    Used = std::clamp(Used, 0, Oct);
+    double ASumAll = 0.0;
+    {
+        double a = 1.0;
+        for (int32_t o = 0; o < Oct; ++o, a *= 0.5) ASumAll += a;
+    }
+    for (int32_t i = 0; i < Count; ++i) S[i] = 0.0;
+
+    static thread_local std::vector<float> T, PX, PY, PZ, QX, QY, QZ, N1, N2;
+    static thread_local std::vector<double> Am, Dx, Dy, A1, A2, A3, B1, B2, B3;
+    if ((int32_t)T.size() < Count)
+    {
+        for (std::vector<float>* A : {&T, &PX, &PY, &PZ, &QX, &QY, &QZ, &N1, &N2}) A->resize((size_t)Count);
+        for (std::vector<double>* A : {&Am, &Dx, &Dy, &A1, &A2, &A3, &B1, &B2, &B3}) A->resize((size_t)Count);
+    }
+    const int32_t HStart = std::max(1, V.HybridStartOctave);
+    const double HLo = (double)V.HybridLow, HHi = std::max((double)V.HybridHigh, (double)V.HybridLow + 1e-3);
+    // ridged with the mean and spread of the noise itself, so blending does not lift the tops
+    auto Ridge = [&](double n) { return ((1.0 - std::fabs(n)) - V6RidgeMean) / V6RidgeSd * V6NoiseSd; };
+
+    if (Block == V6_BLOCK_FBM || Block == (int32_t)EMountainBlock::Hybrid)
+    {
+        double a = 1.0, asum = 0.0;
+        for (int32_t o = 0; o < Used; ++o, a *= 0.5)
+        {
+            Gen(V6Ridge[o], T.data(), Count, X, Y, Z);
+            for (int32_t i = 0; i < Count; ++i)
+            {
+                const double n = (double)T[i];
+                double v = n;
+                if (Block != V6_BLOCK_FBM && o >= HStart && asum > 0.0)
+                {
+                    const double w = V6SStep(HLo, HHi, V6HeightSoFar(S[i], asum));
+                    v = n + w * (Ridge(n) - n);
+                }
+                S[i] += a * v;
+            }
+            asum += a;
+        }
+    }
+    else if (Block == (int32_t)EMountainBlock::Uber)
+    {
+        // a mild domain warp: the ranges' warp field with its own amplitude
+        const double Aw = std::max(0.0, (double)V.UberWarp) / R;
+        if (Aw > 0.0)
+        {
+            Gen(V6Field[V6_RidgeWarpX], QX.data(), Count, X, Y, Z);
+            Gen(V6Field[V6_RidgeWarpY], QY.data(), Count, X, Y, Z);
+            Gen(V6Field[V6_RidgeWarpZ], QZ.data(), Count, X, Y, Z);
+            for (int32_t i = 0; i < Count; ++i)
+            {
+                PX[i] = (float)(X[i] + Aw * QX[i] / V6Sd[V6_RidgeWarpX]);
+                PY[i] = (float)(Y[i] + Aw * QY[i] / V6Sd[V6_RidgeWarpY]);
+                PZ[i] = (float)(Z[i] + Aw * QZ[i] / V6Sd[V6_RidgeWarpZ]);
+            }
+        }
+        else
+        {
+            std::memcpy(PX.data(), X, sizeof(float) * (size_t)Count);
+            std::memcpy(PY.data(), Y, sizeof(float) * (size_t)Count);
+            std::memcpy(PZ.data(), Z, sizeof(float) * (size_t)Count);
+        }
+        // tangent basis per point (a function of the point alone: shared vertices agree)
+        for (int32_t i = 0; i < Count; ++i)
+        {
+            const Vec3d p(PX[i], PY[i], PZ[i]);
+            const Vec3d up = std::fabs(p.Z) < 0.9 ? Vec3d(0, 0, 1) : Vec3d(1, 0, 0);
+            const Vec3d a = Vec3d::Cross(up, p).Normalised(), b = Vec3d::Cross(p, a);
+            A1[i] = a.X; A2[i] = a.Y; A3[i] = a.Z; B1[i] = b.X; B2[i] = b.Y; B3[i] = b.Z;
+            Am[i] = 1.0; Dx[i] = 0.0; Dy[i] = 0.0;
+        }
+        const double Sharp = (double)V.UberSharpness, Slope = std::max(0.0, (double)V.UberSlopeErosion);
+        const double Alt = std::clamp((double)V.UberAltitudeErosion, 0.0, 1.0);
+        double asum = 0.0;
+        for (int32_t o = 0; o < Used; ++o)
+        {
+            const double h = V6_UBER_EPS * (L / std::pow(2.0, o)) / R;
+            Gen(V6Ridge[o], T.data(), Count, PX.data(), PY.data(), PZ.data());
+            for (int32_t i = 0; i < Count; ++i)
+            {
+                QX[i] = (float)(PX[i] + h * A1[i]); QY[i] = (float)(PY[i] + h * A2[i]); QZ[i] = (float)(PZ[i] + h * A3[i]);
+            }
+            Gen(V6Ridge[o], N1.data(), Count, QX.data(), QY.data(), QZ.data());
+            for (int32_t i = 0; i < Count; ++i)
+            {
+                QX[i] = (float)(PX[i] + h * B1[i]); QY[i] = (float)(PY[i] + h * B2[i]); QZ[i] = (float)(PZ[i] + h * B3[i]);
+            }
+            Gen(V6Ridge[o], N2.data(), Count, QX.data(), QY.data(), QZ.data());
+            for (int32_t i = 0; i < Count; ++i)
+            {
+                double sh;
+                if (V.UberRidgesByHeight) sh = (o >= HStart && asum > 0.0) ? V6SStep(HLo, HHi, V6HeightSoFar(S[i], asum)) : 0.0;
+                else                      sh = (o >= 1) ? Sharp : 0.0;
+                const double n = (double)T[i];
+                const double v = n + sh * (Ridge(n) - n);
+                // slope erosion follows the smooth part of the octave: the ridge
+                // crease has a derivative jump, which would make the height jump too
+                Dx[i] += ((double)N1[i] - n) / V6_UBER_EPS;
+                Dy[i] += ((double)N2[i] - n) / V6_UBER_EPS;
+                S[i] += Am[i] * v / (1.0 + Slope * (Dx[i] * Dx[i] + Dy[i] * Dy[i]));
+            }
+            asum += std::pow(0.5, o);
+            for (int32_t i = 0; i < Count; ++i)
+                Am[i] *= 0.5 * (1.0 - Alt * (1.0 - V6HeightSoFar(S[i], asum)));   // altitude erosion
+        }
+    }
+    for (int32_t i = 0; i < Count; ++i) S[i] /= ASumAll;
+}
+
+// Block sum -> R (0 at the valley floors .. ~1 at the tops, more on the
+// highest peaks): through the map onto the fBm distribution, then as fBm.
+double NoiseGraph::V6BlockR(double Sum) const
+{
+    const int32_t K = (int32_t)V6BlockMap.size() - 1;
+    if (K < 1) return 0.0;
+    double u = (Sum - V6BlockLo) / (V6BlockHi - V6BlockLo) * (double)K;
+    u = std::clamp(u, -0.1 * (double)K, 1.1 * (double)K);   // beyond the samples: the end slope, 10 % at most
+    double m;
+    if (u <= 0.0)            m = V6BlockMap[0] + (V6BlockMap[1] - V6BlockMap[0]) * u;
+    else if (u >= (double)K) m = V6BlockMap[K] + (V6BlockMap[K] - V6BlockMap[K - 1]) * (u - (double)K);
+    else
+    {
+        const int32_t I = (int32_t)u;
+        m = V6BlockMap[I] + (V6BlockMap[I + 1] - V6BlockMap[I]) * (u - (double)I);
+    }
+    const double x = (m - V6BlockQ01) / (V6BlockQ99 - V6BlockQ01);
+    // soft floor, no ceiling: no flat valley floors, no flat summits
+    return x < 0.05 ? 0.05 - 0.05 * std::tanh((0.05 - x) / 0.05) : x;
+}
+
+void NoiseGraph::BuildV6Blocks()
+{
+    using namespace PlanetTerrainShapeV6;
+    V6BlockMap.clear();
+    V6BlockRMax = 1.0;
+    const int32_t Block = (int32_t)Params.ShapeV6.Block;
+    if (Block == (int32_t)EMountainBlock::Musgrave) return;
+
+    const int32_t NP = V6_BLOCK_POINTS;
+    std::vector<float> X(NP), Y(NP), Z(NP);
+    for (int32_t i = 0; i < NP; ++i)
+    {
+        const double z = 1.0 - 2.0 * (i + 0.5) / NP, r = std::sqrt(1.0 - z * z), ph = i * 2.399963229728653;
+        X[i] = (float)(r * std::cos(ph)); Y[i] = (float)(r * std::sin(ph)); Z[i] = (float)z;
+    }
+    // one octave: spread of n, mean and spread of its ridge 1 - |n|
+    {
+        std::vector<float> T(NP);
+        Gen(V6Ridge[0], T.data(), NP, X.data(), Y.data(), Z.data());
+        double s1 = 0, s2 = 0, r1 = 0, r2 = 0;
+        for (float v : T) { s1 += v; s2 += (double)v * v; const double r = 1.0 - std::fabs((double)v); r1 += r; r2 += r * r; }
+        V6NoiseSd   = std::sqrt(std::max(1e-12, s2 / NP - (s1 / NP) * (s1 / NP)));
+        V6RidgeMean = r1 / NP;
+        V6RidgeSd   = std::sqrt(std::max(1e-12, r2 / NP - V6RidgeMean * V6RidgeMean));
+    }
+    const int32_t Oct = V6Octaves(Params.ShapeV6);
+    std::vector<double> Sf(NP), Sb(NP);
+    V6BlockSum(X.data(), Y.data(), Z.data(), NP, Oct, V6_BLOCK_FBM, Sf.data());
+    V6BlockSum(X.data(), Y.data(), Z.data(), NP, Oct, Block, Sb.data());
+    std::sort(Sf.begin(), Sf.end());
+    std::sort(Sb.begin(), Sb.end());
+    V6BlockQ01 = Sf[(size_t)(0.01 * NP)];
+    V6BlockQ99 = Sf[(size_t)(0.99 * NP)];
+    V6BlockLo  = Sb.front();
+    V6BlockHi  = std::max(Sb.back(), Sb.front() + 1e-9);
+    V6BlockMap.resize((size_t)V6_BLOCK_KNOTS + 1);
+    for (int32_t k = 0; k <= V6_BLOCK_KNOTS; ++k)
+    {
+        const double v = V6BlockLo + (V6BlockHi - V6BlockLo) * (double)k / (double)V6_BLOCK_KNOTS;
+        // fractional rank of v among the block's samples -> the fBm sample of that rank
+        const size_t u = (size_t)(std::lower_bound(Sb.begin(), Sb.end(), v) - Sb.begin());
+        double q;
+        if (u == 0) q = 0.0;
+        else if (u >= (size_t)NP) q = (double)(NP - 1);
+        else q = (double)(u - 1) + (v - Sb[u - 1]) / std::max(1e-12, Sb[u] - Sb[u - 1]);
+        const size_t q0 = std::min((size_t)q, (size_t)NP - 2);
+        V6BlockMap[(size_t)k] = Sf[q0] + (Sf[q0 + 1] - Sf[q0]) * (q - (double)q0);
+    }
+    V6BlockRMax = std::max(1.0, V6BlockR(V6BlockHi + 0.1 * (V6BlockHi - V6BlockLo)));
 }
 
 double NoiseGraph::MaxHeightEstimateV6() const
@@ -134,7 +343,14 @@ double NoiseGraph::MaxHeightEstimateV6() const
     const double Base   = S.LowlandHeight + S.InteriorRise * 1.5;
     const double Plains = (8.0 + 35.0) * 4.5 + (4.0 + 90.0) + (1.5 + 5.0) * 4.5;
     const double Detail = std::fabs(S.DetailPlains) + std::fabs(S.DetailMountains);
-    return Base + Plains + Detail + std::max(0.0, (double)V.Pedestal) + std::max(0.0, (double)V.MountainMaxHeight);
+    // Mountain blocks: R is not clamped at 1 (V6BlockRMax bounds it).
+    double Mountains = std::max(0.0, (double)V.MountainMaxHeight);
+    if (V.Block != EMountainBlock::Musgrave && V6BlockRMax > 1.0)
+    {
+        const double Floor = std::clamp((double)V.RidgeFloor, 0.0, 1.0);
+        Mountains *= Floor + (1.0 - Floor) * std::pow(std::min(V6BlockRMax, 2.0), std::max(0.1, (double)V.RidgeSharpness));
+    }
+    return Base + Plains + Detail + std::max(0.0, (double)V.Pedestal) + Mountains;
 }
 
 void NoiseGraph::EvaluateTerrainV6(const float* X, const float* Y, const float* Z, int32_t Count, bool bDetail,
@@ -212,6 +428,7 @@ void NoiseGraph::EvaluateTerrainV6(const float* X, const float* Y, const float* 
     const float* LutPow13    = &V6Lut[(size_t)(V6_LUT_POW13    * V6_LUT_SIZE)];
     const float* LutPowSharp = &V6Lut[(size_t)(V6_LUT_POWSHARP * V6_LUT_SIZE)];
     const float* LutTanh     = &V6Lut[(size_t)(V6_LUT_TANH     * V6_LUT_SIZE)];
+    const float* LutPowSharpX = &V6Lut[(size_t)(V6_LUT_POWSHARPX * V6_LUT_SIZE)];
 
     double T0, T1;
     V6RegionThresholds(V, T0, T1);
@@ -253,7 +470,12 @@ void NoiseGraph::EvaluateTerrainV6(const float* X, const float* Y, const float* 
         for (int32_t o = 0; o < Oct; ++o, a *= 0.5) ASum += a;
     }
     for (int32_t i = 0; i < Count; ++i) { Sum[i] = 0.0; Wgt[i] = 1.0; }
-    if (bAnyMountain)
+    const bool bBlock = V.Block != EMountainBlock::Musgrave && !V6BlockMap.empty();
+    if (bAnyMountain && bBlock)
+    {
+        V6BlockSum(X, Y, Z, Count, Used, (int32_t)V.Block, Sum.data());
+    }
+    else if (bAnyMountain)
     {
         Field(V6_RidgeWarpX, Rx, X, Y, Z);
         Field(V6_RidgeWarpY, Ry, X, Y, Z);
@@ -308,18 +530,23 @@ void NoiseGraph::EvaluateTerrainV6(const float* X, const float* Y, const float* 
                  + (1.5 + 5.0 * rf) * (Hm[i] / V6Sd[V6_Hummock]);
         // No hard clamp at the top: a clamp pins a quarter of the land to 1.0
         // (flat plateaus); normalised by the real range of the octave sum.
-        const double Rn = std::clamp(Sum[i] / (ASum * 0.85), 0.0, 1.0);
-        const double M  = Amp[i] * (Floor + (1.0 - Floor) * V6Pow(LutPowSharp, Rn));
+        double Rn, Shape;
+        if (bBlock) { Rn = V6BlockR(Sum[i]); Shape = V6PowX(LutPowSharpX, Rn); }
+        else        { Rn = std::clamp(Sum[i] / (ASum * 0.85), 0.0, 1.0); Shape = V6Pow(LutPowSharp, Rn); }
+        const double M  = Amp[i] * (Floor + (1.0 - Floor) * Shape);
         H += Ped * Wide[i] * Inland * Coast;      // piedmont / regional uplift
         H += M * Coast;
         const double MtnMask = V6SStep(100.0, 900.0, M);
         H += (double)Dt[i] * ((double)SP.DetailPlains + (double)SP.DetailMountains * MtnMask);
 
         if (OutHeight) OutHeight[i] = H;
-        if (OutM)      OutM[i] = (float)Rn;
+        if (OutM)      OutM[i] = bBlock ? (float)(Amp[i] > 0.0 ? std::min(Rn, 1.0) : 0.0) : (float)Rn;
         if (OutInland) OutInland[i] = (float)(Base / 12000.0);
         if (OutMask)   OutMask[i] = (float)(MtnMask * std::clamp(H / 300.0, 0.0, 1.0));
-        if (OutFade)   OutFade[i] = (float)(0.3 * std::clamp(2.0 * std::sqrt(Rn) - 1.0, -1.0, 1.0) * (M > 0.0 ? 1.0 : 0.0));
+        // fade (valleys -1 .. peaks +1) for the erosion filter: blocks take it
+        // from the height in the massif, as the filter's author suggests
+        if (OutFade)   OutFade[i] = (float)((bBlock ? std::clamp(2.0 * Rn - 1.0, -1.0, 1.0)
+                                                    : 0.3 * std::clamp(2.0 * std::sqrt(Rn) - 1.0, -1.0, 1.0)) * (M > 0.0 ? 1.0 : 0.0));
     }
 }
 

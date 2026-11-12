@@ -160,12 +160,12 @@ void NoiseGraph::V6BlockSum(const float* X, const float* Y, const float* Z, int3
     }
     for (int32_t i = 0; i < Count; ++i) S[i] = 0.0;
 
-    static thread_local std::vector<float> T, PX, PY, PZ, QX, QY, QZ, N1, N2;
-    static thread_local std::vector<double> Am, Dx, Dy, A1, A2, A3, B1, B2, B3;
+    static thread_local std::vector<float> T, PX, PY, PZ, QX, QY, QZ, N1, N2, N3;
+    static thread_local std::vector<double> Am, Dx, Dy, Dz, UX, UY, UZ;
     if ((int32_t)T.size() < Count)
     {
-        for (std::vector<float>* A : {&T, &PX, &PY, &PZ, &QX, &QY, &QZ, &N1, &N2}) A->resize((size_t)Count);
-        for (std::vector<double>* A : {&Am, &Dx, &Dy, &A1, &A2, &A3, &B1, &B2, &B3}) A->resize((size_t)Count);
+        for (std::vector<float>* A : {&T, &PX, &PY, &PZ, &QX, &QY, &QZ, &N1, &N2, &N3}) A->resize((size_t)Count);
+        for (std::vector<double>* A : {&Am, &Dx, &Dy, &Dz, &UX, &UY, &UZ}) A->resize((size_t)Count);
     }
     const int32_t HStart = std::max(1, V.HybridStartOctave);
     const double HLo = (double)V.HybridLow, HHi = std::max((double)V.HybridHigh, (double)V.HybridLow + 1e-3);
@@ -214,14 +214,17 @@ void NoiseGraph::V6BlockSum(const float* X, const float* Y, const float* Z, int3
             std::memcpy(PY.data(), Y, sizeof(float) * (size_t)Count);
             std::memcpy(PZ.data(), Z, sizeof(float) * (size_t)Count);
         }
-        // tangent basis per point (a function of the point alone: shared vertices agree)
+        // The slope for the slope erosion: the gradient along the three world
+        // axes, then its part tangent to the sphere, |g|^2 - (g.u)^2. No tangent
+        // basis: a basis has to switch its reference axis somewhere on the sphere,
+        // and with finite differences the slope (and the height) jumped there
+        // (it was the circles |z| = 0.9). A function of the point alone: shared
+        // vertices agree.
         for (int32_t i = 0; i < Count; ++i)
         {
-            const Vec3d p(PX[i], PY[i], PZ[i]);
-            const Vec3d up = std::fabs(p.Z) < 0.9 ? Vec3d(0, 0, 1) : Vec3d(1, 0, 0);
-            const Vec3d a = Vec3d::Cross(up, p).Normalised(), b = Vec3d::Cross(p, a);
-            A1[i] = a.X; A2[i] = a.Y; A3[i] = a.Z; B1[i] = b.X; B2[i] = b.Y; B3[i] = b.Z;
-            Am[i] = 1.0; Dx[i] = 0.0; Dy[i] = 0.0;
+            const Vec3d u = Vec3d(PX[i], PY[i], PZ[i]).Normalised();
+            UX[i] = u.X; UY[i] = u.Y; UZ[i] = u.Z;
+            Am[i] = 1.0; Dx[i] = 0.0; Dy[i] = 0.0; Dz[i] = 0.0;
         }
         const double Sharp = (double)V.UberSharpness, Slope = std::max(0.0, (double)V.UberSlopeErosion);
         const double Alt = std::clamp((double)V.UberAltitudeErosion, 0.0, 1.0);
@@ -232,14 +235,11 @@ void NoiseGraph::V6BlockSum(const float* X, const float* Y, const float* Z, int3
             Gen(V6Ridge[o], T.data(), Count, PX.data(), PY.data(), PZ.data());
             for (int32_t i = 0; i < Count; ++i)
             {
-                QX[i] = (float)(PX[i] + h * A1[i]); QY[i] = (float)(PY[i] + h * A2[i]); QZ[i] = (float)(PZ[i] + h * A3[i]);
+                QX[i] = (float)(PX[i] + h); QY[i] = (float)(PY[i] + h); QZ[i] = (float)(PZ[i] + h);
             }
-            Gen(V6Ridge[o], N1.data(), Count, QX.data(), QY.data(), QZ.data());
-            for (int32_t i = 0; i < Count; ++i)
-            {
-                QX[i] = (float)(PX[i] + h * B1[i]); QY[i] = (float)(PY[i] + h * B2[i]); QZ[i] = (float)(PZ[i] + h * B3[i]);
-            }
-            Gen(V6Ridge[o], N2.data(), Count, QX.data(), QY.data(), QZ.data());
+            Gen(V6Ridge[o], N1.data(), Count, QX.data(), PY.data(), PZ.data());
+            Gen(V6Ridge[o], N2.data(), Count, PX.data(), QY.data(), PZ.data());
+            Gen(V6Ridge[o], N3.data(), Count, PX.data(), PY.data(), QZ.data());
             for (int32_t i = 0; i < Count; ++i)
             {
                 double sh;
@@ -251,7 +251,10 @@ void NoiseGraph::V6BlockSum(const float* X, const float* Y, const float* Z, int3
                 // crease has a derivative jump, which would make the height jump too
                 Dx[i] += ((double)N1[i] - n) / V6_UBER_EPS;
                 Dy[i] += ((double)N2[i] - n) / V6_UBER_EPS;
-                S[i] += Am[i] * v / (1.0 + Slope * (Dx[i] * Dx[i] + Dy[i] * Dy[i]));
+                Dz[i] += ((double)N3[i] - n) / V6_UBER_EPS;
+                const double gu = Dx[i] * UX[i] + Dy[i] * UY[i] + Dz[i] * UZ[i];
+                const double g2 = std::max(0.0, Dx[i] * Dx[i] + Dy[i] * Dy[i] + Dz[i] * Dz[i] - gu * gu);
+                S[i] += Am[i] * v / (1.0 + Slope * g2);
             }
             asum += std::pow(0.5, o);
             for (int32_t i = 0; i < Count; ++i)

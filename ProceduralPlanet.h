@@ -167,6 +167,8 @@ public:
     UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="0.5", ClampMax="8.0"))
     double ErrorThresholdPixels = 1.0;
 
+    // Keep at 14 or below: deeper, the noise runs out of float precision.
+    // Finer ground near the camera comes from the detail levels instead.
     UPROPERTY(EditAnywhere, Category="Planet|View", meta=(ClampMin="1", ClampMax="18"))
     int32 MaxLOD = 14;
 
@@ -203,8 +205,10 @@ public:
     double CollisionDistanceMetres = 1500.0;
 
     // How many frames a new chunk must be on the pool before the chunk it
-    // replaces is removed. Gives its async collision cook time to finish so
-    // the ground does not vanish under the player during a split or merge.
+    // replaces is removed. When the old chunk carries collision, the new
+    // one's collision mesh must also have been applied this many frames ago
+    // (time for the async cook), so the ground does not vanish under the
+    // player during a split or merge.
     UPROPERTY(EditAnywhere, Category="Planet|Budget", meta=(ClampMin="0", ClampMax="120"))
     int32 ReplacementSettleFrames = 6;
 

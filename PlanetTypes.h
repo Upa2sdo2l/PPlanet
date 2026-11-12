@@ -153,7 +153,8 @@ struct FPlanetNoiseParams
     float ContinentLacunarity = 2.0f;
 
     // Sharpness of the continent-ocean boundary. Low = gentle shelves.
-    UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="0.0", ClampMax="1.0"))
+    // Terrain shape Original only (V4 and V6 build their own coast).
+    UPROPERTY(EditAnywhere, Category="Planet|Continent", meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float ShoreSharpness = 0.4f;
 
     // ── Terrain shape ───────────────────────────────────────────────────
@@ -297,24 +298,26 @@ struct FPlanetNoiseParams
     float TableLevelStepMetres = 600.f;
 
     // ── Mountains ───────────────────────────────────────────────────────
+    // Terrain shape Original only: V4 and V6 have their own mountain settings
+    // and ignore this section (checked: no height changes with any of the five).
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
-    meta=(ClampMin="0.5", ClampMax="24.0"))
+        meta=(ClampMin="0.5", ClampMax="24.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float MountainFrequency = 6.f;
 
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
-        meta=(ClampMin="0.0", ClampMax="120000.0"))
+        meta=(ClampMin="0.0", ClampMax="120000.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float MountainAmplitude = 50000.f;
 
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
-        meta=(ClampMin="1.0", ClampMax="8.0"))
+        meta=(ClampMin="1.0", ClampMax="8.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float MountainSharpness = 2.5f;
 
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
-        meta=(ClampMin="1", ClampMax="16"))
+        meta=(ClampMin="1", ClampMax="16", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     int32 MountainOctaves = 12;
 
     UPROPERTY(EditAnywhere, Category="Planet|Mountains",
-        meta=(ClampMin="0.0", ClampMax="1.0"))
+        meta=(ClampMin="0.0", ClampMax="1.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float MountainGain = 0.5f;
 
     // ── Domain warp ─────────────────────────────────────────────────────
@@ -325,16 +328,20 @@ struct FPlanetNoiseParams
     float DomainWarpFrequency = 1.5f;
 
     // ── Climate ─────────────────────────────────────────────────────────
+    // These three act only with the CPU renderer (GPU terrain off). The GPU
+    // renderer takes its climate from the biome settings (PlanetBiomes).
+    //
     // sin(latitude) where polar snow is half-way in; the ramp is ±0.10 around
-    // it. 0.90 ~ 64 deg. Polar axis is world +Z.
+    // it. 0.90 ~ 64 deg. Polar axis is world +Z. CPU renderer only.
     UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
     float SnowLatitudeStart = 0.90f;
 
     // Elevation above sea level, metres, where altitude snow starts. The
-    // terrain reaches ~20+ km, so the range goes well past 9 km.
+    // terrain reaches ~20+ km, so the range goes well past 9 km. CPU renderer only.
     UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="25000.0"))
     float SnowAltitudeStart = 3500.f;
 
+    // CPU renderer only.
     UPROPERTY(EditAnywhere, Category="Planet|Climate", meta=(ClampMin="0.0", ClampMax="1.0"))
     float HumidityVariance = 0.4f;
 
@@ -342,7 +349,8 @@ struct FPlanetNoiseParams
     // Kept in sync with PlanetCore::NoiseParams::OceanDepthScale. An earlier
     // draft of this header said 2.5 while the core ran 0.35, so every slider
     // would have disagreed with the generated terrain. It is 0.35.
-    UPROPERTY(EditAnywhere, Category="Planet|Ocean", meta=(ClampMin="0.0", ClampMax="2.0"))
+    // Terrain shape Original only (V4 and V6: shelf and abyss depth of the shape).
+    UPROPERTY(EditAnywhere, Category="Planet|Ocean", meta=(ClampMin="0.0", ClampMax="2.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float OceanDepthScale = 0.35f;
     
     // ── Detail ─────────────────────────────────────────────────────────────
@@ -363,8 +371,9 @@ struct FPlanetNoiseParams
 
     // Height of a full-scale detail feature. 40 m gives roughly half the
     // local relief at walking scale and ~13% at 2 km.
+    // Terrain shape Original only: V4 and V6 do not add this detail layer.
     UPROPERTY(EditAnywhere, Category="Planet|Detail",
-        meta=(ClampMin="0.0", ClampMax="2000.0"))
+        meta=(ClampMin="0.0", ClampMax="2000.0", EditCondition="TerrainShape == EPlanetTerrainShape::Original"))
     float DetailAmplitudeMetres = 40.0f;
 
     // ── Seed ────────────────────────────────────────────────────────────

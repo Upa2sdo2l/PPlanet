@@ -295,6 +295,13 @@ public:
         // The shaders stay in the game repository (GpuErosion/Shaders), so
         // they update with git like the rest of the planet code. Built at run
         // time (not baked in at compile time): safe for non-ASCII paths.
+        //
+        // A packaged game has no Source folder and needs none: its shaders
+        // were compiled when the game was cooked, and the engine ignores
+        // source directory mappings there. Checking the folder would only
+        // stop the game at start.
+        if (FPlatformProperties::RequiresCookedData()) return;
+
         const FString ShaderDir = FPaths::ConvertRelativePathToFull(
             FPaths::Combine(FPaths::GameSourceDir(), TEXT("FastNoiseTest"), TEXT("GpuErosion"), TEXT("Shaders")));
         if (!FPaths::DirectoryExists(ShaderDir))

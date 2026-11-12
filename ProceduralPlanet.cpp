@@ -694,13 +694,29 @@ void AProceduralPlanet::ApplyReadyChunks()
 
     int32 Committed = 0;
 
-    for (int32 i = 0; i < SlotWork.Num() && Committed < MaxCommitsPerFrame; ++i)
+    // Finished work, closest first. Slot order is arbitrary: under the commit
+    // budget a chunk next to the camera could wait behind far ones.
+    struct FDoneWork { int32 SlotIndex; double Priority; };
+    TArray<FDoneWork, TInlineAllocator<64>> DoneWork;
     {
-        FSlotWork& W = *SlotWork[i];
+        const std::vector<PlanetStreaming::Slot>& Slots = Scheduler.GetSlots();
+        for (int32 i = 0; i < SlotWork.Num(); ++i)
+        {
+            // Acquire load: pairs with the worker's release store, so the
+            // stream set writes above are visible here.
+            if (!SlotWork[i]->bDone.Load()) continue;
+            DoneWork.Add({i, i < (int32)Slots.size() ? Slots[i].Priority : 0.0});
+        }
+    }
+    DoneWork.Sort([](const FDoneWork& A, const FDoneWork& B)
+    {
+        return A.Priority != B.Priority ? A.Priority < B.Priority : A.SlotIndex < B.SlotIndex;
+    });
 
-        // Acquire load: pairs with the worker's release store, so the stream
-        // set writes above are visible here.
-        if (!W.bDone.Load()) continue;
+    for (int32 d = 0; d < DoneWork.Num() && Committed < MaxCommitsPerFrame; ++d)
+    {
+        const int32 i = DoneWork[d].SlotIndex;
+        FSlotWork& W = *SlotWork[i];
 
         // The worker has returned, whatever happens to its result below:
         // the slot's scratch may be reused (and a retired slot released).

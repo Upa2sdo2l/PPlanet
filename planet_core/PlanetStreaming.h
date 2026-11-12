@@ -98,6 +98,15 @@ struct Slot
     // Set when this chunk was swapped in for a coarser lingering chunk (a
     // split). The GPU renderer morphs such chunks in from the parent's shape.
     bool     bAppearedBySplit = false;
+
+    // Collision as the UE side reports it (Scheduler::SetCollisionApplied):
+    // the chunk's collision mesh has been handed to the engine, in frame
+    // CollisionSinceFrame (the cook itself is asynchronous). With the GPU
+    // renderer the mesh arrives several frames after the chunk became Active
+    // (height readback, then a worker job), so "Active" alone does not mean
+    // "has ground to stand on".
+    bool     bCollisionApplied   = false;
+    uint64_t CollisionSinceFrame = 0;
 };
 
 struct WorkerRequest
@@ -123,7 +132,9 @@ struct FrameBudget
     int32_t MaxRetires           = 8;
 
     // A replacement chunk must have been Active this many frames before the
-    // chunk it replaces goes. Gives its async collision cook time to finish,
+    // chunk it replaces goes. When the chunk being replaced carries collision
+    // and the replacement needs it too, the replacement's collision mesh must
+    // also have been applied this many frames ago (time for the async cook),
     // so the ground does not disappear under the player during a swap.
     int32_t SettleFrames         = 6;
 
@@ -187,8 +198,13 @@ public:
 
     // Game thread, after this frame's commits. Retires lingering chunks whose
     // replacements are all Active for Budget.SettleFrames (or that have nothing
-    // replacing them), and sets bShown on every slot.
+    // replacing them), and sets bShown on every slot. A lingering chunk with
+    // collision also waits for the collision of its replacements.
     void UpdateCoverage(uint64_t Frame, const FrameBudget& Budget);
+
+    // Game thread: the UE side applied (true) or removed (false) the collision
+    // mesh of an Active slot. Retiring or reassigning a slot clears the flag.
+    void SetCollisionApplied(int32_t SlotIndex, bool bApplied, uint64_t Frame);
 
     // Reserves an Active slot for a side job that reads its scratch (e.g.
     // building the collision mesh of a chunk the camera came close to). The
@@ -228,8 +244,9 @@ private:
     };
 
     int32_t FindFreeSlot() const;
-    // The lingering slot to give up under capacity pressure: the one that has
-    // lingered longest, farthest first on ties. -1 when none.
+    // The lingering slot to give up under capacity pressure: one without
+    // collision before one with it, then the one that has lingered longest,
+    // farthest first on ties. -1 when none.
     int32_t FindLingeringToEvict() const;
     void Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame);
     void Retire(int32_t SlotIndex);

@@ -35,6 +35,12 @@ int32_t Scheduler::FindLingeringToEvict() const
         if (Candidate < 0) { Candidate = i; continue; }
 
         const Slot& C = Slots[Candidate];
+        // Ground the player may be standing on goes last.
+        if (S.bCollisionApplied != C.bCollisionApplied)
+        {
+            if (!S.bCollisionApplied) Candidate = i;
+            continue;
+        }
         if (S.LingerSinceFrame < C.LingerSinceFrame ||
             (S.LingerSinceFrame == C.LingerSinceFrame && S.Priority > C.Priority))
         {
@@ -64,6 +70,8 @@ void Scheduler::Assign(int32_t SlotIndex, const DesiredChunk& D, uint64_t Frame)
     S.ActiveSinceFrame = 0;
     S.bShown = false;
     S.bAppearedBySplit = false;
+    S.bCollisionApplied = false;
+    S.CollisionSinceFrame = 0;
     KeyToSlot[D.Key] = SlotIndex;
 }
 
@@ -82,6 +90,9 @@ void Scheduler::Retire(int32_t SlotIndex)
     S.bNeedsCollision = false;
     S.bLingering = false;
     S.bShown = false;
+    // The UE side turns a retiring slot's collision off in the same frame.
+    S.bCollisionApplied = false;
+    S.CollisionSinceFrame = 0;
     RetireQueue.push_back(SlotIndex);
 }
 
@@ -229,14 +240,21 @@ void Scheduler::UpdateCoverage(uint64_t Frame, const FrameBudget& Budget)
             S.ActiveSinceFrame = Frame;
 
     // A desired chunk counts as a ready replacement once it has been Active
-    // for the settle time.
-    auto IsSettled = [&](const PlanetLOD::ChunkKey& K)
+    // for the settle time. When the chunk it replaces carries collision and
+    // the replacement needs collision as well, its own collision mesh must
+    // also have been applied for the settle time: otherwise the old ground
+    // would go before the new one exists.
+    auto IsSettled = [&](const PlanetLOD::ChunkKey& K, bool bReplacesCollision)
     {
         const auto It = KeyToSlot.find(K);
         if (It == KeyToSlot.end()) return false;
         const Slot& R = Slots[It->second];
-        return R.State == SlotState::Active && !R.bLingering &&
-               Frame >= R.ActiveSinceFrame + Settle;
+        if (R.State != SlotState::Active || R.bLingering || Frame < R.ActiveSinceFrame + Settle)
+            return false;
+        if (bReplacesCollision && R.bNeedsCollision &&
+            (!R.bCollisionApplied || Frame < R.CollisionSinceFrame + Settle))
+            return false;
+        return true;
     };
 
     // 1. Retire every lingering chunk whose surface is now fully covered by
@@ -254,7 +272,7 @@ void Scheduler::UpdateCoverage(uint64_t Frame, const FrameBudget& Budget)
         {
             if (!PlanetLOD::TilesOverlap(K, L.Key)) continue;
             bAnyReplacement = true;
-            if (!IsSettled(K)) { bAllSettled = false; break; }
+            if (!IsSettled(K, L.bCollisionApplied)) { bAllSettled = false; break; }
         }
 
         if (!bAnyReplacement || bAllSettled || Frame >= L.LingerSinceFrame + MaxLinger)
@@ -306,6 +324,16 @@ int32_t Scheduler::FindSlotIndex(const PlanetLOD::ChunkKey& Key) const
 {
     const auto It = KeyToSlot.find(Key);
     return (It == KeyToSlot.end()) ? -1 : It->second;
+}
+
+void Scheduler::SetCollisionApplied(int32_t SlotIndex, bool bApplied, uint64_t Frame)
+{
+    if (SlotIndex < 0 || SlotIndex >= (int32_t)Slots.size()) return;
+    Slot& S = Slots[SlotIndex];
+    // Only a live chunk can carry collision; a retiring slot has lost it.
+    if (S.State != SlotState::Active) { S.bCollisionApplied = false; S.CollisionSinceFrame = 0; return; }
+    S.bCollisionApplied = bApplied;
+    S.CollisionSinceFrame = bApplied ? Frame : 0;
 }
 
 void Scheduler::WorkerFinished(int32_t SlotIndex)
@@ -378,6 +406,8 @@ std::vector<int32_t> Scheduler::DrainRetires(int32_t MaxCount)
         S.ActiveSinceFrame = 0;
         S.bShown = false;
         S.bAppearedBySplit = false;
+        S.bCollisionApplied = false;
+        S.CollisionSinceFrame = 0;
         Out.push_back(SlotIndex);
     }
     RetireQueue.swap(Kept);

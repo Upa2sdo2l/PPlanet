@@ -1010,6 +1010,9 @@ void AProceduralPlanet::ApplyCollisionMesh(int32 SlotIndex)
     SlotVisibleApplied[SlotIndex]   = 0;
     SlotCollisionApplied[SlotIndex] = 1;
     if (GpuSlots.IsValidIndex(SlotIndex)) GpuSlots[SlotIndex].bHasCollisionMesh = true;
+    // The chunk this one replaces keeps its own collision until this one has
+    // been cooked (Scheduler::UpdateCoverage).
+    Scheduler.SetCollisionApplied(SlotIndex, true, FrameCounter);
 }
 
 void AProceduralPlanet::RemoveCollisionMesh(int32 SlotIndex)
@@ -1022,6 +1025,7 @@ void AProceduralPlanet::RemoveCollisionMesh(int32 SlotIndex)
     Pool[SlotIndex]->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     SlotCollisionApplied[SlotIndex] = 0;
     if (GpuSlots.IsValidIndex(SlotIndex)) GpuSlots[SlotIndex].bHasCollisionMesh = false;
+    Scheduler.SetCollisionApplied(SlotIndex, false, FrameCounter);
 }
 
 void AProceduralPlanet::ConfigureComponentForChunk(int32 SlotIndex, const FChunkKey& Key)
